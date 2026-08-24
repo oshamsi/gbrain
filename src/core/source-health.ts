@@ -12,14 +12,15 @@
  * D9:  resolvePriority(config) — accepts 'high'|'normal'|'low', falls back
  *      to 0 with once-per-source-per-process stderr warn on unknown values.
  *
- * v0.41.32.0: commit-relative staleness. `lag_seconds` is no longer raw
+ * v0.41.32.0: commit-relative legacy lag. `lag_seconds` is no longer raw
  *      wall-clock `now - last_sync_at` (which false-flagged quiet, caught-up
  *      repos as SEVERE). Local callers pass `probeContent: true` and lag
  *      becomes 0 when the source is caught up by COMMIT HASH (HEAD ==
  *      last_commit, untracked ignored, via `isSourceUnchangedSinceSync`).
- *      Remote callers (federation_health on the HTTP MCP path) read the stored
- *      `newest_content_at` column instead — NO git subprocess on a DB-supplied
- *      local_path (preserves the v0.41.27.0 trust boundary).
+ *      Remote federation_health reads the stored `newest_content_at` column.
+ *      Operational status surfaces overlay this field with the bounded shared
+ *      verdict from sync-freshness.ts; this helper remains the metrics/counts
+ *      provider and federation_health's intentionally different 24h signal.
  */
 import { execFileSync } from 'child_process';
 import type { BrainEngine } from './engine.ts';
@@ -206,12 +207,11 @@ export function resolveStalenessCeilingSeconds(): number {
  *   checked has a RECENT `last_sync_at` and stays at 0; only a source nobody has
  *   looked at in a very long time crosses the ceiling.
  *
- *   It ramps rather than steps because three consumers read this one value at
- *   different thresholds: `federation_health` fails at 24h, `sync_freshness`
- *   warns at 24h / fails at 72h, and `buildSyncStatusReport` buckets at a
- *   hardcoded 24/72. A step to the ceiling would cross all of them in the same
- *   instant, firing two checks at once and skipping the warn tier entirely —
- *   which is the alert-storm shape the caught-up branch was written to prevent.
+ *   It ramps rather than steps because the shared freshness evaluator and the
+ *   distinct federation-health metric read this stored fallback at different
+ *   thresholds. A step to the ceiling would cross both in the same instant,
+ *   firing two checks at once and skipping the warn tier entirely — which is
+ *   the alert-storm shape the caught-up branch was written to prevent.
  *   `max(0, wallClock - ceiling)` grows continuously, so warn still precedes
  *   fail and the surfaces escalate in order.
  *
@@ -283,10 +283,13 @@ export async function computeAllSourceMetrics(
     // v0.41.32.0: commit-relative lag. TWO implementations, and the split is
     // load-bearing rather than accidental duplication — see the diagram.
     //
-    //   computeAllSourceMetrics
+    //   computeAllSourceMetrics (legacy lag field)
     //         │
-    //         ├─ probeContent: true  ──► isSourceUnchangedSinceSync (git subprocess)
-    //         │                          LOCAL only. Accurate: keys off the live
+    //         ├─ probeContent: true  ──► isSourceUnchangedSinceSync (legacy sync probe)
+    //         │                          Local compatibility only. New status
+    //         │                          surfaces use sync-freshness.ts's bounded,
+    //         │                          asynchronous host evaluator instead.
+    //         │                          Accurate: keys off the live
     //         │                          commit hash, so a HEAD moved to an
     //         │                          old-dated commit is correctly NOT caught
     //         │                          up. NULL last_commit → wall-clock.
@@ -300,13 +303,11 @@ export async function computeAllSourceMetrics(
     //                                    it structurally less accurate than the
     //                                    probe, which is exactly why it needs the
     //                                    staleness ceiling to stay honest.
-    //                                    Callers: doctor `federation_health`,
-    //                                    doctor `sync_freshness` (via its own
-    //                                    clone-unavailable branch), and
-    //                                    `buildSyncStatusReport` (gbrain status).
+    //                                    Caller: doctor `federation_health`.
     //
-    // Do NOT "unify" these behind one flag: collapsing the trust boundary into a
-    // boolean is how a remote caller eventually acquires a subprocess.
+    // Do not use this boolean split for a new operational status surface.
+    // sync-freshness.ts owns its explicit host/stored modes, async timeout,
+    // total budget, and conservative indeterminate fallback.
     let lagSeconds: number | null;
     if (lastMs === null) {
       lagSeconds = null;

@@ -3,8 +3,9 @@
  * powers the run_doctor MCP op.
  *
  * Strategy: build a fresh PGLite engine + initSchema, run the report, assert
- * all 5 checks present + healthy. Uses the canonical PGLite test pattern
- * (beforeAll + afterAll, not beforeEach) per CLAUDE.md test-isolation rules.
+ * the load-bearing checks are present + healthy. Uses the canonical PGLite
+ * test pattern (beforeAll + afterAll, not beforeEach) per CLAUDE.md
+ * test-isolation rules.
  */
 
 import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
@@ -39,13 +40,14 @@ afterAll(async () => {
 });
 
 describe('doctorReportRemote', () => {
-  test('runs all 5 checks on a fresh PGLite brain', async () => {
+  test('runs load-bearing checks on a fresh PGLite brain', async () => {
     const report = await doctorReportRemote(engine);
     expect(report.schema_version).toBe(2);
     expect(report.checks.length).toBeGreaterThanOrEqual(5);
     const names = report.checks.map(c => c.name);
     expect(names).toContain('connection');
     expect(names).toContain('schema_version');
+    expect(names).toContain('pages_index_heap_parity');
     expect(names).toContain('brain_score');
     expect(names).toContain('sync_failures');
     expect(names).toContain('queue_health');

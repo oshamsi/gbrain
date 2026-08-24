@@ -59,6 +59,7 @@ export {
   whoknowsHealthCheck,
   pgvectorCheck,
   pagesUpsertArbiterCheck,
+  pagesIndexHeapParityCheck,
   jsonbIntegrityCheck,
   checkVolunteerChannels,
   takesWeightGridCheck,
@@ -151,6 +152,7 @@ import {
   whoknowsHealthCheck,
   pgvectorCheck,
   pagesUpsertArbiterCheck,
+  pagesIndexHeapParityCheck,
   jsonbIntegrityCheck,
   checkVolunteerChannels,
   takesWeightGridCheck,
@@ -1764,6 +1766,9 @@ export async function buildChecks(
   progress.heartbeat('pages_upsert_arbiter');
   checks.push(await pagesUpsertArbiterCheck(engine));
 
+  // Catalog flags can stay green while an index has lost heap entries.
+  progress.heartbeat('pages_index_heap_parity');
+  checks.push(await pagesIndexHeapParityCheck(engine));
   // 4b. PgBouncer / prepared-statement compatibility.
   // URL-only inspection — no DB roundtrip — so this is cheap and works
   // regardless of whether the caller is the module singleton or a
@@ -3792,13 +3797,8 @@ export async function buildChecks(
   // Sync freshness check (v0.32 — Check that sources are synced recently)
   if (engine !== null) {
     progress.heartbeat('sync_freshness');
-    // v0.41.27.0 D4: local CLI path is trusted to walk DB-supplied
-    // local_path values via subprocess (we own the brain repo). Pass
-    // localOnly:true so the git short-circuit fires. The HTTP MCP path
-    // at doctorReportRemote (around line 662) deliberately keeps the
-    // default (false) — that's the trust-boundary preservation Codex
-    // P0-1 flagged.
-    checks.push(await checkSyncFreshness(engine, { localOnly: true }));
+    // Keep doctor/status on the canonical registered-host evidence mode.
+    checks.push(await checkSyncFreshness(engine, { freshnessMode: 'host' }));
     // v0.41.19.0 (Issue 5): sync --all consolidation nudge.
     progress.heartbeat('sync_consolidation');
     checks.push(await checkSyncConsolidation(engine));

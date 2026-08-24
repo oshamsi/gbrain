@@ -22,7 +22,7 @@
  * gate. See plan note "v0.41.27.1+ TODOs" in
  * ~/.claude/plans/system-instruction-you-are-working-eager-bird.md.
  */
-import { execFileSync } from 'node:child_process';
+import { execFile, execFileSync } from 'node:child_process';
 
 export type GitHeadProbe = (localPath: string) => string | null;
 // `null` distinguishes probe error from known-dirty (false). Doctor treats
@@ -113,6 +113,118 @@ export interface GitFreshnessOpts {
  *                      DB-only freshness signal instead of wall-clock age.
  */
 export type SourceGitState = 'unchanged' | 'changed' | 'unavailable';
+
+/**
+ * Host-probe result used by operational status surfaces.
+ *
+ * `indeterminate` is deliberately distinct from `unavailable`: a missing
+ * checkout can use the durable newest-content fallback, while a checkout that
+ * exists but times out/errors must fall back to wall-clock age so an unhealthy
+ * Git probe cannot make genuinely pending work look caught up.
+ */
+export type AsyncSourceGitState = SourceGitState | 'indeterminate';
+
+export interface AsyncGitFreshnessOpts extends GitFreshnessOpts {
+  /** Hard timeout for this one child process. The caller also owns a total budget. */
+  timeoutMs: number;
+}
+
+export type AsyncGitStateProbe = (
+  localPath: string | null | undefined,
+  lastCommit: string | null | undefined,
+  opts: AsyncGitFreshnessOpts,
+) => Promise<AsyncSourceGitState>;
+
+/**
+ * One-process, non-blocking Git freshness probe.
+ *
+ * `git status --porcelain=v2 --branch` returns both the exact HEAD oid and the
+ * tracked-dirty signal, so operational HTTP surfaces do not need the former
+ * pair of synchronous 5-second probes. `GIT_OPTIONAL_LOCKS=0` keeps this health
+ * read from refreshing/writing the repository index. Array argv + `shell:false`
+ * preserve the command-injection boundary for registered paths.
+ */
+const DEFAULT_ASYNC_GIT_PROBE: AsyncGitStateProbe = async (localPath, lastCommit, opts) => {
+  if (!localPath || !lastCommit) return 'changed';
+
+  const args = [
+    '-c', 'core.fsmonitor=false',
+    '-C', localPath,
+    'status', '--porcelain=v2', '--branch',
+  ];
+  if (opts.requireCleanWorkingTree === 'ignore-untracked') {
+    args.push('--untracked-files=no');
+  }
+
+  return new Promise<AsyncSourceGitState>((resolve) => {
+    execFile('git', args, {
+      encoding: 'utf8',
+      timeout: Math.max(1, Math.floor(opts.timeoutMs)),
+      maxBuffer: 2 * 1024 * 1024,
+      windowsHide: true,
+      shell: false,
+      env: { ...process.env, GIT_OPTIONAL_LOCKS: '0', LC_ALL: 'C' },
+    }, (error, stdout, stderr) => {
+      if (error) {
+        const detail = String(stderr);
+        // A missing/non-repository checkout is the stateless-deploy case that
+        // may use stored newest-content evidence. Timeouts, ownership errors,
+        // a missing git binary, and output overflow remain indeterminate and
+        // therefore fall back to conservative wall-clock age.
+        resolve(
+          /cannot change to .*No such file or directory|not a git repository/i.test(detail)
+            ? 'unavailable'
+            : 'indeterminate',
+        );
+        return;
+      }
+
+      const lines = String(stdout).split(/\r?\n/).filter(Boolean);
+      const oidLine = lines.find((line) => line.startsWith('# branch.oid '));
+      const oid = oidLine?.slice('# branch.oid '.length).trim();
+      if (!oid || oid === '(initial)') {
+        resolve('indeterminate');
+        return;
+      }
+      if (oid !== lastCommit) {
+        resolve('changed');
+        return;
+      }
+      if (opts.requireCleanWorkingTree) {
+        const dirty = lines.some((line) => !line.startsWith('# '));
+        if (dirty) {
+          resolve('changed');
+          return;
+        }
+      }
+      resolve('unchanged');
+    });
+  });
+};
+
+let _asyncGitProbeOverride: AsyncGitStateProbe | null = null;
+
+/** Test seam for timeout/budget behavior. Production never sets this. */
+export function _setAsyncGitStateProbeForTests(fn: AsyncGitStateProbe | null): void {
+  _asyncGitProbeOverride = fn;
+}
+
+/**
+ * Async operational façade. Existing synchronous test seams remain honored so
+ * the large historical doctor matrix keeps testing the same HEAD/dirty cases;
+ * production takes the non-blocking one-process path above.
+ */
+export async function probeSourceGitStateAsync(
+  localPath: string | null | undefined,
+  lastCommit: string | null | undefined,
+  opts: AsyncGitFreshnessOpts,
+): Promise<AsyncSourceGitState> {
+  if (_asyncGitProbeOverride) return _asyncGitProbeOverride(localPath, lastCommit, opts);
+  if (_headProbe !== DEFAULT_HEAD_PROBE || _cleanProbe !== DEFAULT_CLEAN_PROBE) {
+    return probeSourceGitState(localPath, lastCommit, opts);
+  }
+  return DEFAULT_ASYNC_GIT_PROBE(localPath, lastCommit, opts);
+}
 
 /**
  * Probe a source clone and classify it (see `SourceGitState`).

@@ -104,9 +104,9 @@ import type { PgCodeEdgesDeps } from './postgres-engine/code-edges.ts';
 import * as salienceImpl from './postgres-engine/salience.ts';
 import type { PgSalienceDeps } from './postgres-engine/salience.ts';
 import { hasCJK } from './cjk.ts';
+import { PAGE_CAS_UPDATE_SQL, PageWriteConflictError, type PutPageOptions } from './page-cas.ts';
 import { searchKeywordCJK as searchKeywordCJKImpl } from './postgres-engine/cjk-search.ts';
 import type { CjkKeywordCtx } from './search/cjk-keyword-sql.ts';
-
 function escapeSqlStringLiteral(value: string): string {
   return value.replace(/'/g, "''");
 }
@@ -1295,17 +1295,17 @@ export class PostgresEngine implements BrainEngine {
    */
   async findDuplicatePage(
     sourceId: string,
-    opts: { hash: string; frontmatterId?: string | null },
+    opts: { hash: string; frontmatterId?: string | null; excludeSlug?: string },
   ): Promise<{ slug: string; id: number } | null> {
-    const fmId = opts.frontmatterId ?? null;
-    // RLS scope binding: sourceId is positional here.
+    const fmId = opts.frontmatterId ?? null, excludeSlug = opts.excludeSlug ?? null;
     return await this.withScopedReadTransaction(undefined, sourceId, async (tx) => {
       const rows = await tx`
         SELECT id, slug FROM pages
         WHERE source_id = ${sourceId}
           AND deleted_at IS NULL
           AND (content_hash = ${opts.hash} OR (frontmatter->>'id' = ${fmId} AND ${fmId}::text IS NOT NULL))
-        ORDER BY id
+          AND (${excludeSlug}::text IS NULL OR slug <> ${excludeSlug})
+        ORDER BY CASE WHEN frontmatter->>'id' = ${fmId} AND ${fmId}::text IS NOT NULL THEN 0 ELSE 1 END, id
         LIMIT 1
       `;
       if (rows.length === 0) return null;
@@ -1314,7 +1314,7 @@ export class PostgresEngine implements BrainEngine {
     });
   }
 
-  async putPage(slug: string, page: PageInput, opts?: { sourceId?: string; allowEmptyOverwrite?: boolean }): Promise<Page> {
+  async putPage(slug: string, page: PageInput, opts?: PutPageOptions): Promise<Page> {
     slug = validateSlug(slug);
     const sql = this.sql;
     const hash = page.content_hash || contentHash(page);
@@ -1363,37 +1363,36 @@ export class PostgresEngine implements BrainEngine {
     const sourcePath = page.source_path ?? null;
     // v0.39.3.0 provenance write-through (WARN-8 + CV12). Server stamps
     // `ingested_at = now()` ONLY when any provenance is being written —
-    // null `source_kind` / `source_uri` / `ingested_via` means no provenance
-    // write fired this call, and COALESCE-preserve UPDATE keeps the prior
-    // first-write timestamp intact (audit trail survives routine edits).
+    // null provenance means no write; COALESCE preserves the first-write timestamp.
     const sourceKind = page.source_kind ?? null;
     const sourceUri = page.source_uri ?? null;
     const ingestedVia = page.ingested_via ?? null;
     const ingestedAt = (sourceKind || sourceUri || ingestedVia) ? new Date() : null;
-    const rows = await sql`
-      INSERT INTO pages (source_id, slug, type, page_kind, title, compiled_truth, timeline, frontmatter, content_hash, updated_at, effective_date, effective_date_source, import_filename, chunker_version, source_path, source_kind, source_uri, ingested_via, ingested_at)
-      VALUES (${sourceId}, ${slug}, ${page.type}, ${pageKind}, ${page.title}, ${page.compiled_truth}, ${page.timeline || ''}, ${sql.json(frontmatter as Parameters<typeof sql.json>[0])}, ${hash}, now(), ${effectiveDate}, ${effectiveDateSource}, ${importFilename}, COALESCE(${chunkerVersion}::smallint, ${MARKDOWN_CHUNKER_VERSION}), ${sourcePath}, ${sourceKind}, ${sourceUri}, ${ingestedVia}, ${ingestedAt})
-      ON CONFLICT (source_id, slug) DO UPDATE SET
-        type = EXCLUDED.type,
-        page_kind = EXCLUDED.page_kind,
-        title = EXCLUDED.title,
-        compiled_truth = EXCLUDED.compiled_truth,
-        timeline = EXCLUDED.timeline,
-        frontmatter = EXCLUDED.frontmatter,
-        content_hash = EXCLUDED.content_hash,
-        updated_at = now(),
-        deleted_at = NULL,
-        effective_date        = COALESCE(EXCLUDED.effective_date,        pages.effective_date),
-        effective_date_source = COALESCE(EXCLUDED.effective_date_source, pages.effective_date_source),
-        import_filename       = COALESCE(EXCLUDED.import_filename,       pages.import_filename),
-        chunker_version       = COALESCE(EXCLUDED.chunker_version,       pages.chunker_version),
-        source_path           = COALESCE(EXCLUDED.source_path,           pages.source_path),
-        source_kind           = COALESCE(EXCLUDED.source_kind,           pages.source_kind),
-        source_uri            = COALESCE(EXCLUDED.source_uri,            pages.source_uri),
-        ingested_via          = COALESCE(EXCLUDED.ingested_via,          pages.ingested_via),
-        ingested_at           = COALESCE(EXCLUDED.ingested_at,           pages.ingested_at)
-      RETURNING id, source_id, slug, type, title, compiled_truth, timeline, frontmatter, content_hash, created_at, updated_at, effective_date, effective_date_source, import_filename, source_kind, source_uri, ingested_via, ingested_at
-    `;
+    const rows = opts?.expectedContentHash !== undefined ? await this.executeRaw(PAGE_CAS_UPDATE_SQL, [page.type, pageKind, page.title, page.compiled_truth, page.timeline || '', JSON.stringify(frontmatter), hash, effectiveDate, effectiveDateSource, importFilename, chunkerVersion, sourcePath, sourceKind, sourceUri, ingestedVia, ingestedAt, sourceId, slug, opts.expectedContentHash]) : await sql`
+          INSERT INTO pages (source_id, slug, type, page_kind, title, compiled_truth, timeline, frontmatter, content_hash, updated_at, effective_date, effective_date_source, import_filename, chunker_version, source_path, source_kind, source_uri, ingested_via, ingested_at)
+          VALUES (${sourceId}, ${slug}, ${page.type}, ${pageKind}, ${page.title}, ${page.compiled_truth}, ${page.timeline || ''}, ${sql.json(frontmatter as Parameters<typeof sql.json>[0])}, ${hash}, now(), ${effectiveDate}, ${effectiveDateSource}, ${importFilename}, COALESCE(${chunkerVersion}::smallint, ${MARKDOWN_CHUNKER_VERSION}), ${sourcePath}, ${sourceKind}, ${sourceUri}, ${ingestedVia}, ${ingestedAt})
+          ON CONFLICT (source_id, slug) DO UPDATE SET
+            type = EXCLUDED.type,
+            page_kind = EXCLUDED.page_kind,
+            title = EXCLUDED.title,
+            compiled_truth = EXCLUDED.compiled_truth,
+            timeline = EXCLUDED.timeline,
+            frontmatter = EXCLUDED.frontmatter,
+            content_hash = EXCLUDED.content_hash,
+            updated_at = now(),
+            deleted_at = NULL,
+            effective_date        = COALESCE(EXCLUDED.effective_date,        pages.effective_date),
+            effective_date_source = COALESCE(EXCLUDED.effective_date_source, pages.effective_date_source),
+            import_filename       = COALESCE(EXCLUDED.import_filename,       pages.import_filename),
+            chunker_version       = COALESCE(EXCLUDED.chunker_version,       pages.chunker_version),
+            source_path           = COALESCE(EXCLUDED.source_path,           pages.source_path),
+            source_kind           = COALESCE(EXCLUDED.source_kind,           pages.source_kind),
+            source_uri            = COALESCE(EXCLUDED.source_uri,            pages.source_uri),
+            ingested_via          = COALESCE(EXCLUDED.ingested_via,          pages.ingested_via),
+            ingested_at           = COALESCE(EXCLUDED.ingested_at,           pages.ingested_at)
+          RETURNING id, source_id, slug, type, title, compiled_truth, timeline, frontmatter, content_hash, created_at, updated_at, effective_date, effective_date_source, import_filename, source_kind, source_uri, ingested_via, ingested_at
+        `;
+    if (rows.length === 0 && opts?.expectedContentHash !== undefined) throw new PageWriteConflictError(slug, sourceId, opts.expectedContentHash);
     return rowToPage(rows[0]);
   }
 

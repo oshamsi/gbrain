@@ -189,6 +189,65 @@ export async function pagesUpsertArbiterCheck(engine: BrainEngine): Promise<Chec
   }
 }
 
+/** Detect physical index/heap disagreement that catalog-shape checks miss. */
+export async function pagesIndexHeapParityCheck(engine: BrainEngine): Promise<Check> {
+  try {
+    const { checkPagesIndexHeapParity } = await import('../../../core/pages-index-integrity.ts');
+    const result = await checkPagesIndexHeapParity(engine);
+    if (!result.tablePresent) {
+      return { name: 'pages_index_heap_parity', status: 'ok', message: 'No pages table yet' };
+    }
+    if (result.status === 'inconclusive') {
+      return {
+        name: 'pages_index_heap_parity',
+        status: 'warn',
+        message: `Page index/heap probe was inconclusive: ${result.reason}. Re-run doctor before relying on indexed page lookups.`,
+        details: {
+          heap_rows: result.heapRows,
+          primary_index_rows: result.primaryIndexRows,
+          source_slug_index_rows: result.sourceSlugIndexRows,
+        },
+      };
+    }
+    if (result.status === 'mismatch') {
+      const primaryMissing = result.primaryDiff.missing.slice(0, 10).map((row) => row.id);
+      const primaryUnexpected = result.primaryDiff.unexpected.slice(0, 10).map((row) => row.id);
+      const slugMissing = result.sourceSlugDiff.missing.slice(0, 10).map((row) => row.id);
+      const slugUnexpected = result.sourceSlugDiff.unexpected.slice(0, 10).map((row) => row.id);
+      return {
+        name: 'pages_index_heap_parity',
+        status: 'fail',
+        message:
+          `pages heap/index mismatch: heap=${result.heapRows}, pages_pkey=${result.primaryIndexRows}, ` +
+          `pages_source_slug_key=${result.sourceSlugIndexRows}; missing IDs ` +
+          `pkey=[${primaryMissing.join(',')}], source_slug=[${slugMissing.join(',')}]; unexpected IDs ` +
+          `pkey=[${primaryUnexpected.join(',')}], source_slug=[${slugUnexpected.join(',')}]. ` +
+          `Stop writers, take a verified backup, reconcile duplicate page identities, then rebuild the indexes.`,
+        details: {
+          heap_rows: result.heapRows,
+          primary_index_rows: result.primaryIndexRows,
+          source_slug_index_rows: result.sourceSlugIndexRows,
+          primary_missing_ids: primaryMissing,
+          primary_unexpected_ids: primaryUnexpected,
+          source_slug_missing_ids: slugMissing,
+          source_slug_unexpected_ids: slugUnexpected,
+        },
+      };
+    }
+    return {
+      name: 'pages_index_heap_parity',
+      status: 'ok',
+      message: `pages heap agrees with primary and source/slug indexes (${result.heapRows} rows)`,
+    };
+  } catch (error) {
+    return {
+      name: 'pages_index_heap_parity',
+      status: 'warn',
+      message: `Could not compare pages indexes with the heap: ${error instanceof Error ? error.message : String(error)}`,
+    };
+  }
+}
+
 /**
  * Doctor check: JSONB columns are not double-encoded as strings.
  *
@@ -713,4 +772,3 @@ export async function checkPgliteScratchProbe(opts: {
     return { name, status: 'warn', message: `scratch probe could not run: ${msg}` };
   }
 }
-

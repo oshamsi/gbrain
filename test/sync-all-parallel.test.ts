@@ -181,23 +181,23 @@ describe('buildSyncStatusReport', () => {
       ],
     });
 
-    const report = await buildSyncStatusReport(engine, sources);
+    const report = await buildSyncStatusReport(engine, sources, { freshnessMode: 'stored' });
     expect(report.sources).toHaveLength(4);
 
     const byId = new Map(report.sources.map((s) => [s.source_id, s]));
     expect(byId.get('fresh')!.staleness_class).toBe('fresh');
     expect(byId.get('stale')!.staleness_class).toBe('stale');
     expect(byId.get('severe')!.staleness_class).toBe('severe');
-    expect(byId.get('never')!.staleness_class).toBe('unknown');
+    // Doctor treats a never-synced registered source as a failure; status must
+    // expose the same severe verdict instead of an independent "unknown".
+    expect(byId.get('never')!.staleness_class).toBe('severe');
     expect(byId.get('never')!.staleness_hours).toBeNull();
   });
 
-  // v0.41.32.0 (supersedes #1623): buildSyncStatusReport backs the REMOTE
-  // get_status_snapshot MCP op, so staleness reads the stored newest_content_at
-  // column (NO git subprocess on a DB-supplied local_path). The makeEngine stub
-  // never runs git — if buildSyncStatusReport shelled out it would hit the real
-  // filesystem; these cases prove it reads the column instead.
-  test('content-relative staleness reads newest_content_at column (remote path)', async () => {
+  // v0.41.32.0 (supersedes #1623): the report builder retains an explicit
+  // stored-column posture for checkout-less callers. Operational status and
+  // doctor opt into host mode so they share the same live evidence.
+  test('stored-mode content-relative staleness reads newest_content_at', async () => {
     const now = Date.now();
     const syncIso = new Date(now - 100 * 60 * 60 * 1000).toISOString(); // synced 100h ago
     const sources = [
@@ -231,7 +231,7 @@ describe('buildSyncStatusReport', () => {
       ],
     });
 
-    const report = await buildSyncStatusReport(engine, sources);
+    const report = await buildSyncStatusReport(engine, sources, { freshnessMode: 'stored' });
     const byId = new Map(report.sources.map((s) => [s.source_id, s]));
     // Three-way distinction, which is the whole point of the ramp:
     //   quiet_recent → 0    (caught up AND being checked)
@@ -271,7 +271,7 @@ describe('buildSyncStatusReport', () => {
       ],
     });
 
-    const report = await buildSyncStatusReport(engine, sources);
+    const report = await buildSyncStatusReport(engine, sources, { freshnessMode: 'stored' });
     const byId = new Map(report.sources.map((s) => [s.source_id, s]));
     expect(byId.get('a')!.embedding_coverage_pct).toBe(100);
     expect(byId.get('b')!.embedding_coverage_pct).toBe(50);
@@ -289,7 +289,7 @@ describe('buildSyncStatusReport', () => {
       countRows: [],
     });
 
-    const report = await buildSyncStatusReport(engine, sources);
+    const report = await buildSyncStatusReport(engine, sources, { freshnessMode: 'stored' });
     const byId = new Map(report.sources.map((s) => [s.source_id, s]));
     // syncEnabled omitted defaults to true (matches the loop's `!== false` check).
     expect(byId.get('on')!.sync_enabled).toBe(true);
@@ -316,14 +316,14 @@ describe('buildSyncStatusReport', () => {
     } as unknown as BrainEngine;
 
     // The function MUST throw, not swallow.
-    await expect(buildSyncStatusReport(engine, sources)).rejects.toThrow(
+    await expect(buildSyncStatusReport(engine, sources, { freshnessMode: 'stored' })).rejects.toThrow(
       /statement timeout/,
     );
   });
 
   test('empty source list returns empty array with schema_version: 1, not crash', async () => {
     const engine = makeEngine({ sourceRows: [], countRows: [] });
-    const report = await buildSyncStatusReport(engine, []);
+    const report = await buildSyncStatusReport(engine, [], { freshnessMode: 'stored' });
     expect(report.sources).toEqual([]);
     expect(report.schema_version).toBe(1);
     expect(typeof report.generated_at).toBe('string');
@@ -338,7 +338,7 @@ describe('buildSyncStatusReport', () => {
       sourceRows: [{ id: 'a', last_commit: 'abc', last_sync_at: new Date().toISOString() }],
       countRows: [{ source_id: 'a', pages: 5, chunks_total: 10, chunks_unembedded: 0 }],
     });
-    const report = await buildSyncStatusReport(engine, sources);
+    const report = await buildSyncStatusReport(engine, sources, { freshnessMode: 'stored' });
     // Pin every top-level key — the envelope is a public surface; monitoring
     // pipelines bind to it. New fields are additive; existing names + types
     // must not change without bumping schema_version.
@@ -367,7 +367,7 @@ describe('buildSyncStatusReport', () => {
       sourceRows: [{ id: 'a', last_commit: null, last_sync_at: null }],
       countRows: [],
     });
-    const report = await buildSyncStatusReport(engine, sources);
+    const report = await buildSyncStatusReport(engine, sources, { freshnessMode: 'stored' });
     // The default registry resolves 'embedding' for OpenAI-default setups.
     // Voyage / multimodal brains would see a different name here. The
     // contract is "the value is present and non-empty"; the specific

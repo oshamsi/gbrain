@@ -173,7 +173,7 @@ describe('buildSyncStatusReport against real PGLite (IRON RULE regression for Bl
     // The SQL must not throw. Pre-fix, the broken SQL would have thrown
     // `relation "chunks" does not exist` on PGLite (and Postgres). Post-
     // fix, the canonical `content_chunks JOIN pages ON page_id` shape parses.
-    const report = await buildSyncStatusReport(engine, sources);
+    const report = await buildSyncStatusReport(engine, sources, { freshnessMode: 'stored' });
 
     expect(report.schema_version).toBe(1);
     expect(report.sources).toHaveLength(2);
@@ -217,7 +217,7 @@ describe('buildSyncStatusReport against real PGLite (IRON RULE regression for Bl
       `SELECT id, name, local_path, config FROM sources
          WHERE local_path IS NOT NULL AND archived IS NOT TRUE ORDER BY id`,
     );
-    const report = await buildSyncStatusReport(engine, sources);
+    const report = await buildSyncStatusReport(engine, sources, { freshnessMode: 'stored' });
     const byId = new Map(report.sources.map((s) => [s.source_id, s]));
 
     const a = byId.get('source-a')!;
@@ -246,7 +246,7 @@ describe('buildSyncStatusReport against real PGLite (IRON RULE regression for Bl
     }>(
       `SELECT id, name, local_path, config FROM sources WHERE id = 'source-a'`,
     );
-    const report = await buildSyncStatusReport(engine, sources);
+    const report = await buildSyncStatusReport(engine, sources, { freshnessMode: 'stored' });
     const a = report.sources.find((s) => s.source_id === 'source-a')!;
     expect(a.pages).toBe(3);            // 4 raw rows, 1 soft-deleted → 3 active
     expect(a.chunks_total).toBe(6);     // 8 raw chunks, 2 on soft-deleted page → 6 active
@@ -284,7 +284,7 @@ describe('buildSyncStatusReport against real PGLite (IRON RULE regression for Bl
       `SELECT id, name, local_path, config FROM sources
          WHERE local_path IS NOT NULL AND archived IS NOT TRUE`,
     );
-    const report = await buildSyncStatusReport(engine, sources);
+    const report = await buildSyncStatusReport(engine, sources, { freshnessMode: 'stored' });
     expect(typeof report.embedding_column).toBe('string');
     expect(report.embedding_column.length).toBeGreaterThan(0);
   });
@@ -315,7 +315,7 @@ describe('buildSyncStatusReport against real PGLite (IRON RULE regression for Bl
       },
     } as unknown as BrainEngine;
 
-    await expect(buildSyncStatusReport(proxyEngine, sources)).rejects.toThrow(
+    await expect(buildSyncStatusReport(proxyEngine, sources, { freshnessMode: 'stored' })).rejects.toThrow(
       /count query failed/,
     );
   });

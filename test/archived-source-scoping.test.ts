@@ -100,7 +100,7 @@ describe('#3880 structural pins — all-source local_path selections filter arch
   const sites: Array<{ file: string; patched: number }> = [
     { file: 'src/commands/sync.ts', patched: 1 },
     { file: 'src/core/brain-writer.ts', patched: 1 },
-    { file: 'src/commands/doctor/checks/extraction-sync.ts', patched: 3 },
+    { file: 'src/commands/doctor/checks/extraction-sync.ts', patched: 2 },
     { file: 'src/commands/frontmatter-install-hook.ts', patched: 1 },
     { file: 'src/commands/sources-harden.ts', patched: 1 },
   ];
@@ -111,6 +111,13 @@ describe('#3880 structural pins — all-source local_path selections filter arch
       expect(filtered.length).toBeGreaterThanOrEqual(patched);
     });
   }
+
+  test('doctor sync freshness uses the canonical active-source selector', () => {
+    const doctorSrc = readFileSync('src/commands/doctor/checks/extraction-sync.ts', 'utf-8');
+    const selectorSrc = readFileSync('src/core/sync-freshness.ts', 'utf-8');
+    expect(doctorSrc).toContain('loadOperationalSyncSources(engine)');
+    expect(selectorSrc).toContain('WHERE local_path IS NOT NULL AND archived IS NOT TRUE');
+  });
 
   test('src/core/source-resolver.ts tier-4 selects the archived column for active-over-archived tiering', () => {
     // The resolver keeps archived rows in the SELECT (JS tiering) so a cwd

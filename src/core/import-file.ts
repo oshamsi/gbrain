@@ -2,6 +2,8 @@ import { readFileSync, statSync, lstatSync } from 'fs';
 import { basename, extname } from 'path';
 import { createHash } from 'crypto';
 import type { BrainEngine, FileSpec } from './engine.ts';
+import { assertExpectedPageHash } from './page-cas.ts';
+import { verifyPageReadable } from './page-write-verify.ts';
 import { parseMarkdown } from './markdown.ts';
 import { classifyStoredType } from './schema-pack/type-usage.ts';
 import { chunkText } from './chunkers/recursive.ts';
@@ -204,6 +206,21 @@ export interface ParsedPage {
   tags: string[];
 }
 
+/** A live page already owns the external identity supplied by this write. */
+export class DuplicatePageIdentityError extends Error {
+  constructor(
+    public readonly requestedSlug: string,
+    public readonly ownerSlug: string,
+    public readonly externalId: string,
+  ) {
+    super(
+      `[import] refusing ${requestedSlug}: frontmatter.id=${externalId} is already owned by ` +
+      `${ownerSlug}. External page identities must remain unique within a source.`,
+    );
+    this.name = 'DuplicatePageIdentityError';
+  }
+}
+
 export interface ImportResult {
   slug: string;
   status: 'imported' | 'skipped' | 'error';
@@ -216,6 +233,8 @@ export interface ImportResult {
    * Absent on early rejection before a page can be parsed.
    */
   parsedPage?: ParsedPage;
+  /** This CAS write committed, then a newer writer won before read-back. */
+  superseded_after_commit?: boolean;
   /** Content-quality gate (issue #1699): true when the page landed with a
    *  `quarantine` marker (high-confidence junk, hidden from search). */
   quarantined?: boolean;
@@ -336,6 +355,7 @@ export async function importFromContent(
      * and reindex leave it unset so the guard stays armed.
      */
     allowEmptyOverwrite?: boolean;
+    expectedContentHash?: string; // Existing-row CAS precondition; sync leaves it unset.
   } = {},
 ): Promise<ImportResult> {
   // Normalize BEFORE any tx write: putPage lowercases via validateSlug but
@@ -601,6 +621,7 @@ export async function importFromContent(
   // mirrors that default instead of matching the slug in ANY source (the
   // unscoped-check/scoped-write bug class).
   const existing = await engine.getPage(slug, { sourceId: sourceId ?? 'default' });
+  assertExpectedPageHash(existing, slug, sourceId ?? 'default', opts.expectedContentHash);
 
   // #2044: remote get_page intentionally strips private facts rows. A
   // documented get_page -> edit -> put_page round-trip can therefore arrive
@@ -675,7 +696,7 @@ export async function importFromContent(
     tags: parsed.tags,
   };
 
-  if (existing?.content_hash === hash && !opts.forceRechunk) {
+  if (opts.expectedContentHash === undefined && existing?.content_hash === hash && !opts.forceRechunk) {
     return { slug, status: 'skipped', chunks: 0, parsedPage, ...(typeWarning ? { type_warning: typeWarning } : {}) };
   }
 
@@ -684,7 +705,7 @@ export async function importFromContent(
   // the content is unchanged — stamp the canonical hash via the narrow
   // refreshPageBody UPDATE (no chunk churn, no re-embed, no version snapshot)
   // and skip. The next import then hits the fast path above.
-  if (existing && !opts.forceRechunk && typeof engine.refreshPageBody === 'function') {
+  if (opts.expectedContentHash === undefined && existing && !opts.forceRechunk && typeof engine.refreshPageBody === 'function') {
     const legacyHash = contentHashLegacy({
       title: parsed.title,
       type: parsed.type,
@@ -728,12 +749,18 @@ export async function importFromContent(
   // via the `?.` shape — no failure mode for fake engines.
   const fmId = (parsed.frontmatter as Record<string, unknown> | undefined)?.id;
   const fmIdStr = typeof fmId === 'string' && fmId.length > 0 ? fmId : null;
-  if (!opts.forceRechunk && engine.findDuplicatePage) {
+  // A CAS edit must stay on its named slug, but it must not bypass external
+  // identity uniqueness. In CAS mode we still inspect another live owner and
+  // reject a conflicting frontmatter.id instead of redirecting/skipping the
+  // requested update. forceRechunk retains its historical bypass only for
+  // non-CAS bulk maintenance.
+  if ((opts.expectedContentHash !== undefined || !opts.forceRechunk) && engine.findDuplicatePage) {
     let dup: { slug: string; id: number } | null = null;
     try {
       dup = await engine.findDuplicatePage(sourceId ?? 'default', {
         hash,
         frontmatterId: fmIdStr,
+        excludeSlug: slug,
       });
     } catch (err) {
       throw new Error(
@@ -748,6 +775,9 @@ export async function importFromContent(
       const dupFmIdStr = typeof dupFmId === 'string' && dupFmId.length > 0 ? dupFmId : null;
       const sameExternalId = fmIdStr !== null && dupFmIdStr === fmIdStr;
       if (sameExternalId) {
+        if (opts.expectedContentHash !== undefined) {
+          throw new DuplicatePageIdentityError(slug, dup.slug, fmIdStr);
+        }
         // True duplicate (same external ID). Skip + log to stderr.
         process.stderr.write(
           `[import] skipping ${opts.sourcePath ?? slug}: identical to ${dup.slug} ` +
@@ -896,7 +926,7 @@ export async function importFromContent(
   // schema DEFAULT — required for multi-source brains; harmless ('default')
   // for single-source callers.
   const txOpts = { sourceId: sourceId ?? 'default' };
-  await engine.transaction(async (tx) => {
+  const writtenPage = await engine.transaction(async (tx) => {
     if (existing) await tx.createVersion(slug, txOpts);
 
     // v0.29.1 — compute effective_date from frontmatter precedence chain.
@@ -916,7 +946,7 @@ export async function importFromContent(
       createdAt: existing?.created_at ?? nowDate,
     });
 
-    await tx.putPage(slug, {
+    const committedPage = await tx.putPage(slug, {
       type: parsed.type,
       title: parsed.title,
       compiled_truth: parsed.compiled_truth,
@@ -942,7 +972,7 @@ export async function importFromContent(
       // provenance write fires; never client-controlled.
       // Empty-overwrite escape hatch only when the caller vouched (file
       // import / explicit allow_empty); otherwise the engine guard stays on.
-    }, opts.allowEmptyOverwrite === true ? { ...txOpts, allowEmptyOverwrite: true } : txOpts);
+    }, { ...txOpts, ...(opts.allowEmptyOverwrite === true ? { allowEmptyOverwrite: true } : {}), ...(opts.expectedContentHash !== undefined ? { expectedContentHash: opts.expectedContentHash } : {}) });
 
     // v0.40.3.0: stamp the contextual retrieval state columns alongside
     // the page write. updatePageContextualRetrievalState is a narrow
@@ -1036,6 +1066,7 @@ export async function importFromContent(
         );
       } catch { /* same reason — silent skip */ }
     }
+    return committedPage;
   }).catch(async (err: unknown) => {
     // #4287: name the dimension-mismatch rollback instead of letting the bare
     // pgvector message ("expected N dimensions, not M") surface with no code,
@@ -1053,6 +1084,14 @@ export async function importFromContent(
     throw decorateEmbeddingDimError(err, slug, activeColName);
   });
 
+  const verification = await verifyPageReadable(
+    engine, slug, hash, sourceId, 'importFromContent', {
+      allowSuperseded: opts.expectedContentHash !== undefined,
+      committedPage: writtenPage,
+    },
+  );
+  const supersededAfterCommit = verification.outcome === 'superseded';
+
   // T3 — project frontmatter `aliases:` into page_aliases (free-text alias
   // resolution for search). Runs AFTER the page write commits so the slug
   // exists. Fail-soft: a pre-v110 brain has no page_aliases table yet (the
@@ -1060,100 +1099,30 @@ export async function importFromContent(
   // import. Always called (even with []) so REMOVING an alias from frontmatter
   // clears its row — the content_hash includes non-timestamp frontmatter, so
   // an alias edit changes the hash and reaches this path (not the skip branch).
-  try {
-    const aliasNorms = normalizeAliasList((parsed.frontmatter as Record<string, unknown>).aliases);
-    await engine.setPageAliases(slug, sourceId ?? 'default', aliasNorms);
-  } catch (e) {
-    if (!isUndefinedTableError(e)) {
-      warnOncePerProcess(
-        'setPageAliases:failed',
-        `[import] page_aliases projection failed (non-fatal): ${e instanceof Error ? e.message : String(e)}`,
-      );
+  if (!supersededAfterCommit) {
+    try {
+      const aliasNorms = normalizeAliasList((parsed.frontmatter as Record<string, unknown>).aliases);
+      await engine.setPageAliases(slug, sourceId ?? 'default', aliasNorms);
+    } catch (e) {
+      if (!isUndefinedTableError(e)) {
+        warnOncePerProcess(
+          'setPageAliases:failed',
+          `[import] page_aliases projection failed (non-fatal): ${e instanceof Error ? e.message : String(e)}`,
+        );
+      }
     }
   }
-
-  // Post-write read-back verification.
-  //
-  // After the transaction commits, the page MUST be resolvable via getPage.
-  // If the read-back returns null (or a stale content_hash), the operation
-  // fails LOUDLY — a non-zero exit + error surfaced to the ingest log — rather
-  // than reporting success. A write is not "done" until it is readable.
-  //
-  // This catches the silent-desync class: the page file exists on disk (or the
-  // git commit landed) but the DB index silently never picked it up. Without
-  // this guard, the operation reports success and the page is invisible to all
-  // reads (get_page, search, query) until someone notices the gap manually.
-  await verifyPageReadable(engine, slug, hash, sourceId, 'importFromContent');
 
   return {
     slug,
     status: 'imported',
     chunks: chunks.length,
-    parsedPage,
+    ...(!supersededAfterCommit ? { parsedPage } : {}),
+    ...(supersededAfterCommit ? { superseded_after_commit: true } : {}),
     ...(pageQuarantined ? { quarantined: true } : {}),
     ...(pageFlagged ? { flagged: true, flag_reason: pageFlagReason } : {}),
     ...(typeWarning ? { type_warning: typeWarning } : {}),
   };
-}
-
-/**
- * Post-write read-back assertion.
- *
- * After a page write transaction commits, verify the page is resolvable via
- * `getPage` and that its `content_hash` matches the hash we just wrote. If the
- * read-back fails (page not found or stale hash), throw a loud error so the
- * caller surfaces the failure instead of reporting success.
- *
- * This is the write-then-verify guard on the sync/write path: a write is not
- * "done" until it is readable back.
- */
-async function verifyPageReadable(
-  engine: BrainEngine,
-  slug: string,
-  expectedHash: string,
-  sourceId: string | undefined,
-  caller: string,
-): Promise<void> {
-  const readBack = await engine.getPage(slug, { sourceId: sourceId ?? 'default' });
-  if (!readBack) {
-    // Log to ingest_log before throwing so the failure is durable and
-    // agent-inspectable, not just a transient stderr message.
-    try {
-      await engine.logIngest({
-        source_type: 'write-verify-guard',
-        source_ref: slug,
-        pages_updated: [],
-        summary: `[${caller}] post-write read-back failed: page '${slug}' not found after write (source: ${sourceId ?? 'default'}). Silent desync — DB index did not pick up the write.`,
-        ...(sourceId ? { source_id: sourceId } : {}),
-      });
-    } catch {
-      // Best-effort: don't mask the original failure if logIngest itself fails.
-    }
-    throw new Error(
-      `[${caller}] post-write read-back failed: page '${slug}' not found after write ` +
-      `(source: ${sourceId ?? 'default'}). The page was written but the DB index ` +
-      `did not pick it up. This indicates a silent desync — the operation must fail loudly.`,
-    );
-  }
-  if (readBack.content_hash !== expectedHash) {
-    try {
-      await engine.logIngest({
-        source_type: 'write-verify-guard',
-        source_ref: slug,
-        pages_updated: [],
-        summary: `[${caller}] post-write read-back failed: page '${slug}' has stale content_hash (expected ${expectedHash.slice(0, 12)}, got ${(readBack.content_hash ?? '').slice(0, 12)}; source: ${sourceId ?? 'default'}). Silent desync — DB index has a stale row.`,
-        ...(sourceId ? { source_id: sourceId } : {}),
-      });
-    } catch {
-      // Best-effort.
-    }
-    throw new Error(
-      `[${caller}] post-write read-back failed: page '${slug}' has stale content_hash ` +
-      `(expected ${expectedHash.slice(0, 12)}, got ${(readBack.content_hash ?? '').slice(0, 12)}; ` +
-      `source: ${sourceId ?? 'default'}). The page was written but the DB index ` +
-      `has a stale row. This indicates a silent desync — the operation must fail loudly.`,
-    );
-  }
 }
 
 /**

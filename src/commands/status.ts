@@ -494,15 +494,18 @@ async function buildLocalReport(
     try {
       report.sync = await withSectionDeadline(
         (async () => {
-          const sources = await engine.executeRaw<{
-            id: string;
-            name: string;
-            local_path: string | null;
-            config: Record<string, unknown> | null;
-          }>(`SELECT id, name, local_path, config FROM sources ORDER BY id`);
+          const { loadOperationalSyncSources } = await import('../core/sync-freshness.ts');
+          const { parseSourceConfig } = await import('../core/sources-load.ts');
+          const sources = await loadOperationalSyncSources(engine);
           return buildSyncStatusReport(
             engine,
-            sources.map((s) => ({ id: s.id, name: s.name, local_path: s.local_path, config: s.config ?? {} })),
+            sources.map((source) => ({
+              id: source.id,
+              name: source.name,
+              local_path: source.local_path,
+              config: parseSourceConfig(source.config),
+            })),
+            { freshnessMode: 'host' },
           );
         })(),
         remaining(),

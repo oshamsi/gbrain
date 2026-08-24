@@ -143,6 +143,7 @@ describe('buildChecks — orchestrator against PGLite', () => {
     const names = new Set(checks.map(c => c.name));
     const loadBearing = [
       'connection',
+      'pages_index_heap_parity',
       'schema_version',
       'brain_score',
       'sync_freshness',

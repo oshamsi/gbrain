@@ -118,8 +118,8 @@ import * as codeEdgesImpl from './pglite-engine/code-edges.ts';
 import type { PgliteCodeEdgesDeps } from './pglite-engine/code-edges.ts';
 import * as salienceImpl from './pglite-engine/salience.ts';
 import type { PgliteSalienceDeps } from './pglite-engine/salience.ts';
+import { PAGE_CAS_UPDATE_SQL, PageWriteConflictError, type PutPageOptions } from './page-cas.ts';
 import { searchKeywordCJK } from './pglite-engine/cjk-search.ts';
-
 /**
  * #4284 — opt-in out-of-band watchdog for a PGLite disconnect with a live
  * handle. OFF by default: a DIAGNOSTIC/INCIDENT instrument (CI lanes, heavy
@@ -1672,22 +1672,24 @@ export class PGLiteEngine implements BrainEngine {
    */
   async findDuplicatePage(
     sourceId: string,
-    opts: { hash: string; frontmatterId?: string | null },
+    opts: { hash: string; frontmatterId?: string | null; excludeSlug?: string },
   ): Promise<{ slug: string; id: number } | null> {
     const fmId = opts.frontmatterId ?? null;
+    const excludeSlug = opts.excludeSlug ?? null;
     const sql = `SELECT id, slug FROM pages
        WHERE source_id = $1
          AND deleted_at IS NULL
          AND (content_hash = $2 OR (frontmatter->>'id' = $3 AND $3 IS NOT NULL))
-       ORDER BY id
+         AND ($4::text IS NULL OR slug <> $4)
+       ORDER BY CASE WHEN frontmatter->>'id' = $3 AND $3 IS NOT NULL THEN 0 ELSE 1 END, id
        LIMIT 1`;
-    const { rows } = await this.db.query(sql, [sourceId, opts.hash, fmId]);
+    const { rows } = await this.db.query(sql, [sourceId, opts.hash, fmId, excludeSlug]);
     if (rows.length === 0) return null;
     const r = rows[0] as { id: number | string; slug: string };
     return { slug: r.slug, id: Number(r.id) };
   }
 
-  async putPage(slug: string, page: PageInput, opts?: { sourceId?: string; allowEmptyOverwrite?: boolean }): Promise<Page> {
+  async putPage(slug: string, page: PageInput, opts?: PutPageOptions): Promise<Page> {
     slug = validateSlug(slug);
     const hash = page.content_hash || contentHash(page);
     const frontmatter = page.frontmatter || {};
@@ -1740,36 +1742,34 @@ export class PGLiteEngine implements BrainEngine {
     const sourceUri = page.source_uri ?? null;
     const ingestedVia = page.ingested_via ?? null;
     const ingestedAt = (sourceKind || sourceUri || ingestedVia) ? new Date().toISOString() : null;
-    const { rows } = await this.db.query(
-      `INSERT INTO pages (source_id, slug, type, page_kind, title, compiled_truth, timeline, frontmatter, content_hash, updated_at, effective_date, effective_date_source, import_filename, chunker_version, source_path, source_kind, source_uri, ingested_via, ingested_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, now(), $10::timestamptz, $11, $12, COALESCE($13, ${MARKDOWN_CHUNKER_VERSION}), $14, $15, $16, $17, $18::timestamptz)
-       ON CONFLICT (source_id, slug) DO UPDATE SET
-         type = EXCLUDED.type,
-         page_kind = EXCLUDED.page_kind,
-         title = EXCLUDED.title,
-         compiled_truth = EXCLUDED.compiled_truth,
-         timeline = EXCLUDED.timeline,
-         frontmatter = EXCLUDED.frontmatter,
-         content_hash = EXCLUDED.content_hash,
-         updated_at = now(),
-         deleted_at = NULL,
-         effective_date        = COALESCE(EXCLUDED.effective_date,        pages.effective_date),
-         effective_date_source = COALESCE(EXCLUDED.effective_date_source, pages.effective_date_source),
-         import_filename       = COALESCE(EXCLUDED.import_filename,       pages.import_filename),
-         chunker_version       = COALESCE(EXCLUDED.chunker_version,       pages.chunker_version),
-         source_path           = COALESCE(EXCLUDED.source_path,           pages.source_path),
-         source_kind           = COALESCE(EXCLUDED.source_kind,           pages.source_kind),
-         source_uri            = COALESCE(EXCLUDED.source_uri,            pages.source_uri),
-         ingested_via          = COALESCE(EXCLUDED.ingested_via,          pages.ingested_via),
-         ingested_at           = COALESCE(EXCLUDED.ingested_at,           pages.ingested_at)
-       RETURNING id, source_id, slug, type, title, compiled_truth, timeline, frontmatter, content_hash, created_at, updated_at, effective_date, effective_date_source, import_filename, source_kind, source_uri, ingested_via, ingested_at`,
-      [sourceId, slug, page.type, pageKind, page.title, page.compiled_truth, page.timeline || '', JSON.stringify(frontmatter), hash, effectiveDate, effectiveDateSource, importFilename, chunkerVersion, sourcePath, sourceKind, sourceUri, ingestedVia, ingestedAt]
-    );
-    // PGLite can return zero rows from INSERT ... ON CONFLICT DO UPDATE ...
-    // RETURNING in no-op/trigger edge cases, which made rowToPage(undefined)
-    // throw "undefined is not an object (evaluating 'row.deleted_at')" and
-    // skip the file during sync. The row WAS written, so re-read instead of
-    // crashing.
+    const rows = opts?.expectedContentHash !== undefined ? await this.executeRaw(PAGE_CAS_UPDATE_SQL, [page.type, pageKind, page.title, page.compiled_truth, page.timeline || '', JSON.stringify(frontmatter), hash, effectiveDate, effectiveDateSource, importFilename, chunkerVersion, sourcePath, sourceKind, sourceUri, ingestedVia, ingestedAt, sourceId, slug, opts.expectedContentHash]) : await this.db.query(
+          `INSERT INTO pages (source_id, slug, type, page_kind, title, compiled_truth, timeline, frontmatter, content_hash, updated_at, effective_date, effective_date_source, import_filename, chunker_version, source_path, source_kind, source_uri, ingested_via, ingested_at)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, now(), $10::timestamptz, $11, $12, COALESCE($13, ${MARKDOWN_CHUNKER_VERSION}), $14, $15, $16, $17, $18::timestamptz)
+           ON CONFLICT (source_id, slug) DO UPDATE SET
+             type = EXCLUDED.type,
+             page_kind = EXCLUDED.page_kind,
+             title = EXCLUDED.title,
+             compiled_truth = EXCLUDED.compiled_truth,
+             timeline = EXCLUDED.timeline,
+             frontmatter = EXCLUDED.frontmatter,
+             content_hash = EXCLUDED.content_hash,
+             updated_at = now(),
+             deleted_at = NULL,
+             effective_date        = COALESCE(EXCLUDED.effective_date,        pages.effective_date),
+             effective_date_source = COALESCE(EXCLUDED.effective_date_source, pages.effective_date_source),
+             import_filename       = COALESCE(EXCLUDED.import_filename,       pages.import_filename),
+             chunker_version       = COALESCE(EXCLUDED.chunker_version,       pages.chunker_version),
+             source_path           = COALESCE(EXCLUDED.source_path,           pages.source_path),
+             source_kind           = COALESCE(EXCLUDED.source_kind,           pages.source_kind),
+             source_uri            = COALESCE(EXCLUDED.source_uri,            pages.source_uri),
+             ingested_via          = COALESCE(EXCLUDED.ingested_via,          pages.ingested_via),
+             ingested_at           = COALESCE(EXCLUDED.ingested_at,           pages.ingested_at)
+           RETURNING id, source_id, slug, type, title, compiled_truth, timeline, frontmatter, content_hash, created_at, updated_at, effective_date, effective_date_source, import_filename, source_kind, source_uri, ingested_via, ingested_at`,
+          [sourceId, slug, page.type, pageKind, page.title, page.compiled_truth, page.timeline || '', JSON.stringify(frontmatter), hash, effectiveDate, effectiveDateSource, importFilename, chunkerVersion, sourcePath, sourceKind, sourceUri, ingestedVia, ingestedAt],
+        ).then(result => result.rows);
+    if (rows.length === 0 && opts?.expectedContentHash !== undefined) throw new PageWriteConflictError(slug, sourceId, opts.expectedContentHash);
+    // PGLite can return zero rows from INSERT ... RETURNING in no-op/trigger
+    // edge cases. Re-read the written row rather than crashing on undefined.
     if (rows.length === 0) {
       const reread = await this.getPage(slug, { sourceId });
       if (reread) return reread;

@@ -8,11 +8,14 @@
 
 import { describe, expect, test, beforeEach, afterAll } from 'bun:test';
 import { existsSync, mkdtempSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   isSourceUnchangedSinceSync,
   probeSourceGitState,
+  probeSourceGitStateAsync,
+  _setAsyncGitStateProbeForTests,
   _setGitHeadProbeForTests,
   _setGitCleanProbeForTests,
   type GitHeadProbe,
@@ -23,12 +26,14 @@ import {
 beforeEach(() => {
   _setGitHeadProbeForTests(null);
   _setGitCleanProbeForTests(null);
+  _setAsyncGitStateProbeForTests(null);
 });
 
 afterAll(() => {
   // Restore defaults so other test files inheriting the module state are clean.
   _setGitHeadProbeForTests(null);
   _setGitCleanProbeForTests(null);
+  _setAsyncGitStateProbeForTests(null);
 });
 
 describe('isSourceUnchangedSinceSync — basic predicate', () => {
@@ -232,5 +237,44 @@ describe('probeSourceGitState — three-state verdict', () => {
     _setGitHeadProbeForTests(() => null);  // unavailable → false
     expect(isSourceUnchangedSinceSync('/tmp/gone', 'abc123'))
       .toBe(probeSourceGitState('/tmp/gone', 'abc123') === 'unchanged');
+  });
+});
+
+describe('probeSourceGitStateAsync — bounded operational probe', () => {
+  test('one async status call observes HEAD, tracked dirt, and ignores untracked files', async () => {
+    const repo = mkdtempSync(join(tmpdir(), 'git-head-async-'));
+    try {
+      execFileSync('git', ['init', '--quiet', repo]);
+      execFileSync('git', ['-C', repo, 'config', 'user.name', 'gbrain test']);
+      execFileSync('git', ['-C', repo, 'config', 'user.email', 'test@gbrain.invalid']);
+      writeFileSync(join(repo, 'tracked.md'), 'one\n');
+      execFileSync('git', ['-C', repo, 'add', 'tracked.md']);
+      execFileSync('git', ['-C', repo, 'commit', '--quiet', '-m', 'initial']);
+      const head = execFileSync('git', ['-C', repo, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+      const opts = { requireCleanWorkingTree: 'ignore-untracked' as const, timeoutMs: 1_000 };
+
+      expect(await probeSourceGitStateAsync(repo, head, opts)).toBe('unchanged');
+      writeFileSync(join(repo, 'untracked.md'), 'ignored\n');
+      expect(await probeSourceGitStateAsync(repo, head, opts)).toBe('unchanged');
+      writeFileSync(join(repo, 'tracked.md'), 'changed\n');
+      expect(await probeSourceGitStateAsync(repo, head, opts)).toBe('changed');
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  });
+
+  test('array argv keeps an adversarial registered path out of a shell', async () => {
+    const sentinelDir = mkdtempSync(join(tmpdir(), 'git-head-async-sentinel-'));
+    const sentinelPath = join(sentinelDir, 'pwned');
+    const adversarialPath = `/nonexistent/$(touch ${sentinelPath})/repo`;
+    try {
+      expect(await probeSourceGitStateAsync(adversarialPath, 'abc123', {
+        requireCleanWorkingTree: 'ignore-untracked',
+        timeoutMs: 500,
+      })).toBe('unavailable');
+      expect(existsSync(sentinelPath)).toBe(false);
+    } finally {
+      rmSync(sentinelDir, { recursive: true, force: true });
+    }
   });
 });

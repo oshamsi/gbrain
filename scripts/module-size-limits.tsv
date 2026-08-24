@@ -19,7 +19,7 @@ src/core/engine.ts	2495	ratchet	grown v0.46.26.0 megawave: relational/visibility
 src/commands/autopilot.ts	2641	ratchet	grown v0.46.26.0 megawave (#4300 #4285 #3696) + master v0.46.27.0 env-file lane + boot warning + reload-safe install (#2608 #4443) + 1 nosemgrep dataflow annotation (path-traversal audit)
 src/commands/extract.ts	2332	ratchet	grown v0.46.26.0 megawave: FS-walk stamp snapshot + legacy timeline repair wiring (#3957 D4)
 src/commands/extract-conversation-facts.ts	2045	ratchet	grown v0.46.x per-provider gateway-unavailable copy
-src/core/import-file.ts	2142	ratchet	grown v0.46.26.0 megawave: OCR budget + image import + embed-retry rewire (#3973 #3374)
+src/core/import-file.ts	2111	ratchet	A2 CAS and external-identity guards; still below the 2142-line pre-repair baseline
 src/core/cycle/synthesize.ts	2792	ratchet	merged waves; grown v0.46.26.0 megawave + master rolling lease via shared throttled renewer
 src/commands/embed.ts	1896	ratchet	lowered v0.46.26.0: embedBatchWithBackoff + retry cluster peeled to core/embed-retry.ts (core/commands layering fix)
 src/core/types.ts	1946	ratchet	grown v0.46.26.0 megawave: EvidenceOpts, pacing/usage result fields, PageFilters growth (#4352 #4218)

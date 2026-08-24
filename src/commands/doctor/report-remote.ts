@@ -165,6 +165,11 @@ export async function doctorReportRemote(
     checks.push(await pagesUpsertArbiterCheck(engine));
   }
 
+  {
+    const { pagesIndexHeapParityCheck } = await import('./checks/core-health.ts');
+    checks.push(await pagesIndexHeapParityCheck(engine));
+  }
+
   // v0.42.x — Life Chronicle (#2390): orphaned event projections. Reads already
   // hide projections whose event page is soft-deleted (read-time correctness);
   // this always-run probe surfaces the cleanup backlog. Keyed off the real
@@ -361,8 +366,9 @@ export async function doctorReportRemote(
   // other sources' activity counts/timestamps.
   checks.push(await checkVolunteerChannels(engine, { sourceIds: opts.sourceIds }));
 
-  // 6. Sync freshness check
-  checks.push(await checkSyncFreshness(engine));
+  // 6. Sync freshness check. This admin health surface intentionally uses
+  // the same registered-host evidence as get_status_snapshot.
+  checks.push(await checkSyncFreshness(engine, { freshnessMode: 'host' }));
 
   // v0.41.19.0 (Issue 5): sync --all consolidation nudge for multi-source brains.
   checks.push(await checkSyncConsolidation(engine));

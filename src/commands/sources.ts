@@ -1036,41 +1036,19 @@ async function runFederate(engine: BrainEngine, args: string[], value: boolean):
 // ── v0.40 sources status (D12) ──────────────────────────────
 async function runStatus(engine: BrainEngine, args: string[]): Promise<void> {
   const json = args.includes('--json');
-  const { loadAllSources } = await import('../core/sources-load.ts');
-  const { computeAllSourceMetrics } = await import('../core/source-health.ts');
-  const sources = await loadAllSources(engine, { includeArchived: false });
-  if (sources.length === 0) {
+  const { buildSourceStatusMetrics } = await import('../core/source-status-snapshot.ts');
+  const metrics = await buildSourceStatusMetrics(engine);
+  if (metrics.length === 0) {
     if (json) {
       console.log(JSON.stringify({ schema_version: 1, sources: [] }, null, 2));
     } else {
-      console.log('No sources registered. Use `gbrain sources add <id> --path <path>` first.');
+      console.log('No active sources with a local path. Use `gbrain sources add <id> --path <path>` first.');
     }
     return;
   }
-  // Local CLI on the trusted host: probe the live commit hash so a quiet,
-  // caught-up source reports lag 0 instead of growing wall-clock (v0.41.32.0).
-  const metrics = await computeAllSourceMetrics(engine, sources, { probeContent: true });
-
-  // #1950: a source holding a live (non-TTL-expired) per-source sync lock is
-  // actively syncing RIGHT NOW. Without this it printed "idle" while a sync
-  // proc was live (the bug reported). Read the SAME live-lock signal `gbrain
-  // doctor` uses, via the shared helper, so the two surfaces never disagree.
-  const { liveSyncStatus } = await import('../core/db-lock.ts');
-  const syncRunning = new Map<string, { holder_pid: number; holder_host: string }>();
-  await Promise.all(
-    metrics.map(async (m) => {
-      const live = await liveSyncStatus(engine, m.source_id);
-      if (live) syncRunning.set(m.source_id, live);
-    }),
-  );
 
   if (json) {
-    const enriched = metrics.map((m) => ({
-      ...m,
-      sync_running: syncRunning.has(m.source_id),
-      sync_holder: syncRunning.get(m.source_id) ?? null,
-    }));
-    console.log(JSON.stringify({ schema_version: 1, sources: enriched }, null, 2));
+    console.log(JSON.stringify({ schema_version: 1, sources: metrics }, null, 2));
     return;
   }
 
@@ -1089,7 +1067,7 @@ async function runStatus(engine: BrainEngine, args: string[]): Promise<void> {
     // cron operator sees deferred embedding work after `sync --all`.
     // #1950: a live sync lock wins the column — surfacing "actively syncing"
     // matters more than deferred embed-backfill state.
-    const backfill = syncRunning.has(m.source_id)
+    const backfill = m.sync_running
       ? 'running'
       : m.backfill_active > 0
         ? `active(${m.backfill_active})`
@@ -1107,7 +1085,7 @@ async function runStatus(engine: BrainEngine, args: string[]): Promise<void> {
     const warns: string[] = [];
     if (!m.local_path) warns.push('no local_path');
     // #1950: don't cry "never synced" while a sync lock is live — it's syncing now.
-    if (m.lag_seconds === null && !syncRunning.has(m.source_id)) {
+    if (m.lag_seconds === null && !m.sync_running) {
       warns.push(`never synced — run \`gbrain sync --source ${m.source_id}\``);
     }
     if (m.embed_coverage_pct < 95 && m.total_chunks > 100) {

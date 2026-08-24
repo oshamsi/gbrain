@@ -7,12 +7,12 @@
 import { join } from 'path';
 import { existsSync, readdirSync } from 'fs';
 import type { BrainEngine } from '../../../core/engine.ts';
-import { probeSourceGitState } from '../../../core/git-head.ts';
-// v0.41.32.0: remote staleness reads the stored newest_content_at column via
-// this pure comparator (no git subprocess on the HTTP MCP doctor path).
-import { lagFromContentMs, resolveStalenessCeilingSeconds } from '../../../core/source-health.ts';
-import { resolveEnvNumber, resolveHoursEnv, warnOnceForEnv } from '../../../core/env-number.ts';
-import { CHUNKER_VERSION } from '../../../core/chunkers/code.ts';
+import {
+  evaluateSyncFreshnessSources,
+  loadOperationalSyncSources,
+  type SyncFreshnessMode,
+} from '../../../core/sync-freshness.ts';
+import { resolveEnvNumber, warnOnceForEnv } from '../../../core/env-number.ts';
 import { LINK_EXTRACTOR_VERSION_TS } from '../../../core/link-extraction.ts';
 import { isUndefinedColumnError } from '../../../core/utils.ts';
 import {
@@ -28,7 +28,6 @@ import type { Check } from '../../doctor.ts';
 
 /** Local aliases; the shared warn-once memo lives in core so it can't fork per module. */
 const _resolveEnvNumber = resolveEnvNumber;
-const _resolveSyncFreshnessHours = resolveHoursEnv;
 
 /**
  * v0.42.7 (#1696): single source of truth for the extraction-lag warn
@@ -47,13 +46,11 @@ export const EXTRACTION_LAG_MIN_PAGES = 100;
  * been synced recently. Detects the silent failure mode where `gbrain sync`
  * stopped running and brain search now misses recent pages.
  *
- * Pure staleness check. Reads `sources.last_sync_at` only — no filesystem
- * access. Filesystem-vs-DB drift detection is intentionally out of scope:
- *   - doctorReportRemote runs in the HTTP MCP server (src/commands/serve-http.ts);
- *     walking arbitrary DB-supplied paths from a remote-callable endpoint
- *     crosses a trust boundary (OAuth write scope could mutate local_path).
- *   - Drift detection belongs in `multi_source_drift` which already has
- *     GBRAIN_DRIFT_LIMIT + GBRAIN_DRIFT_TIMEOUT_MS guards.
+ * Classification is delegated to `core/sync-freshness.ts`, the same evaluator
+ * used by `get_status_snapshot`. The host-aware mode checks only registered
+ * source rows, uses shell-free Git argv calls with timeouts, and falls back to
+ * the stored content timestamp when a checkout is unavailable. Callers that
+ * cannot inspect the host can explicitly request `freshnessMode: 'stored'`.
  *
  * Thresholds (env-overridable, default = 24h warn / 72h fail):
  *   - GBRAIN_SYNC_FRESHNESS_WARN_HOURS
@@ -787,275 +784,112 @@ export async function computeExtractHealthCheck(
 
 export async function checkSyncFreshness(
   engine: BrainEngine,
-  opts?: { nowMs?: number; localOnly?: boolean },
+  opts?: { nowMs?: number; localOnly?: boolean; freshnessMode?: SyncFreshnessMode },
 ): Promise<Check> {
   try {
-    // v0.41.27.0: SELECT widens to carry last_commit + chunker_version so
-    // the git short-circuit gate (below) can compare against what
-    // `gbrain sync`'s up-to-date predicate at sync.ts:1057+1075 checks.
-    // Columns existed pre-v0.41 (writeSyncAnchor / writeChunkerVersion);
-    // no schema migration needed.
-    type FreshnessSourceRow = {
-      id: string;
-      name: string;
-      local_path: string | null;
-      last_sync_at: Date | null;
-      last_commit: string | null;
-      chunker_version: string | null;
-      newest_content_at: Date | null;
-    };
-    // v0.41.32.0: newest_content_at feeds the REMOTE (non-localOnly) lag so
-    // doctorReportRemote never shells out to git on a DB-supplied local_path.
-    // #3880: archived sources don't participate in freshness health (v34
-    // legacy fallback).
-    let sources: FreshnessSourceRow[];
-    try {
-      sources = await engine.executeRaw<FreshnessSourceRow>(
-        `SELECT id, name, local_path, last_sync_at, last_commit, chunker_version, newest_content_at FROM sources WHERE local_path IS NOT NULL AND archived IS NOT TRUE`,
-      );
-    } catch {
-      sources = await engine.executeRaw<FreshnessSourceRow>(
-        `SELECT id, name, local_path, last_sync_at, last_commit, chunker_version, newest_content_at FROM sources WHERE local_path IS NOT NULL`,
-      );
-    }
+    const sources = await loadOperationalSyncSources(engine);
 
     if (sources.length === 0) {
       return {
         name: 'sync_freshness',
         status: 'ok',
         message: 'No federated sources to sync',
-        details: { unchanged_count: 0, synced_recently_count: 0, stale_count: 0 },
+        details: {
+          unchanged_count: 0,
+          synced_recently_count: 0,
+          stale_count: 0,
+          source_verdicts: [],
+        },
       };
     }
 
-    const warnHours = _resolveSyncFreshnessHours('GBRAIN_SYNC_FRESHNESS_WARN_HOURS', 24);
-    const failHours = _resolveSyncFreshnessHours('GBRAIN_SYNC_FRESHNESS_FAIL_HOURS', 72);
-    const warnMs = warnHours * 60 * 60 * 1000;
-    const failMs = failHours * 60 * 60 * 1000;
-
-    // `opts.nowMs` is a test-only injection seam for the boundary tests.
-    // Without it, the two `Date.now()` calls (one in the test's `agoMs`
-    // helper, one here) drift apart by microseconds-to-milliseconds, which
-    // pushes "exactly 72h ago" above the strict `>` threshold and flips the
-    // status from warn to fail (CI-flaky, see PR #1138 ship). Production
-    // callers omit `nowMs` and get live wall-clock semantics.
-    const now = opts?.nowMs ?? Date.now();
-
-    // v0.41.27.0: D4 trust boundary. The git short-circuit runs ONLY when
-    // the caller explicitly opts in via `localOnly: true`. Default (false)
-    // preserves the v0.32.4 trust boundary for `doctorReportRemote` (the
-    // HTTP MCP path) — a remote-callable code path must NOT walk
-    // DB-supplied `local_path` values with subprocess calls. runDoctor
-    // (local CLI) passes true; doctorReportRemote keeps the default.
-    const localOnly = opts?.localOnly === true;
-
-    // v0.41.27.0: D7 narrowed predicate. The CHUNKER_VERSION caller-side
-    // check mirrors sync.ts:1057's chunker-version gate so doctor agrees
-    // with sync on "is there work to do?". `sources.chunker_version` is
-    // a TEXT column storing String(CHUNKER_VERSION).
-    const currentChunkerVersion = String(CHUNKER_VERSION);
+    // The default is the host-aware path for both local doctor and the admin
+    // MCP doctor surface. `localOnly:false` remains an explicit escape hatch
+    // for callers that require the stored-column-only posture.
+    const mode = opts?.freshnessMode ?? (opts?.localOnly === false ? 'stored' : 'host');
+    const verdicts = await evaluateSyncFreshnessSources(engine, sources, {
+      nowMs: opts?.nowMs,
+      mode,
+    });
 
     const issues: string[] = [];
-    // v0.41.27.0: D6 three-bucket count math. Every source falls into
-    // EXACTLY ONE bucket per iteration. Invariant pinned by unit test:
-    //   unchanged_count + synced_recently_count + stale_count === sources.length
-    // Stale subsumes warn + fail + never-synced + future-timestamp; we keep
-    // hasWarnings/hasFailures for the existing return-status logic.
+    const inProgress: string[] = [];
     let unchanged_count = 0;
     let synced_recently_count = 0;
     let stale_count = 0;
     let hasWarnings = false;
     let hasFailures = false;
-
-    // BUG 4 (v0.42.x): a source with a LIVE, non-expired per-source sync lock is
-    // actively syncing RIGHT NOW — it must not read as stale or never-synced.
-    // The live lock is the only honest "in progress" signal. Checkpoint banking
-    // is NOT usable: a blocked sync banks the good files then writes no anchor
-    // (test/sync-resumable-import.serial.test.ts), so banking can't tell
-    // in-progress from wedged. A blocked/failed sync's process has exited (no
-    // lock row) and a wedged holder stops refreshing (TTL lapses), so either
-    // correctly falls through to the stale path and is NEVER masked. Same
-    // dynamic import as the stale_locks check; any throw (stub engine in unit
-    // tests, pre-lock-table brain) is swallowed to false, so this can only ADD
-    // an in-progress verdict, never suppress a real stale one.
-    // Notes for sources caught actively syncing (surfaced in the result
-    // message so the operator sees "in progress", not just a silent healthy
-    // bucket). Empty when nothing is syncing — keeps the steady-state messages
-    // byte-for-byte unchanged.
-    const inProgress: string[] = [];
-    let liveSyncSnap: (sourceId: string) => Promise<{ holder_pid: number; holder_host: string; age_ms: number } | null> =
-      async () => null;
-    try {
-      const { inspectLock, syncLockId } = await import('../../../core/db-lock.ts');
-      liveSyncSnap = async (sourceId: string) => {
-        try {
-          const snap = await inspectLock(engine, syncLockId(sourceId));
-          return snap && !snap.ttl_expired
-            ? { holder_pid: snap.holder_pid, holder_host: snap.holder_host, age_ms: snap.age_ms }
-            : null;
-        } catch {
-          return null;
-        }
-      };
-    } catch {
-      /* db-lock unavailable — skip in-progress detection, staleness stands. */
-    }
-
-    // One ceiling for the whole report: hoisted out of the loop so every
-    // source is judged against the same number (and the env read + warn-once
-    // machinery runs once, not once per source).
-    const stalenessCeilingSeconds = resolveStalenessCeilingSeconds();
-    for (const source of sources) {
-      // Embed source.id in user-visible messages so `gbrain sync --source <id>`
-      // matches what the user copy-pastes. Show display name in parens when set.
-      const display = source.name && source.name !== source.id
-        ? `'${source.id}' (${source.name})`
-        : `'${source.id}'`;
-
-      // BUG 4: actively syncing (live lock) → healthy, count as synced_recently
-      // and skip the staleness checks. Keeps the 3-bucket invariant intact.
-      //
-      // ...but ONLY up to the staleness ceiling. `withRefreshingLock` bumps the
-      // heartbeat on its own timer regardless of whether the import is making
-      // forward progress (`liveSyncStatus`'s docstring is explicit: callers may
-      // report "running", NOT "healthy"). So a holder blocked inside a query
-      // keeps refreshing forever, and an uncapped in-progress verdict would
-      // mask that source from every staleness check indefinitely — the same
-      // invisible-failure class this whole pass exists to close, just reached
-      // through the lock table instead of the freshness column.
-      const liveSnap = await liveSyncSnap(source.id);
-      if (liveSnap) {
-        const ceilingMs = stalenessCeilingSeconds * 1000;
-        if (liveSnap.age_ms <= ceilingMs) {
-          inProgress.push(`${display} sync in progress (pid ${liveSnap.holder_pid} on ${liveSnap.holder_host})`);
-          synced_recently_count++;
-          continue;
-        }
-        // Sub-hour ceilings are legal (fractional env override), and an alarm
-        // that names a zero duration ("held the lock for 0h") reads as broken.
-        const heldFor = liveSnap.age_ms >= 3600_000
-          ? `${Math.floor(liveSnap.age_ms / 3600_000)}h`
-          : `${Math.max(1, Math.floor(liveSnap.age_ms / 60_000))}m`;
-        issues.push(
-          `Source ${display} has held the sync lock for ${heldFor} ` +
-          `(pid ${liveSnap.holder_pid} on ${liveSnap.holder_host}) — heartbeating but not finishing. ` +
-          `Run \`gbrain sync --break-lock --source ${source.id}\` after confirming the holder is wedged.`,
-        );
-        hasFailures = true;
-        stale_count++;
-        continue;
-      }
-
-      if (!source.last_sync_at) {
-        issues.push(`Source ${display} has never been synced`);
-        hasFailures = true;
-        stale_count++;
-        continue;
-      }
-
-      const lastSync = new Date(source.last_sync_at).getTime();
-      const ageMs = now - lastSync;
-
-      if (ageMs < 0) {
-        issues.push(
-          `Source ${display} has future last_sync_at — clock skew or corrupted timestamp`,
-        );
-        hasWarnings = true;
-        stale_count++;
-        continue;
-      }
-
-      // v0.41.27.0: git short-circuit (D4 + D7 combined). Only fires when:
-      //   1. caller opted in via localOnly=true (trust boundary)
-      //   2. HEAD === last_commit (no new commits to sync)
-      //   3. working tree has no TRACKED changes — untracked files ignored
-      //      (v0.41.32.0: `'ignore-untracked'`. Sync's incremental path keys off
-      //      the commit diff and never imports untracked files, so a quiet repo
-      //      with stray untracked dirs is genuinely caught up. The pre-v0.41.30
-      //      `true` mode counted those as dirty and produced the false-SEVERE
-      //      alarm this wave fixes.)
-      //   4. chunker_version matches CURRENT (no post-upgrade re-chunk pending —
-      //      still ANDed, so a re-chunk need is never masked)
-      // All four must hold; otherwise fall through to the time-based check.
-      // The chunker version match is computed here (not in the helper)
-      // because it depends on engine state, not git state.
-      //
-      // Clone-unavailable fallback: on stateless deploys (Docker on EB /
-      // K8s / Fly — the platforms the cloud recipes produce), a container
-      // restart wipes `local_path` and each clone is only re-materialized
-      // when that source's next sync job runs. Until then the HEAD probe
-      // cannot run at all ('unavailable'), which previously fell through to
-      // raw wall-clock age — and since a no-op sync doesn't advance
-      // `last_sync_at`, every QUIET source read as stale/FAIL after a
-      // restart (score-sinking alert storm; observed live: 16-source brain,
-      // 12 clones gone after a config-update restart, doctor 70→30).
-      // 'unavailable' + chunker match now reuses the v0.41.32.0 REMOTE lag
-      // signal (newest_content_at) below — DB-only, no subprocess, and it
-      // still reports staleness whenever content really is newer than the
-      // last sync. 'changed' (readable clone with real work) keeps
-      // wall-clock exactly as before, and a chunker mismatch is never
-      // masked (D7): it disables the fallback too.
-      let cloneUnavailable = false;
-      if (localOnly) {
-        const gitState = probeSourceGitState(
-          source.local_path,
-          source.last_commit,
-          { requireCleanWorkingTree: 'ignore-untracked' },
-        );
-        const chunkerMatch = source.chunker_version === currentChunkerVersion;
-        if (gitState === 'unchanged' && chunkerMatch) {
-          unchanged_count++;
-          continue;
-        }
-        cloneUnavailable = gitState === 'unavailable' && chunkerMatch;
-      }
-
-      // v0.41.32.0: REMOTE path (doctorReportRemote, !localOnly) computes lag
-      // from the stored newest_content_at column — NO git subprocess on a
-      // DB-supplied local_path (preserves the v0.41.27.0 trust boundary). A
-      // quiet repo whose newest commit predates its last sync reports 0; NULL
-      // column → wall-clock fallback. LOCAL fall-through keeps wall-clock when
-      // the clone is READABLE: the short-circuit failed on real evidence
-      // (HEAD moved / dirty tree), so the source genuinely has work and
-      // "hours since last sync" is the right staleness measure. A local clone
-      // that is UNAVAILABLE (not yet re-materialized, see above) carries no
-      // evidence either way, so it borrows this same DB-only lag. The
-      // `ageMs < 0` skew check above still runs on raw wall-clock for both
-      // paths (A1).
-      let thresholdAgeMs = ageMs;
-      if (!localOnly || cloneUnavailable) {
-        const contentMs = source.newest_content_at
-          ? new Date(source.newest_content_at).getTime()
-          : null;
-        const lagSec = lagFromContentMs(
-          contentMs !== null && Number.isFinite(contentMs) ? contentMs : null,
-          lastSync,
-          now,
-          stalenessCeilingSeconds,
-        );
-        thresholdAgeMs = lagSec === null ? ageMs : lagSec * 1000;
-      }
-
-      const ageHours = Math.floor(thresholdAgeMs / (1000 * 60 * 60));
+    for (const verdict of verdicts) {
+      const display = verdict.source_name && verdict.source_name !== verdict.source_id
+        ? `'${verdict.source_id}' (${verdict.source_name})`
+        : `'${verdict.source_id}'`;
+      const ageMs = verdict.threshold_age_ms ?? 0;
+      const ageHours = Math.floor(ageMs / 3_600_000);
       const ageDays = Math.floor(ageHours / 24);
 
-      if (thresholdAgeMs > failMs) {
-        issues.push(`Source ${display} last synced ${ageDays}d ago — brain search is stale!`);
-        hasFailures = true;
-        stale_count++;
-      } else if (thresholdAgeMs > warnMs) {
-        issues.push(`Source ${display} last synced ${ageHours}h ago`);
-        hasWarnings = true;
-        stale_count++;
-      } else {
-        synced_recently_count++;
+      if (verdict.reason === 'unchanged') unchanged_count++;
+      else if (verdict.check_status === 'ok') synced_recently_count++;
+      else stale_count++;
+
+      if (verdict.check_status === 'fail') hasFailures = true;
+      if (verdict.check_status === 'warn') hasWarnings = true;
+
+      switch (verdict.reason) {
+        case 'sync_in_progress': {
+          const lock = verdict.lock!;
+          inProgress.push(`${display} sync in progress (pid ${lock.holder_pid} on ${lock.holder_host})`);
+          break;
+        }
+        case 'wedged_sync_lock': {
+          const lock = verdict.lock!;
+          const heldFor = lock.age_ms >= 3_600_000
+            ? `${Math.floor(lock.age_ms / 3_600_000)}h`
+            : `${Math.max(1, Math.floor(lock.age_ms / 60_000))}m`;
+          issues.push(
+            `Source ${display} has held the sync lock for ${heldFor} ` +
+            `(pid ${lock.holder_pid} on ${lock.holder_host}) — heartbeating but not finishing. ` +
+            `Run \`gbrain sync --break-lock --source ${verdict.source_id}\` after confirming the holder is wedged.`,
+          );
+          break;
+        }
+        case 'never_synced':
+          issues.push(`Source ${display} has never been synced`);
+          break;
+        case 'invalid_last_sync':
+          issues.push(`Source ${display} has an invalid last_sync_at timestamp`);
+          break;
+        case 'future_last_sync':
+          issues.push(`Source ${display} has future last_sync_at — clock skew or corrupted timestamp`);
+          break;
+        case 'fail_age':
+          issues.push(`Source ${display} last synced ${ageDays}d ago — brain search is stale!`);
+          break;
+        case 'warn_age':
+          issues.push(`Source ${display} last synced ${ageHours}h ago`);
+          break;
+        case 'unchanged':
+        case 'recent':
+          break;
       }
     }
 
-    // D6 invariant: every source incremented exactly one bucket.
-    const details = { unchanged_count, synced_recently_count, stale_count };
-    // BUG 4: append in-progress context when any source is actively syncing.
-    // Empty otherwise, so steady-state messages are byte-for-byte unchanged.
+    const details = {
+      unchanged_count,
+      synced_recently_count,
+      stale_count,
+      source_verdicts: verdicts.map((verdict) => ({
+        source_id: verdict.source_id,
+        staleness_class: verdict.staleness_class,
+        check_status: verdict.check_status,
+        reason: verdict.reason,
+        raw_age_hours: verdict.raw_age_ms === null
+          ? null
+          : Math.round((verdict.raw_age_ms / 3_600_000) * 10) / 10,
+        staleness_hours: verdict.threshold_age_ms === null
+          ? null
+          : Math.round((verdict.threshold_age_ms / 3_600_000) * 10) / 10,
+      })),
+    };
     const inProgressNote = inProgress.length ? `. ${inProgress.join('; ')}` : '';
 
     if (hasFailures) {

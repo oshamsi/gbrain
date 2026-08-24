@@ -8,7 +8,7 @@ test/agent-register.test.ts	structural guards	2	readFileSync
 test/apply-migrations.test.ts	failed migration prints phase detail (#921)	1	readFileSync
 test/apply-migrations.test.ts	resolveSchemaBehind (#1530)	5	readFileSync
 test/apply-migrations.test.ts	runApplyMigrations exit codes (v0.36.1.x #1062)	1	readFileSync
-test/archived-source-scoping.test.ts	#3880 structural pins — all-source local_path selections filter archived	2	readFileSync
+test/archived-source-scoping.test.ts	#3880 structural pins — all-source local_path selections filter archived	3	readFileSync
 test/asymmetric-encoding-contract.test.ts	Source-text contract (cheap belt + suspenders)	3	readFileSync
 test/auto-link-targeted-probe-2544.test.ts	#2544 — auto-link behavior through put_page (targeted probe)	6	readFileSync
 test/autopilot-auto-drain-wiring.test.ts	autopilot auto-drain wiring	8	readFileSync
@@ -238,6 +238,7 @@ test/sync.test.ts	isSyncable	8	bun-file
 test/sync.test.ts	resolveSlugByPathOrSourcePath (CJK wave v0.32.7, codex F4)	3	bun-file
 test/sync.test.ts	sync auto-embed arguments	2	bun-file
 test/sync.test.ts	sync regression — #132 nested transaction deadlock	1	bun-file
+test/task-page-write-guard.test.ts	ops/tasks semantic whole-page guard	11	readFileSync
 test/template-repo-generator.test.ts	generateTemplateTree	0	readFileSync
 test/template-repo-generator.test.ts	renderTemplateReadme	5	readFileSync
 test/thin-client-routing-audit.test.ts	thin-client routing audit — scratch-DB additions (jobs partial dispatch + config refusal)	5	readFileSync

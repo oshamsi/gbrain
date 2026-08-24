@@ -56,6 +56,43 @@ describe('acquirePageLock', () => {
     await lock!.release();
   });
 
+  test('serializes stale reclamation so a contender cannot unlink the fresh successor', async () => {
+    const slug = 'meetings/stale-reaper-race';
+    const path = lockFile(slug);
+    writeFileSync(path, `999999999\n2024-01-01T00:00:00Z\nstale-token\n`);
+    const tenMinAgo = new Date(Date.now() - 10 * 60 * 1000);
+    utimesSync(path, tenMinAgo, tenMinAgo);
+
+    let staleObserved!: () => void;
+    let resumeReaper!: () => void;
+    const observed = new Promise<void>(resolve => { staleObserved = resolve; });
+    const resume = new Promise<void>(resolve => { resumeReaper = resolve; });
+    let hookCalls = 0;
+    const firstPromise = acquirePageLock(slug, {
+      lockRoot: tmp,
+      beforeStaleReap: async () => {
+        hookCalls += 1;
+        staleObserved();
+        await resume;
+      },
+    });
+
+    await observed;
+    // The old stat→unlink implementation let this contender unlink whatever
+    // fresh lock the first reaper created. It must instead lose on the state
+    // ticket while the first stale observation is in flight.
+    const contender = await acquirePageLock(slug, { lockRoot: tmp });
+    expect(contender).toBeNull();
+
+    resumeReaper();
+    const first = await firstPromise;
+    expect(first).not.toBeNull();
+    expect(hookCalls).toBe(1);
+    expect(readFileSync(path, 'utf-8')).toContain(String(process.pid));
+    expect(await acquirePageLock(slug, { lockRoot: tmp })).toBeNull();
+    await first!.release();
+  });
+
   // #2840: PID liveness is namespace-local. A holder running in another
   // container (shared GBRAIN_HOME volume, separate PID namespace) presents
   // exactly like this: a PID that resolves to ESRCH locally, but a FRESH

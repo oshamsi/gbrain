@@ -698,11 +698,9 @@ describe('v0.31.8 — wedge migration force-retry hint (D19)', () => {
 // ============================================================================
 // v0.32.4 — sync_freshness check
 // ============================================================================
-// Pure staleness probe: reads sources.last_sync_at, no filesystem access.
-// Drift detection was stripped in v0.32.4 — the doctorReportRemote path runs
-// in the HTTP MCP server and walking DB-supplied local_path values from there
-// crosses a trust boundary. Drift belongs in multi_source_drift's existing
-// guard infrastructure (GBRAIN_DRIFT_LIMIT / GBRAIN_DRIFT_TIMEOUT_MS).
+// Baseline time semantics retained by the canonical freshness evaluator.
+// Operational doctor/status add registered-host Git evidence; explicit stored
+// mode remains available for callers that cannot inspect those checkouts.
 // ============================================================================
 
 describe('v0.32.4 — sync_freshness check', () => {
@@ -859,9 +857,8 @@ describe('v0.32.4 — sync_freshness check', () => {
 // ============================================================================
 // Doctor learns to skip the staleness warning when a git-backed source has no
 // new commits since the last sync AND working tree is clean AND chunker
-// version matches. Trust boundary preserved via opts.localOnly (D4); count
-// math fixed with three buckets that sum to sources.length (D6); narrowed
-// predicate mirrors sync.ts:1057+1075 (D7).
+// version matches. Count math uses three buckets that sum to sources.length
+// (D6); the narrowed predicate mirrors sync.ts:1057+1075 (D7).
 // ============================================================================
 
 describe('v0.41.27.0 — sync_freshness git short-circuit', () => {
@@ -916,7 +913,7 @@ describe('v0.41.27.0 — sync_freshness git short-circuit', () => {
     // "X synced recently, Y unchanged since last sync" mixed-case shape
     // is covered separately in case 6.
     expect(result.message).toContain('no new commits since last sync');
-    expect(result.details).toEqual({
+    expect(result.details).toMatchObject({
       unchanged_count: 1, synced_recently_count: 0, stale_count: 0,
     });
   });
@@ -941,7 +938,7 @@ describe('v0.41.27.0 — sync_freshness git short-circuit', () => {
     expect(result.message).toBe(
       'All 2 federated source(s) up to date (no new commits since last sync)',
     );
-    expect(result.details).toEqual({
+    expect(result.details).toMatchObject({
       unchanged_count: 2, synced_recently_count: 0, stale_count: 0,
     });
   });
@@ -1031,7 +1028,7 @@ describe('v0.41.27.0 — sync_freshness git short-circuit', () => {
     expect(result.message).not.toContain(`'unchanged'`);
     expect(result.message).not.toContain(`'recent'`);
     // Three-bucket invariant: sum === sources.length (the load-bearing assertion).
-    expect(result.details).toEqual({
+    expect(result.details).toMatchObject({
       unchanged_count: 1, synced_recently_count: 1, stale_count: 1,
     });
     const { unchanged_count, synced_recently_count, stale_count } = result.details as any;
@@ -1076,22 +1073,20 @@ describe('v0.41.27.0 — sync_freshness git short-circuit', () => {
     expect(result.details?.stale_count).toBe(1);
   });
 
-  test('case 9 — D4 regression: localOnly=false (default) — git probes NEVER called', async () => {
+  test('case 9 — explicit stored mode — git probes NEVER called', async () => {
     const { checkSyncFreshness } = await import('../src/commands/doctor.ts');
     const { _setGitHeadProbeForTests, _setGitCleanProbeForTests } =
       await import('../src/core/git-head.ts');
     // Probes set up to return "everything matches" — IF they were called,
-    // the source would be marked unchanged. Since localOnly defaults false,
-    // they MUST NOT fire and the source MUST be flagged stale by time check.
+    // the source would be marked unchanged. Explicit stored mode must not
+    // inspect the checkout and must classify from the stored timestamp.
     let headCalls = 0;
     let cleanCalls = 0;
     _setGitHeadProbeForTests(() => { headCalls++; return 'matching-sha'; });
     _setGitCleanProbeForTests(() => { cleanCalls++; return true; });
 
-    // Two callers shapes:
-    //   (a) explicit localOnly:false matches doctorReportRemote semantics
-    //   (b) omitted opts matches the default-fallthrough path
-    for (const opts of [{ localOnly: false }, undefined]) {
+    // Both compatibility spellings select the same stored-only evaluator.
+    for (const opts of [{ localOnly: false }, { freshnessMode: 'stored' as const }]) {
       headCalls = 0;
       cleanCalls = 0;
       const result = await checkSyncFreshness(makeStubEngine([
@@ -1120,9 +1115,9 @@ describe('v0.41.27.0 — sync_freshness git short-circuit', () => {
 //       the short-circuit's clean check ignores untracked. Pre-v0.41.30 the
 //       strict clean check counted those as dirty → fell through to wall-clock
 //       → false SEVERE.
-//   T2 (trust boundary): the REMOTE path (no localOnly) computes lag from the
-//       stored newest_content_at column and NEVER shells out to git on a
-//       DB-supplied local_path (preserves the v0.41.27.0 boundary).
+//   T2 (explicit stored mode): computes lag from newest_content_at and never
+//       shells out to Git. Operational doctor/status use host mode so their
+//       back-to-back verdicts include the same registered-checkout evidence.
 // ============================================================================
 describe('v0.41.32.0 — commit-relative staleness', () => {
   function makeStubEngine(rows: any[]): any {
@@ -1167,10 +1162,10 @@ describe('v0.41.32.0 — commit-relative staleness', () => {
 
     expect(sawIgnoreUntracked).toBe(true); // the short-circuit asked to ignore untracked
     expect(result.status).toBe('ok');
-    expect(result.details).toEqual({ unchanged_count: 1, synced_recently_count: 0, stale_count: 0 });
+    expect(result.details).toMatchObject({ unchanged_count: 1, synced_recently_count: 0, stale_count: 0 });
   });
 
-  test('T2: REMOTE (no localOnly) reads column, quiet + recently synced → ok, NO git subprocess', async () => {
+  test('T2: explicit stored mode reads column, quiet + recently synced → ok, NO git subprocess', async () => {
     const { checkSyncFreshness } = await import('../src/commands/doctor.ts');
     const { _setGitHeadProbeForTests, _setGitCleanProbeForTests } =
       await import('../src/core/git-head.ts');
@@ -1186,15 +1181,15 @@ describe('v0.41.32.0 — commit-relative staleness', () => {
         last_commit: 'x', chunker_version: currentChunkerVersion,
         // Content committed BEFORE the last sync → caught up.
         newest_content_at: agoMs(200 * 60 * 60 * 1000) },
-    ])); // NOTE: no { localOnly: true } → remote path
+    ]), { freshnessMode: 'stored' });
 
-    expect(headCalls).toBe(0);   // trust boundary: no git probe on remote path
+    expect(headCalls).toBe(0);   // explicit stored mode never probes Git
     expect(cleanCalls).toBe(0);
     expect(result.status).toBe('ok');
-    expect(result.details).toEqual({ unchanged_count: 0, synced_recently_count: 1, stale_count: 0 });
+    expect(result.details).toMatchObject({ unchanged_count: 0, synced_recently_count: 1, stale_count: 0 });
   });
 
-  test('T2-ceiling: REMOTE, caught up but unsynced past the ceiling → NOT ok', async () => {
+  test('T2-ceiling: stored mode, caught up but unsynced past the ceiling → NOT ok', async () => {
     // The 71-day bug at the doctor layer. This shape (caught up, synced 100h ago)
     // previously reported ok forever, so a dead daemon was invisible. The ceiling
     // ramps it to ~28h, which crosses the 24h warn line but NOT the 72h fail line —
@@ -1211,14 +1206,14 @@ describe('v0.41.32.0 — commit-relative staleness', () => {
         last_sync_at: agoMs(100 * 60 * 60 * 1000),
         last_commit: 'x', chunker_version: currentChunkerVersion,
         newest_content_at: agoMs(200 * 60 * 60 * 1000) },
-    ]));
+    ]), { freshnessMode: 'stored' });
 
-    expect(headCalls).toBe(0);           // still no subprocess on the remote path
+    expect(headCalls).toBe(0);           // still no subprocess in stored mode
     expect(result.status).toBe('warn');  // 28h: past warn, short of fail
-    expect(result.details).toEqual({ unchanged_count: 0, synced_recently_count: 0, stale_count: 1 });
+    expect(result.details).toMatchObject({ unchanged_count: 0, synced_recently_count: 0, stale_count: 1 });
   });
 
-  test('T2b: REMOTE + NULL column → wall-clock fallback → stale (no git subprocess)', async () => {
+  test('T2b: stored mode + NULL column → wall-clock fallback → stale (no git subprocess)', async () => {
     const { checkSyncFreshness } = await import('../src/commands/doctor.ts');
     const { _setGitHeadProbeForTests, _setGitCleanProbeForTests } =
       await import('../src/core/git-head.ts');
@@ -1231,14 +1226,14 @@ describe('v0.41.32.0 — commit-relative staleness', () => {
         last_sync_at: agoMs(100 * 60 * 60 * 1000),
         last_commit: 'x', chunker_version: currentChunkerVersion,
         newest_content_at: null },
-    ]));
+    ]), { freshnessMode: 'stored' });
 
     expect(headCalls).toBe(0); // still no git probe even on the fallback path
     expect(result.status).toBe('fail'); // 100h wall-clock > 72h
     expect(result.details?.stale_count).toBe(1);
   });
 
-  test('T2c: REMOTE + content NEWER than last sync → wall-clock (genuinely behind)', async () => {
+  test('T2c: stored mode + content NEWER than last sync → wall-clock (genuinely behind)', async () => {
     const { checkSyncFreshness } = await import('../src/commands/doctor.ts');
     const result = await checkSyncFreshness(makeStubEngine([
       { id: 'remote', name: '', local_path: '/tmp/remote',
@@ -1246,7 +1241,7 @@ describe('v0.41.32.0 — commit-relative staleness', () => {
         last_commit: 'x', chunker_version: currentChunkerVersion,
         // committed 10h ago, synced 100h ago → behind.
         newest_content_at: agoMs(10 * 60 * 60 * 1000) },
-    ]));
+    ]), { freshnessMode: 'stored' });
     expect(result.status).toBe('fail');
     expect(result.details?.stale_count).toBe(1);
   });
@@ -1824,7 +1819,7 @@ describe('sync_freshness — clone-unavailable content-lag fallback', () => {
     ]), { localOnly: true });
 
     expect(result.status).toBe('ok');
-    expect(result.details).toEqual({
+    expect(result.details).toMatchObject({
       unchanged_count: 0, synced_recently_count: 1, stale_count: 0,
     });
   });
@@ -1929,7 +1924,7 @@ describe('sync_freshness — clone-unavailable content-lag fallback', () => {
     expect(result.status).toBe('fail');
     expect(result.message).toContain(`'stale'`);
     expect(result.message).not.toContain(`'rescued'`);
-    expect(result.details).toEqual({
+    expect(result.details).toMatchObject({
       unchanged_count: 1, synced_recently_count: 1, stale_count: 1,
     });
   });

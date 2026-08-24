@@ -6,9 +6,10 @@
 import type { BrainEngine } from './engine.ts';
 import { loadConfig } from './config.ts';
 import { unacknowledgedSyncFailures } from './sync.ts';
-// lagFromContentMs is the remote/column comparator (buildSyncStatusReport
-// backs the get_status_snapshot MCP op — must NOT shell out to git).
-import { lagFromContentMs } from './source-health.ts';
+import {
+  evaluateSyncFreshnessSources,
+  type SyncFreshnessMode,
+} from './sync-freshness.ts';
 
 /**
  * v0.40.3.0 — read-only per-source dashboard for `gbrain sources status`.
@@ -45,11 +46,10 @@ export interface SyncStatusReportSource {
   /** Raw wall-clock hours since the last successful sync — the honest human
    * number. Distinct from staleness_hours, which is threshold-relative. */
   hours_since_last_sync: number | null;
-  /** Threshold-relative lag driving staleness_class. For a source whose
-   * content is OLDER than its last sync this is the ceiling-ramped value
-   * (see lagFromContentMs), which deliberately under-reads raw wall-clock so
-   * the warn tier fires before the fail tier — display hours_since_last_sync
-   * when a human asks "how long since we synced". */
+  /** Evidence-adjusted lag driving staleness_class. The canonical evaluator
+   * uses registered-source Git state in host mode and the stored content
+   * timestamp in stored mode. Display hours_since_last_sync when a human asks
+   * "how long since we synced". */
   staleness_hours: number | null;
   staleness_class: 'fresh' | 'stale' | 'severe' | 'unknown';
   last_commit: string | null;
@@ -77,9 +77,16 @@ export interface SyncStatusReport {
   embedding_column: string;
 }
 
+export interface BuildSyncStatusReportOptions {
+  nowMs?: number;
+  /** Required so no caller can silently choose evidence semantics by omission. */
+  freshnessMode: SyncFreshnessMode;
+}
+
 export async function buildSyncStatusReport(
   engine: BrainEngine,
   sources: Array<{ id: string; name: string; local_path: string | null; config: Record<string, unknown> }>,
+  opts: BuildSyncStatusReportOptions,
 ): Promise<SyncStatusReport> {
   // Resolve the active embedding column via the registry. Brains pointed
   // at Voyage / multimodal / any non-default column get accurate counts
@@ -97,7 +104,7 @@ export async function buildSyncStatusReport(
     id: string;
     last_commit: string | null;
     last_sync_at: string | Date | null;
-    // v0.41.32.0: remote staleness reads this column (no git subprocess).
+    chunker_version: string | null;
     newest_content_at: string | Date | null;
   };
   type CountRow = {
@@ -112,7 +119,7 @@ export async function buildSyncStatusReport(
   const sourceRows = sourceIds.length === 0
     ? []
     : await engine.executeRaw<SourceRow>(
-        `SELECT id, last_commit, last_sync_at, newest_content_at FROM sources WHERE id = ANY($1::text[])`,
+        `SELECT id, last_commit, last_sync_at, chunker_version, newest_content_at FROM sources WHERE id = ANY($1::text[])`,
         [sourceIds],
       );
   const sourceMap = new Map<string, SourceRow>();
@@ -204,36 +211,48 @@ export async function buildSyncStatusReport(
     }
   }
 
-  const now = Date.now();
+  const now = opts.nowMs ?? Date.now();
+  const freshnessVerdicts = await evaluateSyncFreshnessSources(
+    engine,
+    sources.map((src) => {
+      const row = sourceMap.get(src.id) || {
+        id: src.id,
+        last_commit: null,
+        last_sync_at: null,
+        chunker_version: null,
+        newest_content_at: null,
+      };
+      return {
+        id: src.id,
+        name: src.name,
+        local_path: src.local_path,
+        last_sync_at: row.last_sync_at,
+        last_commit: row.last_commit,
+        chunker_version: row.chunker_version,
+        newest_content_at: row.newest_content_at,
+      };
+    }),
+    { nowMs: now, mode: opts.freshnessMode },
+  );
+  const freshnessMap = new Map(freshnessVerdicts.map((verdict) => [verdict.source_id, verdict]));
   const out: SyncStatusReportSource[] = sources.map((src) => {
     const cfgEntry = (src.config || {}) as { syncEnabled?: boolean };
-    const row = sourceMap.get(src.id) || { id: src.id, last_commit: null, last_sync_at: null, newest_content_at: null };
+    const row = sourceMap.get(src.id) || {
+      id: src.id,
+      last_commit: null,
+      last_sync_at: null,
+      chunker_version: null,
+      newest_content_at: null,
+    };
     const counts = countMap.get(src.id) || { pages: 0, chunks_total: 0, chunks_unembedded: 0 };
-    const lastSyncMs = row.last_sync_at
-      ? (row.last_sync_at instanceof Date ? row.last_sync_at.getTime() : Date.parse(row.last_sync_at))
-      : null;
-    // v0.41.32.0: commit-relative staleness from the stored column — NO git
-    // subprocess (this function backs the remote get_status_snapshot MCP op,
-    // so it must honor the v0.41.27.0 trust boundary). A quiet repo whose
-    // newest commit predates its last sync reports 0; null column → wall-clock.
-    const contentMs = row.newest_content_at
-      ? (row.newest_content_at instanceof Date ? row.newest_content_at.getTime() : Date.parse(row.newest_content_at))
-      : null;
-    const lagSeconds = lagFromContentMs(
-      Number.isFinite(contentMs as number) ? (contentMs as number) : null,
-      lastSyncMs !== null && Number.isFinite(lastSyncMs) ? lastSyncMs : null,
-      now,
-    );
-    const stalenessHours = lagSeconds === null ? null : lagSeconds / 3600;
-    const hoursSinceLastSync = lastSyncMs !== null && Number.isFinite(lastSyncMs)
-      ? Math.round(((now - lastSyncMs) / 3600_000) * 10) / 10
-      : null;
-    let stalenessClass: 'fresh' | 'stale' | 'severe' | 'unknown' = 'unknown';
-    if (stalenessHours !== null) {
-      if (stalenessHours < 24) stalenessClass = 'fresh';
-      else if (stalenessHours < 72) stalenessClass = 'stale';
-      else stalenessClass = 'severe';
-    }
+    const freshness = freshnessMap.get(src.id);
+    const stalenessHours = freshness?.threshold_age_ms == null
+      ? null
+      : freshness.threshold_age_ms / 3_600_000;
+    const hoursSinceLastSync = freshness?.raw_age_ms == null
+      ? null
+      : Math.round((freshness.raw_age_ms / 3_600_000) * 10) / 10;
+    const stalenessClass = freshness?.staleness_class ?? 'unknown';
     const embeddingCoveragePct = counts.chunks_total === 0
       ? 100
       : Math.round(((counts.chunks_total - counts.chunks_unembedded) / counts.chunks_total) * 1000) / 10;

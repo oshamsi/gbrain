@@ -9,9 +9,10 @@
 
 import type { BrainEngine } from '../engine.ts';
 import { clampSearchLimit } from '../engine.ts';
+import { PageWriteConflictError } from '../page-cas.ts';
 import type { Page, PageType } from '../types.ts';
-import { importFromContent } from '../import-file.ts';
-import { serializePageToMarkdown } from '../markdown.ts';
+import { DuplicatePageIdentityError, importFromContent, type ImportResult } from '../import-file.ts';
+import { parseMarkdown, serializePageToMarkdown } from '../markdown.ts';
 import { writePageThrough, type WriteThroughResult } from '../write-through.ts';
 import { extractPageLinks, isAutoLinkEnabled, isAutoTimelineEnabled, isGlobalBasenameEnabled, parseTimelineEntries, makeResolver, type UnresolvedFrontmatterRef } from '../link-extraction.ts';
 // #3190: pack-aware link typing on the put_page auto-link path.
@@ -25,8 +26,11 @@ import { bumpLastRetrievedAt } from '../last-retrieved.ts';
 import { isValidSourceId, ALL_SOURCES } from '../source-id.ts';
 import { resolveExcludePrivatePages, isPrivatePage, findPrivateOnlySlugs } from '../search/private-visibility.ts';
 import { LIST_PAGES_DESCRIPTION, CAPTURE_DESCRIPTION } from '../operations-descriptions.ts';
+import { assertSafeTaskPageWrite, TaskPageWriteGuardError } from '../task-page-write-guard.ts';
 import { OperationError } from './contract.ts';
 import type { Operation, OperationContext } from './contract.ts';
+import { withPutPageOperationLock } from './put-page-lock.ts';
+import { validateSlug } from '../utils.ts';
 import {
   enforceSubagentSlugFence,
   slugOutsideCallerFence,
@@ -37,6 +41,42 @@ import {
 } from './context.ts';
 
 // --- Page CRUD ---
+
+const TASKS_PAGE_SLUG = 'ops/tasks';
+const CONTENT_HASH_RE = /^[0-9a-f]{64}$/i;
+const TASK_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]*$/;
+
+function parseExpectedContentHash(raw: unknown): string | undefined {
+  if (raw === undefined || raw === null) return undefined;
+  if (typeof raw !== 'string' || !CONTENT_HASH_RE.test(raw)) {
+    throw new OperationError(
+      'invalid_params',
+      'put_page: expected_content_hash must be the 64-character SHA-256 content_hash returned by get_page.',
+      'Re-read the page and pass its content_hash without truncation or surrounding whitespace.',
+    );
+  }
+  return raw.toLowerCase();
+}
+
+function parseRemovedTaskIds(raw: unknown): string[] {
+  if (raw === undefined || raw === null) return [];
+  if (!Array.isArray(raw) || raw.some(id => typeof id !== 'string' || !TASK_ID_RE.test(id))) {
+    throw new OperationError(
+      'invalid_params',
+      'put_page: removed_task_ids must be an array of stable task-id strings.',
+      'Pass only the explicitly removed ops/tasks id(s), for example ["t-20260115-01"].',
+    );
+  }
+  return raw as string[];
+}
+
+function pageWriteConflict(slug: string): OperationError {
+  return new OperationError(
+    'write_conflict',
+    `put_page: '${slug}' changed or disappeared after it was read; the stale write was rejected.`,
+    `Run get_page for '${slug}' with include_content: true, reapply only the intended edit to that fresh content, then retry with its content_hash as expected_content_hash.`,
+  );
+}
 
 /**
  * #4329: parse a per-call `source_id` param. Pre-fix, get_page / delete_page /
@@ -333,6 +373,8 @@ const put_page: Operation = {
     slug: { type: 'string', required: true, description: 'Page slug' },
     content: { type: 'string', required: true, description: 'Full markdown content with YAML frontmatter' },
     allow_empty: { type: 'boolean', required: false, description: 'Allow overwriting an existing non-empty page with empty/whitespace-only content (default: false). Without it, put_page rejects the empty overwrite — the empty-stdin failure class.' },
+    expected_content_hash: { type: 'string', required: false, description: 'Optimistic-concurrency precondition for an existing page. Pass the full content_hash returned by get_page; if the page changed or vanished, put_page returns write_conflict instead of overwriting it. Required when updating ops/tasks.' },
+    removed_task_ids: { type: 'array', required: false, items: { type: 'string' }, description: 'ops/tasks only: stable active task ids intentionally removed by this write. Completion and deferral keep their ids in the page and do not use this field.' },
     // v0.39.3.0 provenance write-through (WARN-8 + A1 + CV6). Optional fields
     // for trusted local callers (capture CLI, autopilot, dream cycle). Remote
     // MCP callers (ctx.remote !== false) have their values OVERRIDDEN with
@@ -346,7 +388,27 @@ const put_page: Operation = {
   mutating: true,
   scope: 'write',
   handler: async (ctx, p) => {
-    const slug = p.slug as string;
+    let slug: string;
+    try { slug = validateSlug(p.slug as string); } catch (error) {
+      throw new OperationError('invalid_params', `put_page: ${(error as Error).message}`, 'Use a normalized relative page slug without a leading slash.');
+    }
+    const expectedContentHash = parseExpectedContentHash(p.expected_content_hash);
+    const removedTaskIds = parseRemovedTaskIds(p.removed_task_ids);
+    const isTasksPage = slug.toLowerCase() === TASKS_PAGE_SLUG;
+
+    if (!isTasksPage && removedTaskIds.length > 0) {
+      throw new OperationError(
+        'invalid_params',
+        'put_page: removed_task_ids is valid only for the canonical ops/tasks page.',
+        'Omit removed_task_ids for ordinary pages.',
+      );
+    }
+
+    enforceSubagentSlugFence(ctx, slug, 'put_page');
+    enforceClientSlugFence(ctx, slug, 'put_page');
+    if (ctx.dryRun) return { dry_run: true, action: 'put_page', slug };
+
+    return withPutPageOperationLock(ctx.engine, ctx.sourceId, slug, async () => {
 
     // v0.39.3.0 CV6 trust gate for provenance write-through (WARN-8).
     // Only trusted LOCAL callers (ctx.remote === false — capture CLI,
@@ -376,13 +438,45 @@ const put_page: Operation = {
       provenanceVia = 'mcp:put_page';
     }
 
-    // Subagent namespace enforcement (v0.15+). Runs BEFORE the dry-run
-    // short-circuit so preview calls surface the same rejection. See
-    // enforceSubagentSlugFence for the fail-closed policy.
-    enforceSubagentSlugFence(ctx, slug, 'put_page');
-    enforceClientSlugFence(ctx, slug, 'put_page');
-
-    if (ctx.dryRun) return { dry_run: true, action: 'put_page', slug: p.slug };
+    // Optimistic-concurrency preflight avoids parsing/chunking/embedding work
+    // for an already-stale caller. The engine repeats the comparison in the
+    // write statement below; that atomic CAS is authoritative if another
+    // writer lands after this read.
+    let currentPage: Page | null = null;
+    if (expectedContentHash !== undefined || isTasksPage) {
+      currentPage = await ctx.engine.getPage(slug, { sourceId: ctx.sourceId ?? 'default' });
+    }
+    if (
+      expectedContentHash !== undefined &&
+      (!currentPage || currentPage.content_hash?.toLowerCase() !== expectedContentHash)
+    ) {
+      throw pageWriteConflict(slug);
+    }
+    if (isTasksPage && currentPage && expectedContentHash === undefined) {
+      throw new OperationError(
+        'precondition_required',
+        `put_page: updating '${TASKS_PAGE_SLUG}' requires expected_content_hash so concurrent task edits cannot overwrite one another.`,
+        `Run get_page for '${TASKS_PAGE_SLUG}' with include_content: true, apply one mutation, and pass the returned content_hash as expected_content_hash.`,
+      );
+    }
+    if (isTasksPage) {
+      try {
+        assertSafeTaskPageWrite(
+          currentPage?.compiled_truth ?? null,
+          parseMarkdown(p.content as string, `${slug}.md`).compiled_truth,
+          removedTaskIds,
+        );
+      } catch (error) {
+        if (error instanceof TaskPageWriteGuardError) {
+          throw new OperationError(
+            'task_guard_failed',
+            error.message,
+            `Re-read '${TASKS_PAGE_SLUG}', reapply only the intended task mutation, preserve every unrelated id, and retry with the fresh content_hash.${error.reason === 'invalid_removals' ? ' Use removed_task_ids only for an explicit remove action.' : ''}`,
+          );
+        }
+        throw error;
+      }
+    }
 
     // Empty-overwrite guard: empty/whitespace-only content over an existing
     // non-empty page is almost always an input-plumbing failure (e.g. a
@@ -438,30 +532,47 @@ const put_page: Operation = {
       // Pack load failed; fall through to legacy inferType behavior.
       activePack = undefined;
     }
-    const result = await importFromContent(ctx.engine, slug, p.content as string, {
-      noEmbed,
-      // v0.42 (#1699): untrusted callers can't smuggle gate-owned frontmatter
-      // markers (quarantine/content_flag/embed_skip). Fail-closed — anything
-      // not strictly local is remote (matches CV6 / v0.26.9 F7b posture).
-      remote: ctx.remote !== false,
-      ...(ctx.sourceId ? { sourceId: ctx.sourceId } : {}),
-      // v0.39.0.0 T1.5: pack-aware type inference (loaded above; legacy
-      // inferType behavior when undefined).
-      ...(activePack ? { activePack } : {}),
-      // v0.39.3.0 provenance write-through (WARN-8). Trust-filtered values
-      // computed above; ingested_at is server-stamped at the engine layer.
-      // Null-valued fields signal "no provenance write this call" and the
-      // engine's COALESCE-preserve UPDATE keeps the prior first-write
-      // record intact (CV12 audit-trail survival).
-      source_kind: provenanceKind,
-      source_uri: provenanceUri,
-      ingested_via: provenanceVia,
-      // Only an EXPLICIT allow_empty reaches the engine's empty-overwrite
-      // escape hatch; the default put_page path stays guarded end-to-end
-      // (including frontmatter-only content the raw-content check above
-      // can't see — the parsed body is blank even though content isn't).
-      ...(p.allow_empty === true ? { allowEmptyOverwrite: true } : {}),
-    });
+    let result: ImportResult;
+    try {
+      result = await importFromContent(ctx.engine, slug, p.content as string, {
+        noEmbed,
+        // v0.42 (#1699): untrusted callers can't smuggle gate-owned frontmatter
+        // markers (quarantine/content_flag/embed_skip). Fail-closed — anything
+        // not strictly local is remote (matches CV6 / v0.26.9 F7b posture).
+        remote: ctx.remote !== false,
+        ...(ctx.sourceId ? { sourceId: ctx.sourceId } : {}),
+        // v0.39.0.0 T1.5: pack-aware type inference (loaded above; legacy
+        // inferType behavior when undefined).
+        ...(activePack ? { activePack } : {}),
+        // v0.39.3.0 provenance write-through (WARN-8). Trust-filtered values
+        // computed above; ingested_at is server-stamped at the engine layer.
+        // Null-valued fields signal "no provenance write this call" and the
+        // engine's COALESCE-preserve UPDATE keeps the prior first-write
+        // record intact (CV12 audit-trail survival).
+        source_kind: provenanceKind,
+        source_uri: provenanceUri,
+        ingested_via: provenanceVia,
+        // Only an EXPLICIT allow_empty reaches the engine's empty-overwrite
+        // escape hatch; the default put_page path stays guarded end-to-end
+        // (including frontmatter-only content the raw-content check above
+        // can't see — the parsed body is blank even though content isn't).
+        ...(p.allow_empty === true ? { allowEmptyOverwrite: true } : {}),
+        ...(expectedContentHash !== undefined ? { expectedContentHash } : {}),
+      });
+    } catch (error) {
+      if (error instanceof PageWriteConflictError) throw pageWriteConflict(slug);
+      if (error instanceof DuplicatePageIdentityError) {
+        ctx.logger.warn(
+          `[put_page] refusing duplicate external identity on '${slug}' (existing owner hidden from client)`,
+        );
+        throw new OperationError(
+          'duplicate_identity',
+          'put_page: this frontmatter.id is already owned by another live page in the same source.',
+          'Keep the existing id on its original page, or assign this page a new external id and retry with its current content_hash.',
+        );
+      }
+      throw error;
+    }
 
     // The dedup pre-check in importFromContent can resolve the write to a
     // DIFFERENT page than the one requested (same content_hash, or the same
@@ -498,7 +609,7 @@ const put_page: Operation = {
     //     non-TTY contract preserves their semantics.
     //   - Pack-load failures (activePack undefined) skip the gate entirely
     //     since "unknown" has no meaning without a pack reference.
-    if (activePack && result.status === 'imported') {
+    if (activePack && result.status === 'imported' && !result.superseded_after_commit) {
       try {
         const pageType = (result as { page?: { type?: string } }).page?.type ?? null;
         const knownTypes = new Set(activePack.page_types.map((t) => t.name));
@@ -571,9 +682,9 @@ const put_page: Operation = {
     let autoLinks:
       | { created: number; removed: number; errors: number; unresolved: UnresolvedFrontmatterRef[] }
       | { error: string }
-      | { skipped: 'remote' }
+      | { skipped: 'remote' | 'superseded_after_commit' }
       | undefined;
-    let autoTimeline: { created: number } | { error: string } | { skipped: 'remote' } | undefined;
+    let autoTimeline: { created: number } | { error: string } | { skipped: 'remote' | 'superseded_after_commit' } | undefined;
     // Trusted-workspace path (v0.23 dream cycle) re-enables auto-link/timeline
     // even though ctx.remote=true, because the allow-list bounds the slug and
     // the synthesis prompt is itself the trusted dispatcher. Without this,
@@ -583,7 +694,10 @@ const put_page: Operation = {
     const trustedWorkspace = ctx.viaSubagent === true
       && Array.isArray(ctx.allowedSlugPrefixes)
       && ctx.allowedSlugPrefixes.length > 0;
-    if (ctx.remote !== false && !trustedWorkspace) {
+    if (result.superseded_after_commit) {
+      autoLinks = { skipped: 'superseded_after_commit' };
+      autoTimeline = { skipped: 'superseded_after_commit' };
+    } else if (ctx.remote !== false && !trustedWorkspace) {
       autoLinks = { skipped: 'remote' };
       autoTimeline = { skipped: 'remote' };
     } else if (result.parsedPage) {
@@ -662,7 +776,9 @@ const put_page: Operation = {
     // the delegated (submit_agent → subagent) context carries
     // `allowedSlugPrefixes` but NOT `auth`, so an auth-only test would let a
     // bound client re-open this path simply by delegating the write.
-    if (ctx.auth?.boundSlugPrefixes || ctx.viaSubagent === true) {
+    if (result.superseded_after_commit) {
+      factsQueued = { skipped: 'superseded_after_commit' };
+    } else if (ctx.auth?.boundSlugPrefixes || ctx.viaSubagent === true) {
       factsQueued = { skipped: 'slug_bound_client' };
     } else {
     try {
@@ -705,7 +821,9 @@ const put_page: Operation = {
     // behind the SAME trust gate as auto-link/timeline + the auto_chronicle
     // flag. Enqueues a chronicle_extract job; never blocks the write.
     let chronicleQueued: { queued: boolean } | { skipped: string } | undefined;
-    if (result.status !== 'imported') {
+    if (result.superseded_after_commit) {
+      chronicleQueued = { skipped: 'superseded_after_commit' };
+    } else if (result.status !== 'imported') {
       chronicleQueued = { skipped: 'not_imported' };
     } else if (ctx.remote !== false && !trustedWorkspace) {
       chronicleQueued = { skipped: 'remote' };
@@ -769,6 +887,7 @@ const put_page: Operation = {
       slug: result.slug,
       status: result.status === 'imported' ? 'created_or_updated' : result.status,
       chunks: result.chunks,
+      ...(result.superseded_after_commit ? { superseded_after_commit: true } : {}),
       // #3984: a skipped/error status without the reason is a silent no-op to
       // MCP callers (e.g. the >5MB size guard returned bare status 'skipped'
       // and the agent had no idea why the page never appeared). Thread
@@ -783,6 +902,7 @@ const put_page: Operation = {
       ...(chronicleQueued ? { chronicle_backstop: chronicleQueued } : {}),
       ...(writeThrough ? { write_through: writeThrough } : {}),
     };
+    });
   },
   cliHints: { name: 'put', positional: ['slug'], stdin: 'content' },
 };

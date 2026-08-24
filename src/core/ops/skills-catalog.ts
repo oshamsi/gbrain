@@ -190,39 +190,19 @@ const get_status_snapshot: Operation = {
   handler: async (ctx) => {
     const { buildSyncStatusReport } = await import('../../commands/sync.ts');
     const { buildCycleSnapshot } = await import('../../commands/status.ts');
-    // Pull sources first (handles brains with zero declared sources too).
-    let sources: Array<{ id: string; name: string; local_path: string | null; config: Record<string, unknown> }> = [];
-    try {
-      const rows = await ctx.engine.executeRaw<{
-        id: string;
-        name: string;
-        local_path: string | null;
-        config: Record<string, unknown> | null;
-      }>(
-        `SELECT id, name, local_path, config FROM sources WHERE COALESCE(archived, FALSE) = FALSE ORDER BY id`,
-      );
-      sources = rows.map((r) => ({
-        id: r.id,
-        name: r.name,
-        local_path: r.local_path,
-        config: r.config ?? {},
-      }));
-    } catch {
-      // Pre-v0.26.5 brains may lack the `archived` column; degrade to all rows.
-      const rows = await ctx.engine.executeRaw<{
-        id: string;
-        name: string;
-        local_path: string | null;
-        config: Record<string, unknown> | null;
-      }>(`SELECT id, name, local_path, config FROM sources ORDER BY id`);
-      sources = rows.map((r) => ({
-        id: r.id,
-        name: r.name,
-        local_path: r.local_path,
-        config: r.config ?? {},
-      }));
-    }
-    const sync = await buildSyncStatusReport(ctx.engine, sources);
+    const { loadOperationalSyncSources } = await import('../sync-freshness.ts');
+    const { parseSourceConfig } = await import('../sources-load.ts');
+    const rows = await loadOperationalSyncSources(ctx.engine);
+    const sources = rows.map((row) => ({
+      id: row.id,
+      name: row.name,
+      local_path: row.local_path,
+      config: parseSourceConfig(row.config),
+    }));
+    // Admin-only operational status deliberately evaluates the registered
+    // host checkout. This is the same canonical mode doctor uses, so a moved
+    // HEAD cannot be reported as both fresh and stale in adjacent calls.
+    const sync = await buildSyncStatusReport(ctx.engine, sources, { freshnessMode: 'host' });
     const cycle = await buildCycleSnapshot(ctx.engine);
     // v2 sections, each fail-soft (amendment 26): a broken/pre-migration
     // queue table must not take down the sync/cycle payload that v1 clients

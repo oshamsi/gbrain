@@ -763,7 +763,7 @@ export interface BrainEngine {
    * `isBlankBody`). Pass it only when clearing a body is the deliberate intent;
    * deleting a page goes through `deletePage`/`softDeletePage`, not this path.
    */
-  putPage(slug: string, page: PageInput, opts?: { sourceId?: string; allowEmptyOverwrite?: boolean }): Promise<Page>;
+  putPage(slug: string, page: PageInput, opts?: import('./page-cas.ts').PutPageOptions): Promise<Page>;
   /**
    * v0.41.13 (#1309) — identity-based dedup pre-check for the import pipeline.
    *
@@ -791,7 +791,7 @@ export interface BrainEngine {
    */
   findDuplicatePage?(
     sourceId: string,
-    opts: { hash: string; frontmatterId?: string | null },
+    opts: { hash: string; frontmatterId?: string | null; excludeSlug?: string },
   ): Promise<{ slug: string; id: number } | null>;
   /**
    * Hard-delete a page row. Cascades to content_chunks, page_links,
