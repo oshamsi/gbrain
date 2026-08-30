@@ -68,6 +68,8 @@ export const MAX_RATE_LIMIT_RETRIES = 5;
 export const RATE_LIMIT_FALLBACK_MS = 60_000;
 export const RATE_LIMIT_PAD_MS = 500;
 export const RATE_LIMIT_JITTER = 0.3;
+/** Ollama bge-m3 on this host embeds ~1.3s/chunk; a 40-chunk single request timed out at 90s. */
+export const EMBED_REQUEST_BATCH_SIZE = 8;
 
 export interface EmbedBatchWithBackoffOpts {
   abortSignal?: AbortSignal;
@@ -206,6 +208,15 @@ export async function embedBatchWithBackoff(
   texts: string[],
   opts: EmbedBatchWithBackoffOpts = {},
 ): Promise<Float32Array[]> {
+  if (texts.length > EMBED_REQUEST_BATCH_SIZE) {
+    const embeddings: Float32Array[] = [];
+    for (let offset = 0; offset < texts.length; offset += EMBED_REQUEST_BATCH_SIZE) {
+      if (opts.abortSignal?.aborted) throw new Error('embed budget aborted');
+      const slice = texts.slice(offset, offset + EMBED_REQUEST_BATCH_SIZE);
+      embeddings.push(...await embedBatchWithBackoff(slice, opts));
+    }
+    return embeddings;
+  }
   const signal = opts.abortSignal;
   for (let attempt = 0; attempt <= MAX_RATE_LIMIT_RETRIES; attempt++) {
     if (signal?.aborted) throw new Error('embed budget aborted');
