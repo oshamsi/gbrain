@@ -191,13 +191,17 @@ export function _resetWriteThroughCacheForTest(): void {
  * turn the disk sink off. Shared by writePageThrough and the facts fence
  * lane (fence-write.ts) so both disk sinks honor one flag.
  */
+export function parseWriteThroughDisabled(value: string | null | undefined): boolean {
+  return value != null && isOffValue(value);
+}
+
 export async function isWriteThroughDisabled(engine: BrainEngine): Promise<boolean> {
   const cached = writeThroughCache.get(engine);
   if (cached && Date.now() - cached.at < WRITE_THROUGH_CACHE_MS) return cached.disabled;
   let disabled = false;
   try {
     const v = await engine.getConfig('sync.write_through');
-    disabled = v != null && isOffValue(v);
+    disabled = parseWriteThroughDisabled(v);
   } catch {
     disabled = false;
   }

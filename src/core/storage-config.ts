@@ -182,22 +182,18 @@ function normalizeStorageConfig(raw: RawStorage): StorageConfig {
  */
 let _missingStorageWarned = false;
 
-export function loadStorageConfig(repoPath?: string | null): StorageConfig | null {
-  if (!repoPath) return null;
-
-  const yamlPath = join(repoPath, 'gbrain.yml');
-  if (!existsSync(yamlPath)) return null;
-
-  // Read failure is a real error (not a "feature not configured" signal).
-  // Throwing here lets the caller decide whether to crash or fall back.
-  const content = readFileSync(yamlPath, 'utf-8');
-
+export function parseStorageConfigContent(
+  content: string,
+  label = 'gbrain.yml',
+): StorageConfig | null {
   let raw: RawStorage | null;
   try {
     raw = parseStorageYaml(content);
   } catch (error) {
     console.warn(
-      `Warning: Failed to parse gbrain.yml: ${error instanceof Error ? error.message : String(error)}`,
+      `Warning: Failed to parse ${label}: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
     );
     return null;
   }
@@ -207,7 +203,7 @@ export function loadStorageConfig(repoPath?: string | null): StorageConfig | nul
     if (!_missingStorageWarned) {
       _missingStorageWarned = true;
       console.warn(
-        `Warning: ${yamlPath} exists but has no storage configuration. ` +
+        `Warning: ${label} exists but has no storage configuration. ` +
           `Add a "storage:" section with db_tracked / db_only arrays, ` +
           `or remove gbrain.yml to suppress this warning.`,
       );
@@ -222,7 +218,7 @@ export function loadStorageConfig(repoPath?: string | null): StorageConfig | nul
     if (!_missingStorageWarned) {
       _missingStorageWarned = true;
       console.warn(
-        `Warning: ${yamlPath} exists but has no storage configuration. ` +
+        `Warning: ${label} exists but has no storage configuration. ` +
           `Add a "storage:" section with db_tracked / db_only arrays, ` +
           `or remove gbrain.yml to suppress this warning.`,
       );
@@ -233,6 +229,15 @@ export function loadStorageConfig(repoPath?: string | null): StorageConfig | nul
   // Normalize cosmetic issues + throw on semantic overlap (D7).
   // Throws StorageConfigError on overlap — propagates to the caller.
   return normalizeAndValidateStorageConfig(merged);
+}
+
+export function loadStorageConfig(repoPath?: string | null): StorageConfig | null {
+  if (!repoPath) return null;
+  const yamlPath = join(repoPath, 'gbrain.yml');
+  if (!existsSync(yamlPath)) return null;
+  // Read failure is a real error (not a "feature not configured" signal).
+  // Throwing here lets the caller decide whether to crash or fall back.
+  return parseStorageConfigContent(readFileSync(yamlPath, 'utf8'), yamlPath);
 }
 
 export class StorageConfigError extends Error {

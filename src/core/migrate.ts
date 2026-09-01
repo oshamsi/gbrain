@@ -179,6 +179,59 @@ async function dropInvalidConcurrentIndex(
 // Add new migrations at the end. Never modify existing ones.
 // Exported for tests that structurally assert migration contents (e.g., "v9 must
 // pre-create idx_timeline_dedup_helper before the DELETE..."). Read-only contract.
+const CANONICAL_ROUTING_STATE_SQL = String.raw`
+CREATE TABLE IF NOT EXISTS canonical_routing_state (
+  singleton SMALLINT PRIMARY KEY CHECK (singleton = 1),
+  epoch BIGINT NOT NULL
+);
+INSERT INTO canonical_routing_state (singleton, epoch)
+VALUES (1, 1) ON CONFLICT (singleton) DO NOTHING;
+
+CREATE OR REPLACE FUNCTION bump_canonical_routing_epoch_fn()
+RETURNS trigger SET search_path = pg_catalog, public AS $func$
+BEGIN
+  UPDATE canonical_routing_state SET epoch = epoch + 1 WHERE singleton = 1;
+  IF TG_OP = 'DELETE' THEN RETURN OLD; END IF;
+  RETURN NEW;
+END;
+$func$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS bump_canonical_routing_from_page_trg ON pages;
+CREATE TRIGGER bump_canonical_routing_from_page_trg
+  AFTER INSERT OR DELETE OR UPDATE OF
+    source_id, slug, deleted_at, page_kind, source_path, source_uri
+  ON pages
+  FOR EACH ROW EXECUTE FUNCTION bump_canonical_routing_epoch_fn();
+
+DROP TRIGGER IF EXISTS bump_canonical_routing_from_source_trg ON sources;
+CREATE TRIGGER bump_canonical_routing_from_source_trg
+  AFTER INSERT OR DELETE OR UPDATE OF
+    id, local_path, archived, config, trust_frontmatter_overrides
+  ON sources
+  FOR EACH ROW EXECUTE FUNCTION bump_canonical_routing_epoch_fn();
+
+CREATE OR REPLACE FUNCTION bump_canonical_routing_from_config_fn()
+RETURNS trigger SET search_path = pg_catalog, public AS $func$
+BEGIN
+  IF (TG_OP = 'INSERT' AND NEW.key IN ('sync.repo_path', 'sync.write_through'))
+     OR (TG_OP = 'DELETE' AND OLD.key IN ('sync.repo_path', 'sync.write_through'))
+     OR (TG_OP = 'UPDATE' AND (
+       OLD.key IN ('sync.repo_path', 'sync.write_through')
+       OR NEW.key IN ('sync.repo_path', 'sync.write_through')
+     )) THEN
+    UPDATE canonical_routing_state SET epoch = epoch + 1 WHERE singleton = 1;
+  END IF;
+  IF TG_OP = 'DELETE' THEN RETURN OLD; END IF;
+  RETURN NEW;
+END;
+$func$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS bump_canonical_routing_from_config_trg ON config;
+CREATE TRIGGER bump_canonical_routing_from_config_trg
+  AFTER INSERT OR UPDATE OR DELETE ON config
+  FOR EACH ROW EXECUTE FUNCTION bump_canonical_routing_from_config_fn();
+`;
+
 export const MIGRATIONS: Migration[] = [
   // Version 1 is the baseline (schema.sql creates everything with IF NOT EXISTS).
   {
@@ -6252,6 +6305,12 @@ export const MIGRATIONS: Migration[] = [
         FOR EACH ROW
         EXECUTE FUNCTION bump_canonical_input_on_tag_fn();
     `,
+  },
+  {
+    version: 142,
+    name: 'canonical_routing_state',
+    idempotent: true,
+    sql: CANONICAL_ROUTING_STATE_SQL,
   },
 ];
 

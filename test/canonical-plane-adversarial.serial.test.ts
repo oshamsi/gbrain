@@ -45,6 +45,7 @@ import type { FSWatcher } from 'chokidar';
 
 let engine: PGLiteEngine;
 let repo: string;
+let tmp: string;
 
 function git(cwd: string, ...args: string[]): string {
   return execFileSync('git', ['-C', cwd, ...args], {
@@ -69,6 +70,7 @@ beforeEach(async () => {
   resetGateway();
   _resetSelfWriteGuardForTest();
   repo = fs.mkdtempSync(path.join(os.tmpdir(), 'gbrain-adv-'));
+  tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'gbrain-adv-tmp-'));
   execSync('git init', { cwd: repo, stdio: 'pipe' });
   execSync('git config user.email "t@t.t"', { cwd: repo, stdio: 'pipe' });
   execSync('git config user.name "T"', { cwd: repo, stdio: 'pipe' });
@@ -83,6 +85,7 @@ beforeEach(async () => {
 
 afterEach(() => {
   fs.rmSync(repo, { recursive: true, force: true });
+  if (tmp) fs.rmSync(tmp, { recursive: true, force: true });
 });
 
 function makeCtx(overrides: Partial<OperationContext> = {}): OperationContext {
@@ -420,6 +423,364 @@ describe('canonical-plane adversarial matrix', () => {
     );
     expect(row[0]?.last_commit).toBe(convergeSha);
   });
+
+test('convergence never commits or anchors post-verification file bytes', async () => {
+  const slug = 'inbox/stage-race';
+  await importFromContent(
+    engine,
+    slug,
+    '---\ntitle: Stage Race\n---\n\nCANONICAL\n',
+    { noEmbed: true, sourceId: 'default', sourcePath: `${slug}.md` },
+  );
+  await writePageThrough(engine, slug, { sourceId: 'default' });
+  const file = path.join(repo, `${slug}.md`);
+  const canonical = fs.readFileSync(file, 'utf8');
+  fs.writeFileSync(file, canonical.replace('title: Stage Race', 'title: Stage Race\nextra: stale'));
+  const [sourceBefore] = await engine.executeRaw<{ last_commit: string | null }>(
+    `SELECT last_commit FROM sources WHERE id='default'`,
+  );
+
+  const result = await runCanonicalPlaneConvergence(engine, {
+    sourceId: 'default',
+    yes: true,
+    _afterCommitSnapshotForTest: () => fs.writeFileSync(file, 'RACED\n'),
+  });
+
+  expect(result.exitCode).toBe(1);
+  expect(result.report.anchor_not_advanced).toBe(true);
+  const [sourceAfter] = await engine.executeRaw<{ last_commit: string | null }>(
+    `SELECT last_commit FROM sources WHERE id='default'`,
+  );
+  expect(sourceAfter!.last_commit).toBe(sourceBefore!.last_commit);
+  expect(fs.readFileSync(file, 'utf8')).toBe('RACED\n');
+
+  if (result.report.commit.created) {
+    const sha = result.report.commit.sha!;
+    const committed = execFileSync(
+      'git', ['-C', repo, 'show', `${sha}:${slug}.md`], { encoding: 'utf8' },
+    );
+    expect(committed).not.toBe('RACED\n');
+    expect(sha256Utf8(committed)).toBe(
+      (await loadCanonicalProjection(engine, 'default', slug))!.sha256,
+    );
+  }
+  expect(result.report.conflicts.some(
+    (c) => c.reason === 'git_file_changed',
+  )).toBe(true);
+});
+
+test('published convergence commit preserves a target staged after snapshot', async () => {
+  const slug = 'inbox/index-race';
+  await importFromContent(
+    engine, slug, '---\ntitle: Index Race\n---\n\nCANONICAL\n',
+    { noEmbed: true, sourceId: 'default', sourcePath: `${slug}.md` },
+  );
+  await writePageThrough(engine, slug, { sourceId: 'default' });
+  const file = path.join(repo, `${slug}.md`);
+  const canonical = fs.readFileSync(file);
+  fs.writeFileSync(file, canonical.toString('utf8').replace(
+    'title: Index Race', 'title: Index Race\nextra: stale',
+  ));
+  const [sourceBefore] = await engine.executeRaw<{ last_commit: string | null }>(
+    `SELECT last_commit FROM sources WHERE id='default'`,
+  );
+
+  const result = await runCanonicalPlaneConvergence(engine, {
+    sourceId: 'default',
+    yes: true,
+    _beforeCommitIndexLeaseForTest: () => {
+      fs.writeFileSync(file, 'USER STAGED\n');
+      execFileSync('git', [
+        '--literal-pathspecs', '-C', repo, 'add', '--', `${slug}.md`,
+      ]);
+      fs.writeFileSync(file, canonical);
+    },
+  });
+
+  expect(result.exitCode).toBe(1);
+  expect(result.report.commit.created).toBe(false); // rejected before ref CAS
+  expect(result.report.anchor_not_advanced).toBe(true);
+  expect(result.report.conflicts.some(
+    (conflict) => conflict.reason === 'git_index_changed',
+  )).toBe(true);
+  expect(execFileSync(
+    'git', ['-C', repo, 'show', `:${slug}.md`], { encoding: 'utf8' },
+  )).toBe('USER STAGED\n');
+  expect(fs.readFileSync(file)).toEqual(canonical);
+  expect((await engine.executeRaw<{ last_commit: string | null }>(
+    `SELECT last_commit FROM sources WHERE id='default'`,
+  ))[0]!.last_commit).toBe(sourceBefore!.last_commit);
+  const journalRaw = execFileSync('git', [
+    '-C', repo, 'rev-parse', '--git-path', 'gbrain-converge-default.json',
+  ], { encoding: 'utf8' }).trim();
+  const journal = path.isAbsolute(journalRaw)
+    ? journalRaw : path.resolve(repo, journalRaw);
+  expect(fs.existsSync(journal)).toBe(false);
+});
+
+test('canonical untracked target is committed while unrelated ?? stays untouched', async () => {
+  const slug = 'inbox/untracked-canonical';
+  await importFromContent(
+    engine, slug, '---\ntitle: Untracked Canonical\n---\n\nBODY\n',
+    { noEmbed: true, sourceId: 'default', sourcePath: `${slug}.md` },
+  );
+  await writePageThrough(engine, slug, { sourceId: 'default' });
+  const file = path.join(repo, `${slug}.md`);
+  const unrelated = path.join(repo, 'unrelated.tmp');
+  fs.writeFileSync(unrelated, 'DO NOT COMMIT\n');
+  expect(execFileSync(
+    'git', ['-C', repo, 'status', '--porcelain=v1', '--', `${slug}.md`],
+    { encoding: 'utf8' },
+  ).startsWith('??')).toBe(true);
+  const headBefore = execFileSync(
+    'git', ['-C', repo, 'rev-parse', 'HEAD'], { encoding: 'utf8' },
+  ).trim();
+
+  const dry = await runCanonicalPlaneConvergence(engine, {
+    sourceId: 'default', yes: false,
+  });
+  expect(dry.exitCode).toBe(1);
+  expect(dry.report.would_commit).toBe(1);
+  expect(execFileSync(
+    'git', ['-C', repo, 'rev-parse', 'HEAD'], { encoding: 'utf8' },
+  ).trim()).toBe(headBefore);
+
+  const applied = await runCanonicalPlaneConvergence(engine, {
+    sourceId: 'default', yes: true,
+  });
+  expect(applied.exitCode).toBe(0);
+  expect(applied.report.commit.created).toBe(true);
+  expect(execFileSync(
+    'git', ['-C', repo, 'show', `HEAD:${slug}.md`], { encoding: 'utf8' },
+  )).toBe(fs.readFileSync(file, 'utf8'));
+  expect(execFileSync(
+    'git', ['-C', repo, 'status', '--porcelain=v1', '--', 'unrelated.tmp'],
+    { encoding: 'utf8' },
+  ).startsWith('??')).toBe(true);
+});
+
+test('HEAD blob identity defeats assume-unchanged and accepts exact staged restart bytes', async () => {
+  const slug = 'inbox/index-flags';
+  await importFromContent(
+    engine, slug, '---\ntitle: Index Flags\n---\n\nOLD\n',
+    { noEmbed: true, sourceId: 'default', sourcePath: `${slug}.md` },
+  );
+  await writePageThrough(engine, slug, { sourceId: 'default' });
+  const file = path.join(repo, `${slug}.md`);
+  execFileSync('git', ['-C', repo, 'add', '--', `${slug}.md`]);
+  execFileSync('git', ['-C', repo, 'commit', '-m', 'gbrain: write-through fixture']);
+  const fixtureHead = execFileSync(
+    'git', ['-C', repo, 'rev-parse', 'HEAD'], { encoding: 'utf8' },
+  ).trim();
+  await engine.executeRaw(
+    `UPDATE sources SET last_commit=$1, last_sync_at=now() WHERE id='default'`,
+    [fixtureHead],
+  );
+
+  await importFromContent(
+    engine, slug, '---\ntitle: Index Flags\n---\n\nNEW\n',
+    { noEmbed: true, sourceId: 'default', sourcePath: `${slug}.md` },
+  );
+  await writePageThrough(engine, slug, { sourceId: 'default' });
+  const canonical = fs.readFileSync(file);
+  const oldHead = execFileSync(
+    'git', ['-C', repo, 'rev-parse', 'HEAD'], { encoding: 'utf8' },
+  ).trim();
+  execFileSync('git', ['-C', repo, 'update-index', '--assume-unchanged', `${slug}.md`]);
+  expect(execFileSync(
+    'git', ['-C', repo, 'status', '--porcelain=v1', '--', `${slug}.md`],
+    { encoding: 'utf8' },
+  )).toBe('');
+
+  const dry = await runCanonicalPlaneConvergence(engine, {
+    sourceId: 'default', yes: false,
+  });
+  expect(dry.report.would_commit).toBe(1);
+  expect(execFileSync(
+    'git', ['-C', repo, 'rev-parse', 'HEAD'], { encoding: 'utf8' },
+  ).trim()).toBe(oldHead);
+
+  // Simulate an interrupted older run that already staged exactly the
+  // canonical bytes. This is owned resume state, not arbitrary user staging.
+  execFileSync('git', ['-C', repo, 'update-index', '--no-assume-unchanged', `${slug}.md`]);
+  execFileSync('git', ['-C', repo, 'add', '--', `${slug}.md`]);
+  const applied = await runCanonicalPlaneConvergence(engine, {
+    sourceId: 'default', yes: true,
+  });
+  expect(applied.exitCode).toBe(0);
+  expect(execFileSync(
+    'git', ['-C', repo, 'show', `HEAD:${slug}.md`],
+  )).toEqual(canonical);
+});
+
+test('convergence scrubs inherited alternate Git index', async () => {
+  const slug = 'inbox/real-index-only';
+  await importFromContent(
+    engine, slug, '---\ntitle: Real Index\n---\n\nBODY\n',
+    { noEmbed: true, sourceId: 'default', sourcePath: `${slug}.md` },
+  );
+  await writePageThrough(engine, slug, { sourceId: 'default' });
+  const indexRaw = execFileSync(
+    'git', ['-C', repo, 'rev-parse', '--git-path', 'index'], { encoding: 'utf8' },
+  ).trim();
+  const realIndex = path.isAbsolute(indexRaw) ? indexRaw : path.resolve(repo, indexRaw);
+  const alternate = path.join(tmp, 'attacker-index');
+  fs.copyFileSync(realIndex, alternate);
+  const alternateBefore = fs.readFileSync(alternate);
+  const previous = process.env.GIT_INDEX_FILE;
+  process.env.GIT_INDEX_FILE = alternate;
+  try {
+    const result = await runCanonicalPlaneConvergence(engine, {
+      sourceId: 'default', yes: true,
+    });
+    expect(result.exitCode).toBe(0);
+  } finally {
+    if (previous === undefined) delete process.env.GIT_INDEX_FILE;
+    else process.env.GIT_INDEX_FILE = previous;
+  }
+  expect(fs.readFileSync(alternate)).toEqual(alternateBefore);
+  const afterRaw = execFileSync(
+    'git', ['-C', repo, 'rev-parse', '--git-path', 'index'], { encoding: 'utf8' },
+  ).trim();
+  expect(path.isAbsolute(afterRaw) ? afterRaw : path.resolve(repo, afterRaw))
+    .toBe(realIndex);
+  expect(execFileSync(
+    'git', ['-C', repo, 'show', `HEAD:${slug}.md`],
+  )).toEqual(fs.readFileSync(path.join(repo, `${slug}.md`)));
+});
+
+test('a verified subset may commit but can never anchor an incomplete source', async () => {
+  const good = 'inbox/partial-good';
+  const missing = 'inbox/partial-missing';
+  for (const slug of [good, missing]) {
+    await importFromContent(
+      engine, slug, `---\ntitle: ${slug}\n---\n\nBODY\n`,
+      { noEmbed: true, sourceId: 'default', sourcePath: `${slug}.md` },
+    );
+    await writePageThrough(engine, slug, { sourceId: 'default' });
+  }
+  const missingFile = path.join(repo, `${missing}.md`);
+  const anchorBefore = (await engine.executeRaw<{ last_commit: string | null }>(
+    `SELECT last_commit FROM sources WHERE id='default'`,
+  ))[0]!.last_commit;
+  // Keep `good` canonical and untracked: it is eligible for a real commit
+  // without making the tracked tree dirty. Only the second page is absent.
+  expect(execFileSync(
+    'git', ['-C', repo, 'status', '--porcelain=v1', '--', `${good}.md`],
+    { encoding: 'utf8' },
+  ).startsWith('??')).toBe(true);
+  fs.unlinkSync(missingFile);
+
+  const result = await runCanonicalPlaneConvergence(engine, {
+    sourceId: 'default', yes: true,
+  });
+  expect(result.exitCode).toBe(1);
+  expect(result.report.missing_file).toBeGreaterThan(0);
+  expect(result.report.commit.created).toBe(true);
+  expect(result.report.anchor_not_advanced).toBe(true);
+  expect((await engine.executeRaw<{ last_commit: string | null }>(
+    `SELECT last_commit FROM sources WHERE id='default'`,
+  ))[0]!.last_commit).toBe(anchorBefore);
+  const walRaw = execFileSync(
+    'git', ['-C', repo, 'rev-parse', '--git-path', 'gbrain-converge-default.json'],
+    { encoding: 'utf8' },
+  ).trim();
+  expect(fs.existsSync(path.isAbsolute(walRaw) ? walRaw : path.resolve(repo, walRaw)))
+    .toBe(false); // deliberate partial completed; Git history is the resume proof
+});
+
+test('a page created after the snapshot makes the source-epoch anchor CAS miss', async () => {
+  const anchorBefore = (await engine.executeRaw<{ last_commit: string | null }>(
+    `SELECT last_commit FROM sources WHERE id='default'`,
+  ))[0]!.last_commit;
+  const result = await runCanonicalPlaneConvergence(engine, {
+    sourceId: 'default',
+    yes: true,
+    _afterPageScanForTest: async () => {
+      await importFromContent(
+        engine,
+        'inbox/late-page',
+        '---\ntitle: Late Page\n---\n\nLATE\n',
+        { noEmbed: true, sourceId: 'default', sourcePath: 'inbox/late-page.md' },
+      );
+      await writePageThrough(engine, 'inbox/late-page', { sourceId: 'default' });
+    },
+  });
+  expect(result.exitCode).toBe(1);
+  expect(result.report.anchor_not_advanced).toBe(true);
+  expect(result.report.errors.some(
+    (error) => error.reason.endsWith(':canonical_routing_moved'),
+  )).toBe(true);
+  expect((await engine.executeRaw<{ last_commit: string | null }>(
+    `SELECT last_commit FROM sources WHERE id='default'`,
+  ))[0]!.last_commit).toBe(anchorBefore);
+});
+
+test('convergence auto-push is push-only and never executes the rebase hook', async () => {
+  const slug = 'inbox/push-order';
+  await importFromContent(
+    engine, slug, '---\ntitle: Push Order\n---\n\nCANONICAL\n',
+    { noEmbed: true, sourceId: 'default', sourcePath: `${slug}.md` },
+  );
+  await writePageThrough(engine, slug, { sourceId: 'default' });
+  const file = path.join(repo, `${slug}.md`);
+  fs.writeFileSync(file, fs.readFileSync(file, 'utf8').replace(
+    'title: Push Order', 'title: Push Order\nextra: stale',
+  ));
+
+  const gitPath = (name: string): string => {
+    const raw = execFileSync(
+      'git', ['-C', repo, 'rev-parse', '--git-path', name], { encoding: 'utf8' },
+    ).trim();
+    return path.isAbsolute(raw) ? raw : path.resolve(repo, raw);
+  };
+  const marker = path.join(tmp, 'managed-hook-must-not-run');
+  const journal = gitPath('gbrain-converge-default.json');
+  const hook = gitPath('hooks/post-commit');
+  const shq = (value: string): string => `'${value.replace(/'/g, "'\\''")}'`;
+  fs.mkdirSync(path.dirname(hook), { recursive: true });
+  fs.writeFileSync(hook, `#!/bin/sh
+# gbrain brain-durability post-commit hook (v0.42.44+)
+echo EXECUTED > ${shq(marker)}
+exit 99
+`);
+  fs.chmodSync(hook, 0o755);
+
+  const remote = path.join(tmp, 'push-only.git');
+  execFileSync('git', ['init', '--bare', remote]);
+  try { execFileSync('git', ['-C', repo, 'remote', 'remove', 'origin']); } catch { /* absent */ }
+  execFileSync('git', ['-C', repo, 'remote', 'add', 'origin', remote]);
+  const expectedRef = execFileSync(
+    'git', ['-C', repo, 'symbolic-ref', '-q', 'HEAD'], { encoding: 'utf8' },
+  ).trim();
+  execFileSync('git', [
+    '-C', repo, 'push', '--no-verify', 'origin', `HEAD:${expectedRef}`,
+  ]);
+
+  const result = await runCanonicalPlaneConvergence(engine, {
+    sourceId: 'default', yes: true,
+  });
+  expect(result.exitCode).toBe(0);
+  expect(fs.existsSync(journal)).toBe(false);
+  expect(fs.existsSync(marker)).toBe(false); // banner was inspected, hook not run
+  const anchoredHead = execFileSync(
+    'git', ['-C', repo, 'rev-parse', 'HEAD'], { encoding: 'utf8' },
+  ).trim();
+  expect((await engine.executeRaw<{ last_commit: string | null }>(
+    `SELECT last_commit FROM sources WHERE id='default'`,
+  ))[0]!.last_commit).toBe(anchoredHead);
+
+  let remoteHead = '';
+  for (let attempt = 0; attempt < 100 && remoteHead !== anchoredHead; attempt++) {
+    await new Promise((resolveDelay) => setTimeout(resolveDelay, 20));
+    try {
+      remoteHead = execFileSync(
+        'git', ['--git-dir', remote, 'rev-parse', expectedRef], { encoding: 'utf8' },
+      ).trim();
+    } catch { /* detached push is still in flight */ }
+  }
+  expect(remoteHead).toBe(anchoredHead);
+});
 
   test('add_tag updates semantic content_hash; repo loss is partial', async () => {
     await importFromContent(engine, 'inbox/taghash', '---\ntitle: T\n---\n\nbody\n', {

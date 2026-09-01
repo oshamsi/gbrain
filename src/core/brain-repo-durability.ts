@@ -28,10 +28,12 @@
  */
 
 import {
-  existsSync, readFileSync, writeFileSync, mkdirSync, chmodSync, rmSync, statSync, renameSync,
+  existsSync, readFileSync, writeFileSync, mkdirSync, chmodSync, rmSync,
+  statSync, renameSync, openSync, closeSync, copyFileSync, fsyncSync,
 } from 'fs';
-import { join, dirname, relative, isAbsolute } from 'path';
-import { execFileSync, execSync } from 'child_process';
+import { createHash, randomBytes } from 'node:crypto';
+import { join, dirname, relative, isAbsolute, resolve } from 'path';
+import { execFileSync, execSync, spawn } from 'child_process';
 import {
   GIT_ENV, GIT_ENV_AUTH, divergenceSafePull, detectDefaultBranch, pushProbe,
   type PullOutcome, type PushProbeResult,
@@ -437,6 +439,51 @@ export function isDurabilityHardened(repoPath: string): boolean {
  * (index.lock contention, nothing changed, detached states) — the DB row and
  * the on-disk file remain the durable sinks either way.
  */
+export function triggerManagedDurabilityPushOnly(
+  repoPath: string,
+  expectedRef: string,
+  expectedHead: string,
+): boolean {
+  try {
+    if (
+      !expectedRef.startsWith('refs/heads/')
+      || !/^[0-9a-f]{40,64}$/.test(expectedHead)
+    ) return false;
+    const { dir } = resolveHooksDir(repoPath);
+    const hookPath = join(dir, 'post-commit');
+    if (!existsSync(hookPath)) return false;
+    const hook = readFileSync(hookPath, 'utf8');
+    if (!hook.includes(HOOK_BANNER)) return false;
+    if (
+      execFileSync('git', ['-C', repoPath, 'symbolic-ref', '-q', 'HEAD'], {
+        encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'],
+        timeout: 10_000, env: controlledGitEnv(),
+      }).trim() !== expectedRef
+      || execFileSync('git', ['-C', repoPath, 'rev-parse', 'HEAD'], {
+        encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'],
+        timeout: 10_000, env: controlledGitEnv(),
+      }).trim() !== expectedHead
+    ) return false;
+    const child = spawn('git', [
+      '-C', repoPath,
+      '-c', 'http.followRedirects=false',
+      'push', '--no-verify', 'origin', `${expectedHead}:${expectedRef}`,
+    ], {
+      cwd: repoPath,
+      stdio: 'ignore',
+      detached: true,
+      env: controlledGitAuthEnv(),
+    });
+    child.on('error', () => { /* best-effort launch */ });
+    child.unref();
+    return true;
+  } catch {
+    // Canonical state is already durable. Explicit brain-commit-push remains
+    // the fail-loud guarantee; this notification is intentionally push-only.
+    return false;
+  }
+}
+
 export function commitWriteThroughFile(repoPath: string, absPath: string, slug: string): boolean {
   try {
     const rel = relative(repoPath, absPath);
@@ -452,29 +499,645 @@ export function commitWriteThroughFile(repoPath: string, absPath: string, slug: 
 
 // ── Push-state query (D14) ───────────────────────────────────────────────────
 
-export function commitWriteThroughFiles(repoPath: string, absPaths: string[], message: string): string | null {
-  try {
-    const rels: string[] = [];
-    for (const absPath of absPaths) {
-      const rel = relative(repoPath, absPath);
-      if (!rel || rel.startsWith('..') || isAbsolute(rel)) continue;
-      rels.push(rel);
+export type VerifiedCommitFile = {
+  absPath: string;
+  expectedSha256: string;
+};
+
+export type VerifiedBatchCommitOutcome =
+  | { status: 'committed'; sha: string; pathCount: number }
+  | { status: 'no_change'; sha: null; pathCount: 0 }
+  | {
+      status: 'conflict';
+      reason: 'invalid_path' | 'file_changed' | 'index_changed' | 'head_moved';
+      path?: string;
+      expected?: string;
+      actual?: string;
+      committedSha?: string;
+      pathCount?: number;
     }
-    const unique = [...new Set(rels)];
-    if (unique.length === 0) return null;
-    const gitOpts = { stdio: 'ignore', timeout: 60_000, env: { ...process.env, ...GIT_ENV } } as const;
-    execFileSync('git', ['--literal-pathspecs', '-C', repoPath, 'add', '--', ...unique], gitOpts);
-    execFileSync('git', ['--literal-pathspecs', '-C', repoPath, 'commit', '--only', '--no-gpg-sign', '-m', message, '--', ...unique], gitOpts);
-    const sha = execFileSync('git', ['-C', repoPath, 'rev-parse', 'HEAD'], {
-      encoding: 'utf8',
-      timeout: 15_000,
-      env: { ...process.env, ...GIT_ENV },
-    }).trim();
-    return sha || null;
-  } catch {
-    return null;
+  | {
+      status: 'error';
+      reason: 'git_failed';
+      detail: string;
+      committedSha?: string;
+      pathCount?: number;
+    };
+
+type VerifiedBatchCommitOptions = {
+  expectedHead: string;
+  /** Exact symbolic branch captured with expectedHead; OID alone is ambiguous. */
+  expectedRef: string;
+  /** Persist a receipt for the exact orphan commit before publishing its ref. */
+  beforePublish: (candidate: {
+    commitSha: string;
+    treeSha: string;
+    publishedFiles: readonly VerifiedCommitFile[];
+    /** Identity of the standard Git index.lock this process owns. */
+    indexLeaseIdentity: { dev: string; ino: string };
+  }) => void;
+  /** Deterministic race seam; production never supplies it. */
+  _beforeIndexLeaseForTest?: () => void;
+  /** Deterministic file/ref race seam; index.lock is already held here. */
+  _afterSnapshotForTest?: () => void;
+  /** Deterministic crash seam immediately after successful ref CAS. */
+  _afterRefPublishForTest?: () => void;
+};
+
+type CapturedCommitFile = VerifiedCommitFile & {
+  rel: string;
+  bytes: Buffer;
+  blobOid: string;
+  mode: '100644' | '100755';
+  headEntry: GitPathEntry | null;
+  indexEntry: GitPathEntry | null;
+  changesHead: boolean;
+};
+
+type GitPathEntry = { mode: string; oid: string };
+
+function controlledGitEnv(extra: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...process.env, ...GIT_ENV, ...extra };
+  // `-C <verified-root>` is authoritative. An inherited alternate index or
+  // repository redirect would otherwise make the "real index" CAS a lie.
+  delete env.GIT_INDEX_FILE;
+  delete env.GIT_DIR;
+  delete env.GIT_WORK_TREE;
+  delete env.GIT_COMMON_DIR;
+  delete env.GIT_OBJECT_DIRECTORY;
+  delete env.GIT_ALTERNATE_OBJECT_DIRECTORIES;
+  env.GIT_OPTIONAL_LOCKS = '0';
+  return env;
+}
+
+function controlledGitAuthEnv(): NodeJS.ProcessEnv {
+  // Auth-capable pushes must not inherit the strict read-path
+  // askpass=/bin/false, but remain non-interactive through GIT_ENV_AUTH.
+  const env: NodeJS.ProcessEnv = { ...process.env, ...GIT_ENV_AUTH };
+  delete env.GIT_ASKPASS;
+  delete env.SSH_ASKPASS;
+  delete env.SSH_ASKPASS_REQUIRE;
+  delete env.GIT_INDEX_FILE;
+  delete env.GIT_DIR;
+  delete env.GIT_WORK_TREE;
+  delete env.GIT_COMMON_DIR;
+  delete env.GIT_OBJECT_DIRECTORY;
+  delete env.GIT_ALTERNATE_OBJECT_DIRECTORIES;
+  env.GIT_OPTIONAL_LOCKS = '0';
+  return env;
+}
+
+function sha256Bytes(bytes: Buffer): string {
+  return createHash('sha256').update(bytes).digest('hex');
+}
+
+function gitText(
+  repoPath: string,
+  args: string[],
+  env: NodeJS.ProcessEnv,
+  input?: Buffer,
+): string {
+  return execFileSync('git', ['-C', repoPath, ...args], {
+    encoding: 'utf8',
+    stdio: input ? ['pipe', 'pipe', 'pipe'] : ['ignore', 'pipe', 'pipe'],
+    input,
+    timeout: 60_000,
+    env,
+  }).trim();
+}
+
+function gitRaw(
+  repoPath: string,
+  args: string[],
+  env: NodeJS.ProcessEnv,
+): Buffer {
+  return execFileSync('git', ['-C', repoPath, ...args], {
+    stdio: ['ignore', 'pipe', 'pipe'],
+    timeout: 60_000,
+    env,
+  });
+}
+
+function oneNulRecord(raw: Buffer, label: string): string | null {
+  if (raw.length === 0) return null;
+  if (raw[raw.length - 1] !== 0) throw new Error(`unterminated ${label}`);
+  const records = raw.subarray(0, raw.length - 1).toString('utf8').split('\0');
+  if (records.length !== 1 || !records[0]) throw new Error(`ambiguous ${label}`);
+  return records[0];
+}
+
+function treePathEntry(
+  repoPath: string,
+  commit: string,
+  rel: string,
+  env: NodeJS.ProcessEnv,
+): GitPathEntry | null {
+  const record = oneNulRecord(gitRaw(repoPath, [
+    '--literal-pathspecs', 'ls-tree', '-z', commit, '--', rel,
+  ], env), `tree entry for ${rel}`);
+  if (record == null) return null;
+  const tab = record.indexOf('\t');
+  const [mode, type, oid, extra] = record.slice(0, tab).split(/ +/);
+  if (tab < 0 || extra !== undefined || type !== 'blob' || !mode || !oid) {
+    throw new Error(`invalid tree entry for ${rel}`);
+  }
+  return { mode, oid };
+}
+
+function indexPathEntry(
+  repoPath: string,
+  rel: string,
+  env: NodeJS.ProcessEnv,
+): GitPathEntry | null {
+  const record = oneNulRecord(gitRaw(repoPath, [
+    '--literal-pathspecs', 'ls-files', '--stage', '-z', '--', rel,
+  ], env), `index entry for ${rel}`);
+  if (record == null) return null;
+  const tab = record.indexOf('\t');
+  const [mode, oid, stage, extra] = record.slice(0, tab).split(/ +/);
+  if (tab < 0 || extra !== undefined || stage !== '0' || !mode || !oid) {
+    throw new Error(`unmerged or invalid index entry for ${rel}`);
+  }
+  return { mode, oid };
+}
+
+function samePathEntry(a: GitPathEntry | null, b: GitPathEntry | null): boolean {
+  return a == null ? b == null : b != null && a.mode === b.mode && a.oid === b.oid;
+}
+
+type IndexPublishOutcome =
+  | { ok: true }
+  | { ok: false; reason: 'index_changed' | 'head_moved' | 'git_failed'; detail?: string };
+
+type RealIndexLease = {
+  indexPath: string;
+  lockPath: string;
+  env: NodeJS.ProcessEnv;
+  identity: { dev: string; ino: string };
+  prepared: boolean;
+  installed: boolean;
+};
+
+function acquireRealIndexLease(
+  gitRoot: string,
+  baseEnv: NodeJS.ProcessEnv,
+): RealIndexLease {
+  const indexRaw = gitText(gitRoot, ['rev-parse', '--git-path', 'index'], baseEnv);
+  const indexPath = isAbsolute(indexRaw) ? indexRaw : resolve(gitRoot, indexRaw);
+  const lockPath = `${indexPath}.lock`;
+  let ownsLock = false;
+  try {
+    const fd = openSync(lockPath, 'wx', 0o600);
+    ownsLock = true;
+    closeSync(fd);
+    if (!existsSync(indexPath)) {
+      throw new Error('real git index is absent');
+    }
+    // This lock is acquired BEFORE the first target index read and remains
+    // owned through update-ref plus target reset. Ordinary git add/commit can
+    // either finish before this point or observe standard lock contention; it
+    // can never perform an invisible A->B->A between our capture and publish.
+    copyFileSync(indexPath, lockPath);
+    const identityStat = statSync(lockPath, { bigint: true });
+    return {
+      indexPath,
+      lockPath,
+      env: { ...baseEnv, GIT_INDEX_FILE: lockPath },
+      identity: {
+        dev: identityStat.dev.toString(),
+        ino: identityStat.ino.toString(),
+      },
+      prepared: false,
+      installed: false,
+    };
+  } catch (error) {
+    // EEXIST means another Git process owns index.lock. Never remove a path
+    // this invocation did not create.
+    if (ownsLock) {
+      rmSync(`${lockPath}.lock`, { force: true });
+      rmSync(lockPath, { force: true });
+    }
+    throw error;
   }
 }
+
+function sameLeaseIdentity(
+  lockPath: string,
+  expected: { dev: string; ino: string },
+): boolean {
+  try {
+    const stat = statSync(lockPath, { bigint: true });
+    return stat.dev.toString() === expected.dev
+      && stat.ino.toString() === expected.ino;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Build the final real-index bytes without asking Git to rewrite index.lock.
+ * Git may replace `preparedPath`; copying that complete file into the already
+ * owned lock inode preserves the identity later recorded in the WAL.
+ */
+function prepareRealIndexLease(
+  gitRoot: string,
+  newCommit: string,
+  files: readonly CapturedCommitFile[],
+  baseEnv: NodeJS.ProcessEnv,
+  lease: RealIndexLease,
+): IndexPublishOutcome {
+  const preparedPath = `${lease.lockPath}.prepared-${process.pid}-${
+    randomBytes(8).toString('hex')
+  }`;
+  try {
+    if (!sameLeaseIdentity(lease.lockPath, lease.identity)) {
+      return { ok: false, reason: 'index_changed' };
+    }
+    for (const file of files) {
+      const actual = indexPathEntry(gitRoot, file.rel, lease.env);
+      if (!samePathEntry(actual, file.indexEntry)) {
+        return {
+          ok: false,
+          reason: 'index_changed',
+          detail: file.rel,
+        };
+      }
+    }
+    copyFileSync(lease.lockPath, preparedPath);
+    const preparedEnv = { ...baseEnv, GIT_INDEX_FILE: preparedPath };
+    execFileSync('git', [
+      '--literal-pathspecs', '-C', gitRoot,
+      'reset', '--quiet', newCommit, '--', ...files.map((file) => file.rel),
+    ], {
+      stdio: 'ignore', timeout: 30_000, env: preparedEnv,
+    });
+    for (const file of files) {
+      const actual = indexPathEntry(gitRoot, file.rel, preparedEnv);
+      const next = treePathEntry(gitRoot, newCommit, file.rel, baseEnv);
+      if (!samePathEntry(actual, next)) {
+        throw new Error(`index CAS verify failed: ${file.rel}`);
+      }
+    }
+    // `preparedPath` is complete. Copy+fsync into our still-owned standard
+    // lock inode before WAL publication; this keeps dev/ino stable across a
+    // SIGKILL and never exposes partial bytes as the real index.
+    copyFileSync(preparedPath, lease.lockPath);
+    const fd = openSync(lease.lockPath, 'r');
+    try { fsyncSync(fd); } finally { closeSync(fd); }
+    if (!sameLeaseIdentity(lease.lockPath, lease.identity)) {
+      return { ok: false, reason: 'index_changed' };
+    }
+    lease.prepared = true;
+    return { ok: true };
+  } catch (error) {
+    return {
+      ok: false,
+      reason: 'git_failed',
+      detail: error instanceof Error ? error.message : String(error),
+    };
+  } finally {
+    rmSync(`${preparedPath}.lock`, { force: true });
+    rmSync(preparedPath, { force: true });
+  }
+}
+
+function publishRealIndexLease(
+  gitRoot: string,
+  expectedRef: string,
+  newCommit: string,
+  files: readonly CapturedCommitFile[],
+  baseEnv: NodeJS.ProcessEnv,
+  lease: RealIndexLease,
+): IndexPublishOutcome {
+  try {
+    if (!lease.prepared || !sameLeaseIdentity(lease.lockPath, lease.identity)) {
+      return { ok: false, reason: 'index_changed' };
+    }
+    if (
+      gitText(gitRoot, ['symbolic-ref', '-q', 'HEAD'], baseEnv) !== expectedRef
+      || gitText(gitRoot, ['rev-parse', 'HEAD'], baseEnv) !== newCommit
+    ) return { ok: false, reason: 'head_moved' };
+    for (const file of files) {
+      const actual = indexPathEntry(gitRoot, file.rel, lease.env);
+      const next = treePathEntry(gitRoot, newCommit, file.rel, baseEnv);
+      if (!samePathEntry(actual, next)) {
+        return { ok: false, reason: 'index_changed', detail: file.rel };
+      }
+    }
+    renameSync(lease.lockPath, lease.indexPath);
+    lease.installed = true;
+    return { ok: true };
+  } catch (error) {
+    return {
+      ok: false,
+      reason: 'git_failed',
+      detail: error instanceof Error ? error.message : String(error),
+    };
+  }
+}
+
+function releaseRealIndexLease(lease: RealIndexLease | null): void {
+  if (!lease) return;
+  rmSync(`${lease.lockPath}.lock`, { force: true });
+  if (!lease.installed) rmSync(lease.lockPath, { force: true });
+}
+
+export function commitWriteThroughFiles(
+  repoPath: string,
+  files: VerifiedCommitFile[],
+  message: string,
+  opts: VerifiedBatchCommitOptions,
+): VerifiedBatchCommitOutcome {
+  const baseEnv = controlledGitEnv();
+  let gitRoot = repoPath;
+  let tempIndex: string | null = null;
+  let realIndexLease: RealIndexLease | null = null;
+  let committedSha: string | undefined;
+  let publishedPathCount = 0;
+
+  try {
+    const rootRaw = gitText(repoPath, ['rev-parse', '--show-toplevel'], baseEnv);
+    gitRoot = isAbsolute(rootRaw) ? rootRaw : resolve(repoPath, rootRaw);
+    if (
+      gitText(gitRoot, ['symbolic-ref', '-q', 'HEAD'], baseEnv) !== opts.expectedRef
+      || gitText(gitRoot, ['rev-parse', opts.expectedRef], baseEnv)
+        !== opts.expectedHead
+    ) {
+      return { status: 'conflict', reason: 'head_moved' };
+    }
+    opts._beforeIndexLeaseForTest?.();
+    realIndexLease = acquireRealIndexLease(gitRoot, baseEnv);
+
+    const byRel = new Map<string, CapturedCommitFile>();
+    for (const file of files) {
+      const rel = relative(gitRoot, file.absPath).replace(/\\/g, '/');
+      if (!rel || rel === '..' || rel.startsWith('../') || isAbsolute(rel)) {
+        return { status: 'conflict', reason: 'invalid_path', path: file.absPath };
+      }
+      if (byRel.has(rel)) {
+        return { status: 'conflict', reason: 'invalid_path', path: file.absPath };
+      }
+      const bytes = readFileSync(file.absPath);
+      const actual = sha256Bytes(bytes);
+      if (actual !== file.expectedSha256) {
+        return {
+          status: 'conflict', reason: 'file_changed', path: file.absPath,
+          expected: file.expectedSha256, actual,
+        };
+      }
+      const headEntry = treePathEntry(gitRoot, opts.expectedHead, rel, baseEnv);
+      if (
+        headEntry
+        && headEntry.mode !== '100644'
+        && headEntry.mode !== '100755'
+      ) {
+        return { status: 'conflict', reason: 'invalid_path', path: file.absPath };
+      }
+      const mode: '100644' | '100755' = headEntry
+        ? (headEntry.mode === '100755' ? '100755' : '100644')
+        : ((statSync(file.absPath).mode & 0o111) === 0 ? '100644' : '100755');
+      // Write the immutable object now, so a crash-resume index that already
+      // contains exactly these captured bytes is distinguishable from user
+      // staging. Loose orphan objects are harmless and Git-prunable.
+      const blobOid = gitText(
+        gitRoot, ['hash-object', '-w', '--stdin'], baseEnv, bytes,
+      );
+      const intendedEntry: GitPathEntry = { mode, oid: blobOid };
+      const liveIndexEntry = indexPathEntry(gitRoot, rel, realIndexLease.env);
+      if (
+        !samePathEntry(liveIndexEntry, headEntry)
+        && !samePathEntry(liveIndexEntry, intendedEntry)
+      ) {
+        return {
+          status: 'conflict', reason: 'index_changed', path: file.absPath,
+          expected: `${headEntry?.oid ?? '<absent>'}|${blobOid}`,
+          actual: liveIndexEntry?.oid,
+        };
+      }
+      byRel.set(rel, {
+        ...file,
+        rel,
+        bytes,
+        blobOid,
+        mode,
+        headEntry,
+        indexEntry: liveIndexEntry,
+        changesHead: false,
+      });
+    }
+    if (byRel.size === 0) return { status: 'no_change', sha: null, pathCount: 0 };
+
+    const gitDirRaw = gitText(gitRoot, ['rev-parse', '--git-dir'], baseEnv);
+    const gitDir = isAbsolute(gitDirRaw) ? gitDirRaw : resolve(gitRoot, gitDirRaw);
+    tempIndex = join(
+      gitDir,
+      `gbrain-converge-index-${process.pid}-${randomBytes(8).toString('hex')}`,
+    );
+    const indexEnv = { ...baseEnv, GIT_INDEX_FILE: tempIndex };
+    gitText(gitRoot, ['read-tree', opts.expectedHead], indexEnv);
+
+    for (const captured of byRel.values()) {
+      const rehashedBlob = gitText(
+        gitRoot, ['hash-object', '-w', '--stdin'], indexEnv, captured.bytes,
+      );
+      if (rehashedBlob !== captured.blobOid) {
+        throw new Error(`captured Git blob identity changed: ${captured.rel}`);
+      }
+      captured.changesHead = !samePathEntry(
+        { mode: captured.mode, oid: captured.blobOid },
+        captured.headEntry,
+      );
+      gitText(gitRoot, [
+        'update-index', '--add', '--cacheinfo',
+        captured.mode, captured.blobOid, captured.rel,
+      ], indexEnv);
+    }
+
+    // A first fence catches ordinary movement after page-lock release.
+    for (const captured of byRel.values()) {
+      const actual = sha256Bytes(readFileSync(captured.absPath));
+      if (actual !== captured.expectedSha256) {
+        return {
+          status: 'conflict', reason: 'file_changed', path: captured.absPath,
+          expected: captured.expectedSha256, actual,
+        };
+      }
+    }
+
+    const tree = gitText(gitRoot, ['write-tree'], indexEnv);
+    const baseTree = gitText(
+      gitRoot, ['rev-parse', `${opts.expectedHead}^{tree}`], baseEnv,
+    );
+    if (tree === baseTree) {
+      if (
+        gitText(gitRoot, ['symbolic-ref', '-q', 'HEAD'], baseEnv)
+          !== opts.expectedRef
+        || gitText(gitRoot, ['rev-parse', opts.expectedRef], baseEnv)
+          !== opts.expectedHead
+      ) {
+        return { status: 'conflict', reason: 'head_moved' };
+      }
+      // Never touch the real index on a generic no-op. The captured
+      // index-versus-HEAD fence above has already rejected user staging; this
+      // is defense in depth for the zero-index-write contract.
+      return { status: 'no_change', sha: null, pathCount: 0 };
+    }
+
+    if (
+      gitText(gitRoot, ['symbolic-ref', '-q', 'HEAD'], baseEnv)
+        !== opts.expectedRef
+      || gitText(gitRoot, ['rev-parse', opts.expectedRef], baseEnv)
+        !== opts.expectedHead
+    ) {
+      return { status: 'conflict', reason: 'head_moved' };
+    }
+
+    const newCommit = gitText(gitRoot, [
+      'commit-tree', tree, '-p', opts.expectedHead, '-m', message,
+    ], baseEnv);
+    const published = [...byRel.values()].filter((file) => file.changesHead);
+    if (published.length === 0) {
+      throw new Error('non-empty tree has no changed verified path');
+    }
+    publishedPathCount = published.length;
+    // Prepare and fsync the exact post-commit real-index bytes while the
+    // standard index.lock is held. The WAL below can then name that lock inode
+    // before either the ref or real index is published.
+    const preparedIndex = prepareRealIndexLease(
+      gitRoot, newCommit, published, baseEnv, realIndexLease,
+    );
+    if (!preparedIndex.ok) {
+      if (preparedIndex.reason === 'index_changed'
+        || preparedIndex.reason === 'head_moved') {
+        return {
+          status: 'conflict', reason: preparedIndex.reason,
+          ...(preparedIndex.detail
+            ? { path: resolve(gitRoot, preparedIndex.detail) }
+            : {}),
+        };
+      }
+      return {
+        status: 'error', reason: 'git_failed',
+        detail: preparedIndex.detail ?? 'index preparation failed',
+      };
+    }
+    // The orphan is immutable but not published. Persist its exact identity
+    // before the ref CAS so recovery can never attribute a lookalike commit.
+    opts.beforePublish({
+      commitSha: newCommit,
+      treeSha: tree,
+      indexLeaseIdentity: realIndexLease.identity,
+      publishedFiles: published.map(({ absPath, expectedSha256 }) => ({
+        absPath, expectedSha256,
+      })),
+    });
+    opts._afterSnapshotForTest?.();
+    if (
+      gitText(gitRoot, ['symbolic-ref', '-q', 'HEAD'], baseEnv)
+        !== opts.expectedRef
+      || gitText(gitRoot, ['rev-parse', opts.expectedRef], baseEnv)
+        !== opts.expectedHead
+    ) {
+      return { status: 'conflict', reason: 'head_moved' };
+    }
+    try {
+      gitText(
+        gitRoot,
+        ['update-ref', opts.expectedRef, newCommit, opts.expectedHead],
+        baseEnv,
+      );
+    } catch {
+      return { status: 'conflict', reason: 'head_moved' };
+    }
+    committedSha = newCommit;
+    opts._afterRefPublishForTest?.();
+
+    if (
+      gitText(gitRoot, ['symbolic-ref', '-q', 'HEAD'], baseEnv)
+        !== opts.expectedRef
+      || gitText(gitRoot, ['rev-parse', opts.expectedRef], baseEnv) !== newCommit
+      || gitText(gitRoot, ['rev-parse', 'HEAD'], baseEnv) !== newCommit
+    ) {
+      return {
+        status: 'conflict', reason: 'head_moved', committedSha: newCommit,
+        pathCount: publishedPathCount,
+      };
+    }
+
+    // Synchronize only paths actually changed by this commit, under the real
+    // index.lock and only if each entry still equals the captured preimage.
+    // A concurrent `git add` wins: its staging is preserved and we surface a
+    // hard partial with the already-published commit/WAL identity.
+    const indexCas = publishRealIndexLease(
+      gitRoot, opts.expectedRef, newCommit, published, baseEnv, realIndexLease,
+    );
+    if (!indexCas.ok) {
+      if (indexCas.reason === 'index_changed' || indexCas.reason === 'head_moved') {
+        return {
+          status: 'conflict', reason: indexCas.reason,
+          ...(indexCas.detail ? { path: resolve(gitRoot, indexCas.detail) } : {}),
+          committedSha: newCommit,
+          pathCount: publishedPathCount,
+        };
+      }
+      return {
+        status: 'error', reason: 'git_failed',
+        detail: indexCas.detail ?? 'index CAS failed', committedSha: newCommit,
+        pathCount: publishedPathCount,
+      };
+    }
+
+    if (
+      gitText(gitRoot, ['symbolic-ref', '-q', 'HEAD'], baseEnv)
+        !== opts.expectedRef
+      || gitText(gitRoot, ['rev-parse', 'HEAD'], baseEnv) !== newCommit
+    ) {
+      return {
+        status: 'conflict', reason: 'head_moved', committedSha: newCommit,
+        pathCount: publishedPathCount,
+      };
+    }
+
+    // Prove the committed tree contains the captured blobs, then close the
+    // final disk TOCTOU. A concurrent file edit remains dirty and is reported.
+    for (const captured of byRel.values()) {
+      const committedBlob = gitText(
+        gitRoot, ['rev-parse', `${newCommit}:${captured.rel}`], baseEnv,
+      );
+      if (committedBlob !== captured.blobOid) {
+        return {
+          status: 'error', reason: 'git_failed',
+          detail: `committed_blob_mismatch:${captured.rel}`,
+          committedSha: newCommit, pathCount: publishedPathCount,
+        };
+      }
+      const actual = sha256Bytes(readFileSync(captured.absPath));
+      if (actual !== captured.expectedSha256) {
+        return {
+          status: 'conflict', reason: 'file_changed', path: captured.absPath,
+          expected: captured.expectedSha256, actual, committedSha: newCommit,
+          pathCount: publishedPathCount,
+        };
+      }
+    }
+
+    return { status: 'committed', sha: newCommit, pathCount: published.length };
+  } catch (err) {
+    return {
+      status: 'error',
+      reason: 'git_failed',
+      detail: err instanceof Error ? err.message : String(err),
+      ...(committedSha ? { committedSha, pathCount: publishedPathCount } : {}),
+    };
+  } finally {
+    releaseRealIndexLease(realIndexLease);
+    if (tempIndex) {
+      rmSync(`${tempIndex}.lock`, { force: true });
+      rmSync(tempIndex, { force: true });
+    }
+  }
+}
+
 
 export type PushLogStatus = 'ok' | 'needs_attention' | 'unknown';
 
