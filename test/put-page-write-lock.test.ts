@@ -131,8 +131,9 @@ describe('putPage engine compare-and-swap', () => {
       expectedContentHash: snapshot!.content_hash!,
     });
     expect(first.status).toBe('imported');
-    expect(same.status).toBe('imported');
-    expect((await engine.getVersions('notes/same-hash')).length).toBe(1);
+    expect(same.status).toBe('skipped');
+    expect(same.skip_reason).toBe('unchanged');
+    expect((await engine.getVersions('notes/same-hash')).length).toBe(0);
 
     const legacyContent = '---\ntype: note\ntitle: Legacy\n---\n\nlegacy body';
     const legacyHash = contentHashLegacy({

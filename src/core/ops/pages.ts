@@ -43,6 +43,18 @@ import {
 // --- Page CRUD ---
 
 const TASKS_PAGE_SLUG = 'ops/tasks';
+
+/**
+ * The task tracker is a hot coordination page and its guarded write must not
+ * hold the cross-session page lease while an external embedder retries. Its
+ * chunks still land with NULL embeddings and the standing stale-embed worker
+ * backfills them, exactly like other server-deferred writes.
+ */
+export function shouldDeferPutPageEmbeds(
+  slug: string, deferEmbeds: boolean, embeddingAvailable: boolean,
+): boolean {
+  return slug.toLowerCase() === TASKS_PAGE_SLUG || deferEmbeds || !embeddingAvailable;
+}
 const CONTENT_HASH_RE = /^[0-9a-f]{64}$/i;
 const TASK_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]*$/;
 
@@ -508,7 +520,7 @@ const put_page: Operation = {
     // oneshot runner) also defers — chunks land `embedding IS NULL` and the
     // standing embed machinery backfills them outside the model loop.
     const { isAvailable } = await import('../ai/gateway.ts');
-    const noEmbed = ctx.deferEmbeds === true || !isAvailable('embedding');
+    const noEmbed = shouldDeferPutPageEmbeds(slug, ctx.deferEmbeds === true, isAvailable('embedding'));
     // v0.31.8 (D7 / codex OV-1): thread ctx.sourceId so put_page on a
     // multi-source brain lands in the intended source instead of the
     // default-source clobber path. importFromContent already accepts
@@ -644,10 +656,14 @@ const put_page: Operation = {
     // put_page's own trust-gating produces two skip reasons ('subagent_sandbox',
     // 'dry_run') that never come out of writePageThrough itself — widen the
     // field rather than losing the commit/pushed/lastPushStatus typing.
-    let writeThrough: (Omit<WriteThroughResult, 'skipped'> & { skipped?: WriteThroughResult['skipped'] | 'subagent_sandbox' | 'dry_run' }) | undefined;
+    let writeThrough: (Omit<WriteThroughResult, 'skipped'> & { skipped?: WriteThroughResult['skipped'] | 'subagent_sandbox' | 'dry_run' | 'unchanged' }) | undefined;
     const isSandboxSubagent = ctx.viaSubagent === true
       && !(Array.isArray(ctx.allowedSlugPrefixes) && ctx.allowedSlugPrefixes.length > 0);
-    if (!ctx.dryRun && result.status !== 'error' && !isSandboxSubagent) {
+    const unchangedNoOp = result.status === 'skipped' && result.skip_reason === 'unchanged';
+    if (unchangedNoOp) {
+      // Identical CAS/content: do not restamp ingested_at on the canonical file.
+      writeThrough = { written: false, skipped: 'unchanged' };
+    } else if (!ctx.dryRun && result.status !== 'error' && !isSandboxSubagent) {
       const sourceId = ctx.sourceId ?? 'default';
       const provenanceVia = ctx.remote === false ? 'put_page' : 'mcp:put_page';
       // Shared canonical write-through (also used by `gbrain brainstorm/lsd
@@ -667,6 +683,13 @@ const put_page: Operation = {
     } else if (ctx.dryRun) {
       writeThrough = { written: false, skipped: 'dry_run' };
     }
+    const partial = Boolean(
+      writeThrough
+      && writeThrough.written !== true
+      && writeThrough.skipped !== 'unchanged'
+      && writeThrough.skipped !== 'subagent_sandbox'
+      && writeThrough.skipped !== 'dry_run',
+    );
 
     // Auto-link post-hook: runs AFTER importFromContent (which is its own
     // transaction). Runs even on status='skipped' so reconciliation catches drift
@@ -900,6 +923,8 @@ const put_page: Operation = {
       ...(writerLint ? { writer_lint: writerLint } : {}),
       ...(factsQueued ? { facts_backstop: factsQueued } : {}),
       ...(chronicleQueued ? { chronicle_backstop: chronicleQueued } : {}),
+      ...(unchangedNoOp ? { changed: false, no_op: true } : {}),
+      ...(partial ? { partial: true } : {}),
       ...(writeThrough ? { write_through: writeThrough } : {}),
     };
     });

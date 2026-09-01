@@ -250,7 +250,7 @@ export interface ImportResult {
    * in its malformed summary and keeps them OUT of failedFiles / the failure
    * ledger so they can never gate bookmark advancement.
    */
-  skip_reason?: 'malformed_path';
+  skip_reason?: 'malformed_path' | 'unchanged';
   /**
    * Advisory (schema.type_warnings): the page's explicit frontmatter `type:`
    * is an alias of a canonical pack type or undeclared in the pack. The type
@@ -696,8 +696,19 @@ export async function importFromContent(
     tags: parsed.tags,
   };
 
-  if (opts.expectedContentHash === undefined && existing?.content_hash === hash && !opts.forceRechunk) {
-    return { slug, status: 'skipped', chunks: 0, parsedPage, ...(typeWarning ? { type_warning: typeWarning } : {}) };
+  // Identical semantic hash: skip the store write even when CAS supplied
+  // expectedContentHash. Tracker/MCP updates always pass a hash, so the
+  // previous `expectedContentHash === undefined` guard let no-op CAS
+  // rewrites bump updated_at and restamp the canonical file.
+  if (existing?.content_hash === hash && !opts.forceRechunk) {
+    return {
+      slug,
+      status: 'skipped',
+      chunks: 0,
+      parsedPage,
+      skip_reason: 'unchanged',
+      ...(typeWarning ? { type_warning: typeWarning } : {}),
+    };
   }
 
   // #3694 one-time reconcile: a row written by the PRE-fix putPage formula

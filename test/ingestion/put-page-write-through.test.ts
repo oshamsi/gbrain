@@ -140,6 +140,7 @@ describe('put_page write-through — trust gating', () => {
     })) as { write_through?: { written: boolean; skipped?: string } };
     expect(result.write_through?.written).toBe(false);
     expect(result.write_through?.skipped).toBe('subagent_sandbox');
+    expect((result as { partial?: boolean }).partial).toBeUndefined();
     expect(fs.existsSync(path.join(brainDir, 'wiki/agents/42/scratch.md'))).toBe(false);
   });
 
@@ -182,6 +183,7 @@ describe('put_page write-through — config edge cases', () => {
       content: '---\ntitle: N\n---\n\nbody',
     })) as { write_through?: { skipped?: string } };
     expect(result.write_through?.skipped).toBe('no_repo_configured');
+    expect((result as { partial?: boolean }).partial).toBe(true);
   });
 
   test('repo path points at a missing directory → skipped repo_not_found', async () => {
@@ -192,6 +194,7 @@ describe('put_page write-through — config edge cases', () => {
       content: '---\ntitle: M\n---\n\nbody',
     })) as { write_through?: { skipped?: string } };
     expect(result.write_through?.skipped).toBe('repo_not_found');
+    expect((result as { partial?: boolean }).partial).toBe(true);
   });
 });
 
