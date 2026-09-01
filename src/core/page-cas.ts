@@ -1,16 +1,18 @@
-/** Options for the page-row write primitive. */
-export interface PutPageOptions {
+export type PageProvenanceFence = {
+  source_kind: string | null;
+  ingested_via: string | null;
+  ingested_at: Date | string | null;
+};
+
+type PutPageBaseOptions = {
   sourceId?: string;
   allowEmptyOverwrite?: boolean;
-  /** Existing-row optimistic-concurrency precondition. */
-  expectedContentHash?: string;
-  /** Snapshotted set-once provenance; CAS refuses if the live tuple moved. */
-  expectedProvenance?: {
-    source_kind: string | null;
-    ingested_via: string | null;
-    ingested_at: Date | string | null;
-  };
-}
+};
+
+export type PutPageOptions = PutPageBaseOptions & (
+  | { expectedContentHash?: undefined; expectedProvenance?: never }
+  | { expectedContentHash: string; expectedProvenance: PageProvenanceFence }
+);
 
 /** Stable engine-layer signal for an optimistic page-write conflict. */
 export class PageWriteConflictError extends Error {
@@ -61,71 +63,78 @@ export const PAGE_CAS_UPDATE_SQL = `
     source_uri = COALESCE($14, pages.source_uri),
     ingested_via = COALESCE(pages.ingested_via, $15),
     ingested_at = COALESCE(pages.ingested_at, $16::timestamptz)
-  WHERE source_id = $17 AND slug = $18 AND content_hash = $19
+  WHERE source_id = $17
+    AND slug = $18
+    AND content_hash = $19
     AND deleted_at IS NULL
-    AND (
-      $20::boolean IS NOT TRUE
-      OR (
-        pages.source_kind IS NOT DISTINCT FROM $21
-        AND pages.ingested_via IS NOT DISTINCT FROM $22
-        AND pages.ingested_at IS NOT DISTINCT FROM $23::timestamptz
-      )
-    )
+    AND pages.source_kind IS NOT DISTINCT FROM $20
+    AND pages.ingested_via IS NOT DISTINCT FROM $21
+    AND pages.ingested_at IS NOT DISTINCT FROM $22::timestamptz
   RETURNING id, source_id, slug, type, title, compiled_truth, timeline,
     frontmatter, content_hash, created_at, updated_at, effective_date,
     effective_date_source, import_filename, source_kind, source_uri,
     ingested_via, ingested_at`;
 
-/**
- * Atomic compare-only fence for identical-content CAS.
- *
- * Confirms the live row still carries `expectedContentHash` without writing
- * page fields or bumping `updated_at`. Zero RETURNING rows means the row
- * moved, vanished, or was tombstoned — callers must fall through to the
- * normal CAS write, which then conflicts.
- */
-// TODO: SET slug = slug is a real UPDATE and advances the statement-level
-// page-generation/cache clock even though it does not bump updated_at.
-// Prefer a compare-only SELECT ... FOR UPDATE if that cache churn matters.
-export const PAGE_CAS_COMPARE_SQL = `
-  UPDATE pages
-     SET slug = slug
-   WHERE source_id = $1 AND slug = $2 AND content_hash = $3
-     AND deleted_at IS NULL
-     AND (
-       $4::boolean IS NOT TRUE
-       OR (
-         pages.source_kind IS NOT DISTINCT FROM $5
-         AND pages.ingested_via IS NOT DISTINCT FROM $6
-         AND pages.ingested_at IS NOT DISTINCT FROM $7::timestamptz
-       )
-     )
-  RETURNING id`;
-
-export async function pageHashStillMatches(
-  engine: { executeRaw<T = Record<string, unknown>>(sql: string, params?: unknown[]): Promise<T[]> },
+export async function lockExpectedPageSnapshot(
+  engine: {
+    executeRaw<T = Record<string, unknown>>(
+      sql: string,
+      params?: unknown[],
+    ): Promise<T[]>;
+  },
   slug: string,
   sourceId: string,
   expectedContentHash: string,
-  expectedProvenance?: {
-    source_kind: string | null;
-    ingested_via: string | null;
-    ingested_at: Date | string | null;
-  } | null,
-): Promise<boolean> {
-  const fence = expectedProvenance != null;
-  const at = expectedProvenance?.ingested_at;
-  const atIso = at == null || at === ''
-    ? null
-    : (at instanceof Date ? at.toISOString() : String(at));
-  const rows = await engine.executeRaw(PAGE_CAS_COMPARE_SQL, [
-    sourceId,
-    slug,
-    expectedContentHash,
-    fence,
-    expectedProvenance?.source_kind ?? null,
-    expectedProvenance?.ingested_via ?? null,
-    atIso,
-  ]);
-  return rows.length > 0;
+  expectedProvenance: PageProvenanceFence,
+): Promise<void> {
+  const at = expectedProvenance.ingested_at;
+  const rows = await engine.executeRaw<{ id: number | string }>(
+    `SELECT id
+       FROM pages
+      WHERE source_id = $1
+        AND slug = $2
+        AND content_hash = $3
+        AND deleted_at IS NULL
+        AND source_kind IS NOT DISTINCT FROM $4
+        AND ingested_via IS NOT DISTINCT FROM $5
+        AND ingested_at IS NOT DISTINCT FROM $6::timestamptz
+      FOR UPDATE`,
+    [
+      sourceId,
+      slug,
+      expectedContentHash,
+      expectedProvenance.source_kind,
+      expectedProvenance.ingested_via,
+      at == null || at === ''
+        ? null
+        : (at instanceof Date ? at.toISOString() : String(at)),
+    ],
+  );
+  if (rows.length !== 1) {
+    throw new PageWriteConflictError(slug, sourceId, expectedContentHash);
+  }
+}
+
+export function requireResolvedIngestedAt(page: {
+  source_kind?: string | null;
+  source_uri?: string | null;
+  ingested_via?: string | null;
+  ingested_at?: Date | string | null;
+}): Date | null {
+  // Preserve 68d75a4 behavior: URI-only provenance also owns an ingest clock,
+  // even though source_uri is not serialized into canonical frontmatter.
+  const hasCanonicalProvenance = Boolean(
+    page.source_kind || page.source_uri || page.ingested_via,
+  );
+  if (hasCanonicalProvenance && page.ingested_at == null) {
+    throw new TypeError('putPage: provenance requires caller-resolved ingested_at');
+  }
+  if (page.ingested_at == null) return null;
+  const value = page.ingested_at instanceof Date
+    ? page.ingested_at
+    : new Date(page.ingested_at);
+  if (Number.isNaN(value.getTime())) {
+    throw new TypeError('putPage: invalid ingested_at');
+  }
+  return value;
 }

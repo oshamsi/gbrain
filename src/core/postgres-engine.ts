@@ -104,7 +104,12 @@ import type { PgCodeEdgesDeps } from './postgres-engine/code-edges.ts';
 import * as salienceImpl from './postgres-engine/salience.ts';
 import type { PgSalienceDeps } from './postgres-engine/salience.ts';
 import { hasCJK } from './cjk.ts';
-import { PAGE_CAS_UPDATE_SQL, PageWriteConflictError, type PutPageOptions } from './page-cas.ts';
+import {
+  PAGE_CAS_UPDATE_SQL,
+  PageWriteConflictError,
+  requireResolvedIngestedAt,
+  type PutPageOptions,
+} from './page-cas.ts';
 import { searchKeywordCJK as searchKeywordCJKImpl } from './postgres-engine/cjk-search.ts';
 import type { CjkKeywordCtx } from './search/cjk-keyword-sql.ts';
 function escapeSqlStringLiteral(value: string): string {
@@ -1367,8 +1372,34 @@ export class PostgresEngine implements BrainEngine {
     const sourceKind = page.source_kind ?? null;
     const sourceUri = page.source_uri ?? null;
     const ingestedVia = page.ingested_via ?? null;
-    const ingestedAt = page.ingested_at ?? ((sourceKind || sourceUri || ingestedVia) ? new Date() : null);
-    const rows = opts?.expectedContentHash !== undefined ? await this.executeRaw(PAGE_CAS_UPDATE_SQL, [page.type, pageKind, page.title, page.compiled_truth, page.timeline || '', JSON.stringify(frontmatter), hash, effectiveDate, effectiveDateSource, importFilename, chunkerVersion, sourcePath, sourceKind, sourceUri, ingestedVia, ingestedAt, sourceId, slug, opts.expectedContentHash, opts.expectedProvenance !== undefined, opts.expectedProvenance?.source_kind ?? null, opts.expectedProvenance?.ingested_via ?? null, opts.expectedProvenance?.ingested_at ?? null]) : await sql`
+    const ingestedAt = requireResolvedIngestedAt(page);
+    let rows: Record<string, unknown>[];
+    if (opts?.expectedContentHash !== undefined) {
+      const expected = opts.expectedProvenance;
+      if (!expected) {
+        throw new TypeError(
+          'putPage: expectedProvenance is required with expectedContentHash',
+        );
+      }
+      const expectedAt = expected.ingested_at;
+      const expectedAtIso = expectedAt == null || expectedAt === ''
+        ? null
+        : expectedAt instanceof Date
+          ? expectedAt.toISOString()
+          : new Date(String(expectedAt)).toISOString();
+      rows = await this.executeRaw<Record<string, unknown>>(
+        PAGE_CAS_UPDATE_SQL,
+        [
+          page.type, pageKind, page.title, page.compiled_truth,
+          page.timeline || '', JSON.stringify(frontmatter), hash,
+          effectiveDate, effectiveDateSource, importFilename, chunkerVersion,
+          sourcePath, sourceKind, sourceUri, ingestedVia, ingestedAt,
+          sourceId, slug, opts.expectedContentHash,
+          expected.source_kind, expected.ingested_via, expectedAtIso,
+        ],
+      );
+    } else {
+      rows = await sql`
           INSERT INTO pages (source_id, slug, type, page_kind, title, compiled_truth, timeline, frontmatter, content_hash, updated_at, effective_date, effective_date_source, import_filename, chunker_version, source_path, source_kind, source_uri, ingested_via, ingested_at)
           VALUES (${sourceId}, ${slug}, ${page.type}, ${pageKind}, ${page.title}, ${page.compiled_truth}, ${page.timeline || ''}, ${sql.json(frontmatter as Parameters<typeof sql.json>[0])}, ${hash}, now(), ${effectiveDate}, ${effectiveDateSource}, ${importFilename}, COALESCE(${chunkerVersion}::smallint, ${MARKDOWN_CHUNKER_VERSION}), ${sourcePath}, ${sourceKind}, ${sourceUri}, ${ingestedVia}, ${ingestedAt})
           ON CONFLICT (source_id, slug) DO UPDATE SET
@@ -1392,6 +1423,7 @@ export class PostgresEngine implements BrainEngine {
             ingested_at           = COALESCE(pages.ingested_at,           EXCLUDED.ingested_at)
           RETURNING id, source_id, slug, type, title, compiled_truth, timeline, frontmatter, content_hash, created_at, updated_at, effective_date, effective_date_source, import_filename, source_kind, source_uri, ingested_via, ingested_at
         `;
+    }
     if (rows.length === 0 && opts?.expectedContentHash !== undefined) throw new PageWriteConflictError(slug, sourceId, opts.expectedContentHash);
     return rowToPage(rows[0]);
   }

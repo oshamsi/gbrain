@@ -2,7 +2,13 @@ import { readFileSync, statSync, lstatSync } from 'fs';
 import { basename, extname } from 'path';
 import { createHash } from 'crypto';
 import type { BrainEngine, FileSpec } from './engine.ts';
-import { assertExpectedPageHash, pageHashStillMatches, PageWriteConflictError } from './page-cas.ts';
+import {
+  assertExpectedPageHash,
+  lockExpectedPageSnapshot,
+  PageWriteConflictError,
+  type PageProvenanceFence,
+  type PutPageOptions,
+} from './page-cas.ts';
 import { verifyPageReadable } from './page-write-verify.ts';
 import { parseMarkdown } from './markdown.ts';
 import { classifyStoredType } from './schema-pack/type-usage.ts';
@@ -59,6 +65,7 @@ import {
 import { countLiteral } from './fence-shared.ts';
 import { scanFencedBlocks, MAX_FENCES_PER_PAGE } from './fence-scan.ts';
 import {
+  canonicalizeEffectiveTags,
   loadCanonicalProjection,
   materializeProvenanceFrontmatter,
   persistCanonicalProjectionFromRow,
@@ -437,138 +444,227 @@ async function enforceExternalIdentityUniqueness(
   return null;
 }
 
+
+function semanticHashForParsed(
+  parsed: {
+    title: string;
+    type: PageType;
+    compiled_truth: string;
+    timeline?: string;
+    frontmatter: Record<string, unknown>;
+  },
+  tags: readonly string[],
+): string {
+  return contentHash({
+    title: parsed.title,
+    type: parsed.type,
+    compiled_truth: parsed.compiled_truth,
+    timeline: parsed.timeline || '',
+    frontmatter: parsed.frontmatter,
+    tags: [...tags],
+  });
+}
+
+function provenanceFenceOf(page: {
+  source_kind?: string | null;
+  ingested_via?: string | null;
+  ingested_at?: Date | string | null;
+}): PageProvenanceFence {
+  return {
+    source_kind: page.source_kind ?? null,
+    ingested_via: page.ingested_via ?? null,
+    ingested_at: page.ingested_at ?? null,
+  };
+}
+
 function storedProvenanceString(value: unknown): string | null {
   if (typeof value !== 'string') return null;
   const trimmed = value.trim();
   return trimmed ? trimmed : null;
 }
 
-async function reconcileUnchangedProjections(
+async function reconcileSemanticNoOpAtomically(
   engine: BrainEngine,
   slug: string,
   sourceId: string | undefined,
-  parsed: { compiled_truth: string; timeline?: string; tags: string[]; frontmatter: Record<string, unknown> },
-  hash: string,
+  parsed: {
+    title: string;
+    type: PageType;
+    compiled_truth: string;
+    timeline?: string;
+    frontmatter: Record<string, unknown>;
+  },
+  requestedTags: readonly string[],
+  expectedStoredHash: string,
+  targetHash: string,
+  expectedProvenance: PageProvenanceFence,
   resolvedProvenance: ProvenanceTuple,
   opts: { source_uri?: string | null },
-): Promise<void> {
-  const txOpts = { sourceId: sourceId ?? 'default' };
+): Promise<CanonicalImportReceipt> {
   const sid = sourceId ?? 'default';
-  for (const tag of parsed.tags) {
-    try {
-      await engine.addTag(slug, tag, txOpts);
-    } catch { /* add-only repair is fail-soft on a semantic no-op */ }
-  }
-  try {
-    const snap = await engine.executeRaw<{
+  const txOpts = { sourceId: sid };
+
+  const receipt = await engine.transaction(async (tx) => {
+    await lockExpectedPageSnapshot(
+      tx, slug, sid, expectedStoredHash, expectedProvenance,
+    );
+
+    const rows = await tx.executeRaw<{
+      id: number | string;
       frontmatter: Record<string, unknown> | string | null;
       source_kind: string | null;
+      source_uri: string | null;
       ingested_via: string | null;
       ingested_at: Date | string | null;
-      content_hash: string | null;
-      canonical_input_generation: string | number | null;
-      updated_at: Date | string | null;
+      content_hash: string;
     }>(
-      `SELECT frontmatter, source_kind, ingested_via, ingested_at, content_hash,
-              canonical_input_generation, updated_at
+      `SELECT id, frontmatter, source_kind, source_uri,
+              ingested_via, ingested_at, content_hash
          FROM pages
-        WHERE source_id = $1 AND slug = $2 AND deleted_at IS NULL
-        LIMIT 1`,
+        WHERE source_id = $1 AND slug = $2 AND deleted_at IS NULL`,
       [sid, slug],
     );
-    const row = Array.isArray(snap) ? snap[0] : undefined;
-    if (row) {
-      const effective: ProvenanceTuple = {
-        source_kind: row.source_kind ?? resolvedProvenance.source_kind,
-        ingested_via: row.ingested_via ?? resolvedProvenance.ingested_via,
-        ingested_at: row.ingested_at == null || row.ingested_at === ''
-          ? resolvedProvenance.ingested_at
-          : (row.ingested_at instanceof Date ? row.ingested_at : new Date(String(row.ingested_at))),
-      };
-      const fm = typeof row.frontmatter === 'string'
-        ? JSON.parse(row.frontmatter) as Record<string, unknown>
-        : { ...(row.frontmatter ?? {}) };
-      const beforeKind = storedProvenanceString(fm.source_kind);
-      const beforeVia = storedProvenanceString(fm.ingested_via);
-      const beforeAt = storedProvenanceString(fm.ingested_at);
-      materializeProvenanceFrontmatter(fm, effective);
-      const colsNeed = (row.source_kind == null && effective.source_kind != null)
-        || (row.ingested_via == null && effective.ingested_via != null)
-        || ((row.ingested_at == null || row.ingested_at === '') && effective.ingested_at != null);
-      const fmNeed = storedProvenanceString(fm.source_kind) !== beforeKind
-        || storedProvenanceString(fm.ingested_via) !== beforeVia
-        || storedProvenanceString(fm.ingested_at) !== beforeAt;
-      if (colsNeed || fmNeed) {
-        const updatedAt = row.updated_at instanceof Date
-          ? row.updated_at.toISOString()
-          : (row.updated_at ?? null);
-        await engine.executeRaw(
-          `UPDATE pages SET
-             source_kind = COALESCE(pages.source_kind, $1),
-             source_uri = COALESCE(pages.source_uri, $2),
-             ingested_via = COALESCE(pages.ingested_via, $3),
-             ingested_at = COALESCE(pages.ingested_at, $4::timestamptz),
-             frontmatter = $5::jsonb
-           WHERE source_id = $6 AND slug = $7 AND deleted_at IS NULL
-             AND content_hash IS NOT DISTINCT FROM $8
-             AND canonical_input_generation IS NOT DISTINCT FROM $9::bigint
-             AND updated_at IS NOT DISTINCT FROM $10::timestamptz`,
-          [
-            effective.source_kind,
-            opts.source_uri ?? null,
-            effective.ingested_via,
-            effective.ingested_at ? effective.ingested_at.toISOString() : null,
-            JSON.stringify(fm),
-            sid,
-            slug,
-            row.content_hash,
-            row.canonical_input_generation,
-            updatedAt,
-          ],
-        );
+    if (rows.length !== 1) {
+      throw new PageWriteConflictError(slug, sid, expectedStoredHash);
+    }
+    const row = rows[0]!;
+
+    for (const tag of requestedTags) await tx.addTag(slug, tag, txOpts);
+    const finalTags = canonicalizeEffectiveTags(
+      await tx.getTags(slug, txOpts),
+    );
+    if (semanticHashForParsed(parsed, finalTags) !== targetHash) {
+      throw new PageWriteConflictError(slug, sid, expectedStoredHash);
+    }
+
+    const effective: ProvenanceTuple = {
+      source_kind: row.source_kind ?? resolvedProvenance.source_kind,
+      ingested_via: row.ingested_via ?? resolvedProvenance.ingested_via,
+      ingested_at: row.ingested_at == null || row.ingested_at === ''
+        ? resolvedProvenance.ingested_at
+        : (row.ingested_at instanceof Date
+          ? row.ingested_at
+          : new Date(String(row.ingested_at))),
+    };
+    const fm = typeof row.frontmatter === 'string'
+      ? JSON.parse(row.frontmatter)
+      : { ...(row.frontmatter ?? {}) };
+    const beforeReserved = {
+      source_kind: fm.source_kind,
+      ingested_via: fm.ingested_via,
+      ingested_at: fm.ingested_at,
+    };
+    materializeProvenanceFrontmatter(fm, effective);
+    const reservedFrontmatterChanged =
+      beforeReserved.source_kind !== fm.source_kind
+      || beforeReserved.ingested_via !== fm.ingested_via
+      || beforeReserved.ingested_at !== fm.ingested_at;
+
+    const mustWrite = row.content_hash !== targetHash
+      || (row.source_kind == null && effective.source_kind != null)
+      || (opts.source_uri != null && row.source_uri !== opts.source_uri)
+      || (row.ingested_via == null && effective.ingested_via != null)
+      || ((row.ingested_at == null || row.ingested_at === '')
+        && effective.ingested_at != null)
+      || reservedFrontmatterChanged;
+
+    if (mustWrite) {
+      const updated = await tx.executeRaw<{ id: number | string }>(
+        `UPDATE pages SET
+           source_kind = COALESCE(pages.source_kind, $1),
+           source_uri = COALESCE($2, pages.source_uri),
+           ingested_via = COALESCE(pages.ingested_via, $3),
+           ingested_at = COALESCE(pages.ingested_at, $4::timestamptz),
+           frontmatter = $5::jsonb,
+           content_hash = $6
+         WHERE id = $7 AND source_id = $8 AND slug = $9
+           AND deleted_at IS NULL AND content_hash = $10
+         RETURNING id`,
+        [
+          effective.source_kind,
+          opts.source_uri ?? null,
+          effective.ingested_via,
+          effective.ingested_at?.toISOString() ?? null,
+          JSON.stringify(fm),
+          targetHash,
+          row.id,
+          sid,
+          slug,
+          expectedStoredHash,
+        ],
+      );
+      if (updated.length !== 1) {
+        throw new PageWriteConflictError(slug, sid, expectedStoredHash);
       }
     }
-  } catch { /* provenance COALESCE repair is fail-soft */ }
-  try {
-    const existingProj = await loadCanonicalProjection(engine, sid, slug);
-    if (!existingProj || !projectionIsFresh(existingProj)) {
-      await persistCanonicalProjectionFromRow(engine, sid, slug);
+
+    let projection = await loadCanonicalProjection(tx, sid, slug);
+    if (!projection || !projectionIsFresh(projection) || mustWrite) {
+      projection = await persistCanonicalProjectionFromRow(tx, sid, slug);
     }
-  } catch { /* projection backfill on a semantic no-op is fail-soft */ }
-  const codeRefs = extractCodeRefs(parsed.compiled_truth + '\n' + (parsed.timeline || ''));
+    if (
+      !projection
+      || !projectionIsFresh(projection)
+      || projection.semanticContentHash !== targetHash
+    ) {
+      throw new PageWriteConflictError(slug, sid, expectedStoredHash);
+    }
+    return canonicalImportReceiptOf(projection);
+  });
+
+  const codeRefs = extractCodeRefs(
+    parsed.compiled_truth + '\n' + (parsed.timeline || ''),
+  );
   const linkOpts = sourceId
-    ? { fromSourceId: sourceId, toSourceId: sourceId, originSourceId: sourceId }
+    ? {
+        fromSourceId: sourceId,
+        toSourceId: sourceId,
+        originSourceId: sourceId,
+      }
     : undefined;
   for (const ref of codeRefs) {
     const codeSlug = slugifyCodePath(ref.path);
     try {
-      await engine.addLink( // gbrain-allow-direct-insert: unchanged-lane code-ref repair
-        slug, codeSlug,
+      await engine.addLink( // gbrain-allow-direct-insert: semantic no-op reconcile derived indexes
+        slug,
+        codeSlug,
         ref.line ? `cited at ${ref.path}:${ref.line}` : ref.path,
-        'documents', 'markdown', slug, 'compiled_truth',
+        'documents',
+        'markdown',
+        slug,
+        'compiled_truth',
         linkOpts,
       );
     } catch { /* code page not yet imported */ }
     try {
-      await engine.addLink( // gbrain-allow-direct-insert: unchanged-lane reverse code-ref repair
-        codeSlug, slug,
-        ref.path, 'documented_by', 'markdown', slug, 'compiled_truth',
+      await engine.addLink( // gbrain-allow-direct-insert: semantic no-op reconcile derived indexes
+        codeSlug,
+        slug,
+        ref.path,
+        'documented_by',
+        'markdown',
+        slug,
+        'compiled_truth',
         linkOpts,
       );
     } catch { /* same reason */ }
   }
   try {
-    const aliasNorms = normalizeAliasList((parsed.frontmatter as Record<string, unknown>).aliases);
-    await engine.setPageAliases(slug, sourceId ?? 'default', aliasNorms);
-  } catch (e) {
-    if (!isUndefinedTableError(e)) {
+    const aliasNorms = normalizeAliasList(parsed.frontmatter.aliases);
+    await engine.setPageAliases(slug, sid, aliasNorms);
+  } catch (error) {
+    if (!isUndefinedTableError(error)) {
       warnOncePerProcess(
         'setPageAliases:failed',
-        `[import] page_aliases projection failed (non-fatal): ${e instanceof Error ? e.message : String(e)}`,
+        `[import] page_aliases projection failed (non-fatal): ${
+          error instanceof Error ? error.message : String(error)
+        }`,
       );
     }
   }
+  return receipt;
 }
+
 
 
 export interface CanonicalImportReceipt {
@@ -1056,7 +1152,7 @@ export async function importFromContent(
 
   const provenanceNow = new Date();
   const isTrustedSync = Boolean(opts.sourcePath) && opts.remote !== true;
-  const resolvedProvenance = resolveSetOnceProvenance(
+  const resolvedBase = resolveSetOnceProvenance(
     existing,
     { source_kind: opts.source_kind, ingested_via: opts.ingested_via },
     provenanceNow,
@@ -1071,6 +1167,11 @@ export async function importFromContent(
       inventTimestamp: true,
     },
   );
+  const resolvedProvenance = {
+    ...resolvedBase,
+    ingested_at: resolvedBase.ingested_at
+      ?? (opts.source_uri ? provenanceNow : null),
+  };
   if (!parsed.frontmatter) parsed.frontmatter = {};
   materializeProvenanceFrontmatter(parsed.frontmatter, resolvedProvenance);
 
@@ -1083,26 +1184,13 @@ export async function importFromContent(
   // formula (byte-parity pinned by test/content-hash-parity-3694.test.ts).
   // Sort tags in place first to preserve the pre-#3694 downstream behavior
   // (parsedPage.tags was sorted by the old inline `.sort()` mutation).
-  parsed.tags.sort();
-  // Add-only tag DML leaves existing tags in place, so the stored semantic
-  // hash (and persistCanonicalProjectionFromRow) must use the post-tx union.
-  let hashTags = parsed.tags;
-  if (existing && typeof engine.getTags === 'function') {
-    try {
-      const currentTags = await engine.getTags(slug, { sourceId: sourceId ?? 'default' });
-      hashTags = [...new Set([...currentTags, ...parsed.tags])].sort();
-    } catch {
-      hashTags = parsed.tags;
-    }
-  }
-  const hash = contentHash({
-    title: parsed.title,
-    type: parsed.type,
-    compiled_truth: parsed.compiled_truth,
-    timeline: parsed.timeline,
-    frontmatter: parsed.frontmatter,
-    tags: hashTags,
-  });
+  const requestedTags = canonicalizeEffectiveTags(parsed.tags);
+  const storedTags = existing
+    ? await engine.getTags(slug, { sourceId: sourceId ?? 'default' })
+    : [];
+  const effectiveTags = canonicalizeEffectiveTags(storedTags, requestedTags);
+  parsed.tags = effectiveTags;
+  const hash = semanticHashForParsed(parsed, effectiveTags);
 
   const parsedPage: ParsedPage = {
     type: parsed.type,
@@ -1132,33 +1220,20 @@ export async function importFromContent(
       skip_reason: 'unchanged' as const,
       ...(typeWarning ? { type_warning: typeWarning } : {}),
     };
-    if (opts.expectedContentHash !== undefined) {
-      if (typeof engine.executeRaw === 'function') {
-        const stillMatches = await pageHashStillMatches(
-          engine, slug, sourceId ?? 'default', opts.expectedContentHash,
-          existing
-            ? {
-                source_kind: existing.source_kind ?? null,
-                ingested_via: existing.ingested_via ?? null,
-                ingested_at: existing.ingested_at ?? null,
-              }
-            : null,
-        );
-        if (stillMatches) {
-          await reconcileUnchangedProjections(engine, slug, sourceId, parsed, hash, resolvedProvenance, {
-            source_uri: opts.source_uri ?? null,
-          });
-          return skipResult;
-        }
-        // Row moved after the snapshot: fall through to the normal CAS write.
-      }
-      // No compare-only primitive: do not return no_op; fall through.
-    } else {
-      await reconcileUnchangedProjections(engine, slug, sourceId, parsed, hash, resolvedProvenance, {
-        source_uri: opts.source_uri ?? null,
-      });
-      return skipResult;
-    }
+
+    const canonicalReceipt = await reconcileSemanticNoOpAtomically(
+      engine,
+      slug,
+      sourceId,
+      parsed,
+      requestedTags,
+      opts.expectedContentHash ?? existing.content_hash,
+      hash,
+      provenanceFenceOf(existing),
+      resolvedProvenance,
+      { source_uri: opts.source_uri ?? null },
+    );
+    return { ...skipResult, canonical_receipt: canonicalReceipt };
   }
 
   // #3694 one-time reconcile: a row written by the PRE-fix putPage formula
@@ -1166,7 +1241,11 @@ export async function importFromContent(
   // the content is unchanged — stamp the canonical hash via the narrow
   // refreshPageBody UPDATE (no chunk churn, no re-embed, no version snapshot)
   // and skip. The next import then hits the fast path above.
-  if (opts.expectedContentHash === undefined && existing && !opts.forceRechunk && typeof engine.refreshPageBody === 'function') {
+  if (
+    opts.expectedContentHash === undefined
+    && existing
+    && !opts.forceRechunk
+  ) {
     const legacyHash = contentHashLegacy({
       title: parsed.title,
       type: parsed.type,
@@ -1175,14 +1254,27 @@ export async function importFromContent(
       frontmatter: parsed.frontmatter,
     });
     if (existing.content_hash === legacyHash) {
-      await engine.refreshPageBody(
+      const canonicalReceipt = await reconcileSemanticNoOpAtomically(
+        engine,
         slug,
-        sourceId ?? 'default',
-        parsed.compiled_truth,
-        parsed.timeline || '',
+        sourceId,
+        parsed,
+        requestedTags,
+        legacyHash,
         hash,
+        provenanceFenceOf(existing),
+        resolvedProvenance,
+        { source_uri: opts.source_uri ?? null },
       );
-      return { slug, status: 'skipped', chunks: 0, parsedPage, ...(typeWarning ? { type_warning: typeWarning } : {}) };
+      return {
+        slug,
+        status: 'skipped' as const,
+        chunks: 0,
+        parsedPage,
+        skip_reason: 'unchanged' as const,
+        canonical_receipt: canonicalReceipt,
+        ...(typeWarning ? { type_warning: typeWarning } : {}),
+      };
     }
   }
 
@@ -1319,6 +1411,31 @@ export async function importFromContent(
   // for single-source callers.
   const txOpts = { sourceId: sourceId ?? 'default' };
   const written = await engine.transaction(async (tx) => {
+    if (existing) {
+      await lockExpectedPageSnapshot(
+        tx,
+        slug,
+        sourceId ?? 'default',
+        opts.expectedContentHash ?? existing.content_hash,
+        provenanceFenceOf(existing),
+      );
+    }
+
+    const lockedStoredTags = existing
+      ? await tx.getTags(slug, { sourceId: sourceId ?? 'default' })
+      : [];
+    const lockedEffectiveTags = canonicalizeEffectiveTags(
+      lockedStoredTags,
+      requestedTags,
+    );
+    const lockedHash = semanticHashForParsed(parsed, lockedEffectiveTags);
+    if (lockedHash !== hash) {
+      throw new PageWriteConflictError(
+        slug, sourceId ?? 'default',
+        opts.expectedContentHash ?? existing?.content_hash ?? hash,
+      );
+    }
+
     if (existing) await tx.createVersion(slug, txOpts);
 
     // v0.29.1 — compute effective_date from frontmatter precedence chain.
@@ -1344,7 +1461,7 @@ export async function importFromContent(
       compiled_truth: parsed.compiled_truth,
       timeline: parsed.timeline || '',
       frontmatter: parsed.frontmatter,
-      content_hash: hash,
+      content_hash: lockedHash,
       effective_date: effectiveDate,
       effective_date_source: effectiveDateSource,
       import_filename: filenameForChain,
@@ -1363,18 +1480,21 @@ export async function importFromContent(
       ingested_at: resolvedProvenance.ingested_at,
       // Empty-overwrite escape hatch only when the caller vouched (file
       // import / explicit allow_empty); otherwise the engine guard stays on.
-    }, {
-      ...txOpts,
-      ...(opts.allowEmptyOverwrite === true ? { allowEmptyOverwrite: true } : {}),
-      ...(opts.expectedContentHash !== undefined ? { expectedContentHash: opts.expectedContentHash } : {}),
-      ...(opts.expectedContentHash !== undefined ? {
-        expectedProvenance: {
-          source_kind: existing?.source_kind ?? null,
-          ingested_via: existing?.ingested_via ?? null,
-          ingested_at: existing?.ingested_at ?? null,
-        },
-      } : {}),
-    });
+    }, existing
+      ? {
+        sourceId: sourceId ?? 'default',
+        expectedContentHash: opts.expectedContentHash ?? existing.content_hash,
+        expectedProvenance: provenanceFenceOf(existing),
+        ...(opts.allowEmptyOverwrite === true
+          ? { allowEmptyOverwrite: true }
+          : {}),
+      }
+      : {
+        sourceId: sourceId ?? 'default',
+        ...(opts.allowEmptyOverwrite === true
+          ? { allowEmptyOverwrite: true }
+          : {}),
+      });
     if (committedPage != null && !provenanceTuplesEqual(resolvedProvenance, committedPage)) {
       throw new PageWriteConflictError(slug, txOpts.sourceId, opts.expectedContentHash ?? (existing?.content_hash ?? ''));
     }
@@ -1412,8 +1532,19 @@ export async function importFromContent(
     // tags. Frontmatter-tag REMOVAL would require a `tag_source` provenance
     // column (deferred — see TODOS.md #1621-followup). addTag is idempotent
     // (ON CONFLICT DO NOTHING), so re-adding existing tags is a no-op.
-    for (const tag of parsed.tags) {
+    for (const tag of requestedTags) {
       await tx.addTag(slug, tag, txOpts);
+    }
+
+    const finalTags = canonicalizeEffectiveTags(
+      await tx.getTags(slug, { sourceId: sourceId ?? 'default' }),
+    );
+    const finalHash = semanticHashForParsed(parsed, finalTags);
+    if (finalHash !== lockedHash) {
+      throw new PageWriteConflictError(
+        slug, sourceId ?? 'default',
+        opts.expectedContentHash ?? existing?.content_hash ?? hash,
+      );
     }
 
     // Store the canonical markdown projection in the same transaction as the
@@ -1424,6 +1555,12 @@ export async function importFromContent(
       txOpts.sourceId,
       slug,
     );
+    if (canonicalProjection.semanticContentHash !== finalHash) {
+      throw new PageWriteConflictError(
+        slug, sourceId ?? 'default',
+        opts.expectedContentHash ?? existing?.content_hash ?? hash,
+      );
+    }
 
     if (chunks.length > 0) {
       await tx.upsertChunks(slug, chunks, txOpts);

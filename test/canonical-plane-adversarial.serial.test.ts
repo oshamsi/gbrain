@@ -13,10 +13,13 @@ import { resetGateway } from '../src/core/ai/gateway.ts';
 import { operations } from '../src/core/operations.ts';
 import type { OperationContext } from '../src/core/operations.ts';
 import { importFromContent } from '../src/core/import-file.ts';
+import { parseMarkdown } from '../src/core/markdown.ts';
+import { PageWriteConflictError } from '../src/core/page-cas.ts';
 import { writePageThrough } from '../src/core/write-through.ts';
 import {
   buildCanonicalPageProjection,
   loadCanonicalProjection,
+  projectionIsFresh,
   persistCanonicalProjectionFromRow,
   sha256Utf8,
 } from '../src/core/page-canonical.ts';
@@ -510,5 +513,159 @@ describe('watcher self-origin and static renderer guard', () => {
     }
     const canonical = fs.readFileSync(path.join(root, 'core/page-canonical.ts'), 'utf8');
     expect(canonical).toContain('export function buildCanonicalPageProjection');
+  });
+});
+
+describe('atomic canonical identity', () => {
+  function taggedMarkdown(body: string, tags: string[]): string {
+    return `---\ntitle: Atomic Identity\ntags:\n${tags.map((tag) => `  - ${tag}`).join('\n')}\n---\n\n${body}\n`;
+  }
+
+  test('unchanged reconciliation conflicts on a provenance race', async () => {
+    const slug = 'inbox/atomic-provenance';
+    const content = taggedMarkdown('BODY-1', ['base']);
+    await importFromContent(engine, slug, content, {
+      noEmbed: true, sourceId: 'default',
+      source_kind: 'manual', ingested_via: 'test',
+    });
+    const initial = await engine.getPage(slug, { sourceId: 'default' });
+    const initialProjection = await loadCanonicalProjection(engine, 'default', slug);
+    const projected = parseMarkdown(initialProjection!.content, `${slug}.md`);
+    const dbAt = new Date(initial!.ingested_at!).toISOString();
+    expect(projected.frontmatter.ingested_at).toBe(dbAt);
+
+    const savedTransaction = engine.transaction;
+    const originalTransaction = engine.transaction.bind(engine);
+    let injected = false;
+    engine.transaction = async (fn) => {
+      if (!injected) {
+        injected = true;
+        await engine.executeRaw(
+          `UPDATE pages SET ingested_via='racer'
+            WHERE source_id='default' AND slug=$1`,
+          [slug],
+        );
+      }
+      return originalTransaction(fn);
+    };
+    try {
+      await expect(importFromContent(engine, slug, content, {
+        noEmbed: true,
+        sourceId: 'default',
+        expectedContentHash: initial!.content_hash,
+        source_kind: 'manual',
+        ingested_via: 'test',
+      })).rejects.toBeInstanceOf(PageWriteConflictError);
+    } finally {
+      engine.transaction = savedTransaction;
+    }
+  });
+
+  test('successful unchanged legacy adoption uses exactly one clock', async () => {
+    const slug = 'inbox/atomic-one-clock';
+    const content = taggedMarkdown('UNCHANGED', ['base']);
+    await importFromContent(engine, slug, content, {
+      noEmbed: true,
+      sourceId: 'default',
+      source_kind: 'manual',
+      ingested_via: 'test',
+    });
+    const before = await engine.getPage(slug, { sourceId: 'default' });
+
+    await engine.executeRaw(
+      `UPDATE pages SET
+         ingested_at = NULL,
+         frontmatter = frontmatter - 'ingested_at',
+         canonical_input_generation = COALESCE(canonical_input_generation, 0) + 1
+       WHERE source_id = 'default' AND slug = $1`,
+      [slug],
+    );
+    const stale = await loadCanonicalProjection(engine, 'default', slug);
+    expect(stale!.semanticContentHash).toBe(before!.content_hash);
+    expect(String(stale!.inputGeneration)).not.toBe(String(stale!.basisGeneration));
+
+    const result = await importFromContent(engine, slug, content, {
+      noEmbed: true,
+      sourceId: 'default',
+      source_kind: 'manual',
+      ingested_via: 'test',
+    });
+    expect(result).toMatchObject({ status: 'skipped', skip_reason: 'unchanged' });
+
+    const row = await engine.getPage(slug, { sourceId: 'default' });
+    const projection = await loadCanonicalProjection(engine, 'default', slug);
+    const projected = parseMarkdown(projection!.content, `${slug}.md`);
+    const rowAt = new Date(row!.ingested_at!).toISOString();
+    expect(rowAt).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+    expect(row!.frontmatter.ingested_at).toBe(rowAt);
+    expect(projected.frontmatter.ingested_at).toBe(rowAt);
+    expect(String(projection!.inputGeneration))
+      .toBe(String(projection!.basisGeneration));
+  });
+
+  test('changed source reimport hashes the effective additive tag union', async () => {
+    const slug = 'inbox/atomic-tags';
+    await importFromContent(engine, slug, taggedMarkdown('BODY-1', ['base']), {
+      noEmbed: true, sourceId: 'default',
+    });
+    const added = await addTag.handler(makeCtx(), {
+      slug, tag: 'enrich',
+    }) as { status: string };
+    expect(added.status).toBe('ok');
+
+    const changed = await importFromContent(
+      engine,
+      slug,
+      taggedMarkdown('BODY-2', ['base']),
+      { noEmbed: true, sourceId: 'default' },
+    );
+    expect(changed.status).toBe('imported');
+    const fileWrite = await writePageThrough(engine, slug, { sourceId: 'default' });
+    expect(fileWrite.written).toBe(true);
+    expect((await engine.getTags(slug, { sourceId: 'default' })).sort())
+      .toEqual(['base', 'enrich']);
+    const page = await engine.getPage(slug, { sourceId: 'default' });
+    const projection = await loadCanonicalProjection(engine, 'default', slug);
+    expect(page!.content_hash).toBe(projection!.semanticContentHash);
+    expect(projection!.content).toContain('BODY-2');
+    expect(fs.readFileSync(path.join(repo, `${slug}.md`), 'utf8'))
+      .toBe(projection!.content);
+  });
+
+  test('engine putPage requires caller-resolved ingested_at with provenance', async () => {
+    await expect(engine.putPage('inbox/missing-clock', {
+      type: 'note', title: 'Clock', compiled_truth: 'body', timeline: '',
+      frontmatter: {}, source_kind: 'manual', ingested_via: 'test',
+    }, { sourceId: 'default' })).rejects.toThrow(
+      'provenance requires caller-resolved ingested_at',
+    );
+
+    const at = new Date('2026-08-01T00:00:00.000Z');
+    await engine.putPage('inbox/one-clock', {
+      type: 'note', title: 'Clock', compiled_truth: 'body', timeline: '',
+      frontmatter: {}, source_kind: 'manual', ingested_via: 'test', ingested_at: at,
+    }, { sourceId: 'default' });
+    await persistCanonicalProjectionFromRow(engine, 'default', 'inbox/one-clock');
+    const storedClock = await engine.getPage('inbox/one-clock', { sourceId: 'default' });
+    const clockProjection = await loadCanonicalProjection(engine, 'default', 'inbox/one-clock');
+    expect(new Date(storedClock!.ingested_at!).toISOString()).toBe(at.toISOString());
+    expect(parseMarkdown(clockProjection!.content, 'one-clock.md').frontmatter.ingested_at)
+      .toBe(at.toISOString());
+  });
+
+  test('same-content URI reimport is incoming-non-null-wins', async () => {
+    const slug = 'inbox/atomic-uri';
+    const content = taggedMarkdown('URI-BODY', ['base']);
+    await importFromContent(engine, slug, content, {
+      noEmbed: true, sourceId: 'default', source_uri: 'urn:old',
+    });
+    const result = await importFromContent(engine, slug, content, {
+      noEmbed: true, sourceId: 'default', source_uri: 'urn:new',
+    });
+    expect(result.status).toBe('skipped');
+    const row = await engine.getPage(slug, { sourceId: 'default' });
+    expect(row!.source_uri).toBe('urn:new');
+    const projection = await loadCanonicalProjection(engine, 'default', slug);
+    expect(projectionIsFresh(projection!)).toBe(true);
   });
 });

@@ -146,6 +146,17 @@ function utcIso(value: Date | string | null | undefined): string | undefined {
   return date.toISOString();
 }
 
+
+export function canonicalizeEffectiveTags(
+  ...groups: ReadonlyArray<readonly string[]>
+): string[] {
+  const out = new Set<string>();
+  for (const group of groups) {
+    for (const tag of group) out.add(String(tag));
+  }
+  return [...out].sort();
+}
+
 function sortedUniqueTags(tags: readonly string[]): string[] {
   return [...new Set(tags.map((tag) => String(tag)))].sort();
 }
@@ -178,7 +189,7 @@ export function buildCanonicalPageProjection(
   const ingestedAt = utcIso(page.ingested_at ?? undefined);
   if (ingestedAt) frontmatter.ingested_at = ingestedAt;
 
-  const tags = sortedUniqueTags(effectiveTags);
+  const tags = canonicalizeEffectiveTags(effectiveTags);
   const content = serializeMarkdown(
     frontmatter,
     page.compiled_truth ?? '',
@@ -218,7 +229,7 @@ export function serializeRedactedPageForRead(
     {
       type: (page.type as PageType) ?? 'note',
       title: page.title ?? '',
-      tags: sortedUniqueTags(tags),
+      tags: canonicalizeEffectiveTags(tags),
     },
   );
 }

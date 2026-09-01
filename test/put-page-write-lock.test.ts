@@ -12,6 +12,22 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
+
+function engineCas(page: Pick<
+  Page,
+  'content_hash' | 'source_kind' | 'ingested_via' | 'ingested_at'
+>): PutPageOptions {
+  if (!page.content_hash) throw new Error('test fixture has no content_hash');
+  return {
+    expectedContentHash: page.content_hash,
+    expectedProvenance: {
+      source_kind: page.source_kind ?? null,
+      ingested_via: page.ingested_via ?? null,
+      ingested_at: page.ingested_at ?? null,
+    },
+  };
+}
+
 let engine: PGLiteEngine;
 const putPageOp = operations.find(operation => operation.name === 'put_page')!;
 
@@ -77,13 +93,9 @@ describe('putPage engine compare-and-swap', () => {
     const seeded = await engine.putPage('notes/concurrent', pageBody('base'));
     const expected = seeded.content_hash!;
 
-    await engine.putPage('notes/concurrent', pageBody('writer one'), {
-      expectedContentHash: expected,
-    });
+    await engine.putPage('notes/concurrent', pageBody('writer one'), engineCas(seeded));
     await expect(
-      engine.putPage('notes/concurrent', pageBody('writer two'), {
-        expectedContentHash: expected,
-      }),
+      engine.putPage('notes/concurrent', pageBody('writer two'), engineCas(seeded)),
     ).rejects.toBeInstanceOf(PageWriteConflictError);
 
     expect((await engine.getPage('notes/concurrent'))?.compiled_truth).toBe('writer one');
@@ -94,15 +106,10 @@ describe('putPage engine compare-and-swap', () => {
     await engine.executeRaw("INSERT INTO sources (id, name) VALUES ('team-x', 'team-x')");
 
     await expect(
-      engine.putPage('notes/missing', pageBody('must not create'), {
-        expectedContentHash: seeded.content_hash!,
-      }),
+      engine.putPage('notes/missing', pageBody('must not create'), engineCas(seeded)),
     ).rejects.toBeInstanceOf(PageWriteConflictError);
     await expect(
-      engine.putPage('notes/source-bound', pageBody('wrong target'), {
-        sourceId: 'team-x',
-        expectedContentHash: seeded.content_hash!,
-      }),
+      engine.putPage('notes/source-bound', pageBody('wrong target'), { ...engineCas(seeded), sourceId: 'team-x' }),
     ).rejects.toBeInstanceOf(PageWriteConflictError);
 
     expect(await engine.getPage('notes/missing')).toBeNull();
@@ -113,9 +120,7 @@ describe('putPage engine compare-and-swap', () => {
     const seeded = await engine.putPage('notes/deleted', pageBody('base'));
     await engine.softDeletePage('notes/deleted', { sourceId: 'default' });
 
-    await expect(engine.putPage('notes/deleted', pageBody('resurrected'), {
-      expectedContentHash: seeded.content_hash!,
-    })).rejects.toBeInstanceOf(PageWriteConflictError);
+    await expect(engine.putPage('notes/deleted', pageBody('resurrected'), engineCas(seeded))).rejects.toBeInstanceOf(PageWriteConflictError);
 
     const tombstone = await engine.getPage('notes/deleted', { includeDeleted: true });
     expect(tombstone?.compiled_truth).toBe('base');
@@ -433,9 +438,7 @@ describe('put_page operation write lock and ops/tasks guard', () => {
       reads += 1;
       const snapshot = await originalGetPage(requested, opts);
       if (reads === 2) {
-        await engine.putPage(slug, pageBody('rival won'), {
-          expectedContentHash: snapshot!.content_hash!,
-        });
+        await engine.putPage(slug, pageBody('rival won'), engineCas(snapshot!));
       }
       return snapshot;
     }) as typeof engine.getPage;
@@ -467,9 +470,7 @@ describe('put_page operation write lock and ops/tasks guard', () => {
       reads += 1;
       const snapshot = await originalGetPage(requested, opts);
       if (reads === 2) {
-        await engine.putPage(slug, pageBody('rival won'), {
-          expectedContentHash: snapshot!.content_hash!,
-        });
+        await engine.putPage(slug, pageBody('rival won'), engineCas(snapshot!));
       }
       return snapshot;
     }) as typeof engine.getPage;
@@ -515,9 +516,7 @@ describe('put_page operation write lock and ops/tasks guard', () => {
       reads += 1;
       const page = await originalGetPage(requested, opts);
       if (reads === 3) {
-        await engine.putPage(slug, { ...pageBody('writer B'), title: 'Writer B' }, {
-          expectedContentHash: page!.content_hash!,
-        });
+        await engine.putPage(slug, { ...pageBody('writer B'), title: 'Writer B' }, engineCas(page!));
         await engine.executeRaw(
           'UPDATE pages SET updated_at = $1::timestamptz WHERE source_id = $2 AND slug = $3',
           [page!.updated_at.toISOString(), 'default', slug],

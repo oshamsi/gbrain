@@ -118,7 +118,12 @@ import * as codeEdgesImpl from './pglite-engine/code-edges.ts';
 import type { PgliteCodeEdgesDeps } from './pglite-engine/code-edges.ts';
 import * as salienceImpl from './pglite-engine/salience.ts';
 import type { PgliteSalienceDeps } from './pglite-engine/salience.ts';
-import { PAGE_CAS_UPDATE_SQL, PageWriteConflictError, type PutPageOptions } from './page-cas.ts';
+import {
+  PAGE_CAS_UPDATE_SQL,
+  PageWriteConflictError,
+  requireResolvedIngestedAt,
+  type PutPageOptions,
+} from './page-cas.ts';
 import { searchKeywordCJK } from './pglite-engine/cjk-search.ts';
 /**
  * #4284 — opt-in out-of-band watchdog for a PGLite disconnect with a live
@@ -1741,8 +1746,34 @@ export class PGLiteEngine implements BrainEngine {
     const sourceKind = page.source_kind ?? null;
     const sourceUri = page.source_uri ?? null;
     const ingestedVia = page.ingested_via ?? null;
-    const ingestedAt = page.ingested_at ? (page.ingested_at instanceof Date ? page.ingested_at.toISOString() : String(page.ingested_at)) : ((sourceKind || sourceUri || ingestedVia) ? new Date().toISOString() : null);
-    const rows = opts?.expectedContentHash !== undefined ? await this.executeRaw(PAGE_CAS_UPDATE_SQL, [page.type, pageKind, page.title, page.compiled_truth, page.timeline || '', JSON.stringify(frontmatter), hash, effectiveDate, effectiveDateSource, importFilename, chunkerVersion, sourcePath, sourceKind, sourceUri, ingestedVia, ingestedAt, sourceId, slug, opts.expectedContentHash, opts.expectedProvenance !== undefined, opts.expectedProvenance?.source_kind ?? null, opts.expectedProvenance?.ingested_via ?? null, opts.expectedProvenance?.ingested_at ?? null]) : await this.db.query(
+    const ingestedAt = requireResolvedIngestedAt(page)?.toISOString() ?? null;
+    let rows: Record<string, unknown>[];
+    if (opts?.expectedContentHash !== undefined) {
+      const expected = opts.expectedProvenance;
+      if (!expected) {
+        throw new TypeError(
+          'putPage: expectedProvenance is required with expectedContentHash',
+        );
+      }
+      const expectedAt = expected.ingested_at;
+      const expectedAtIso = expectedAt == null || expectedAt === ''
+        ? null
+        : expectedAt instanceof Date
+          ? expectedAt.toISOString()
+          : new Date(String(expectedAt)).toISOString();
+      rows = await this.executeRaw<Record<string, unknown>>(
+        PAGE_CAS_UPDATE_SQL,
+        [
+          page.type, pageKind, page.title, page.compiled_truth,
+          page.timeline || '', JSON.stringify(frontmatter), hash,
+          effectiveDate, effectiveDateSource, importFilename, chunkerVersion,
+          sourcePath, sourceKind, sourceUri, ingestedVia, ingestedAt,
+          sourceId, slug, opts.expectedContentHash,
+          expected.source_kind, expected.ingested_via, expectedAtIso,
+        ],
+      );
+    } else {
+      const result = await this.db.query(
           `INSERT INTO pages (source_id, slug, type, page_kind, title, compiled_truth, timeline, frontmatter, content_hash, updated_at, effective_date, effective_date_source, import_filename, chunker_version, source_path, source_kind, source_uri, ingested_via, ingested_at)
            VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, now(), $10::timestamptz, $11, $12, COALESCE($13, ${MARKDOWN_CHUNKER_VERSION}), $14, $15, $16, $17, $18::timestamptz)
            ON CONFLICT (source_id, slug) DO UPDATE SET
@@ -1766,7 +1797,9 @@ export class PGLiteEngine implements BrainEngine {
              ingested_at           = COALESCE(pages.ingested_at,           EXCLUDED.ingested_at)
            RETURNING id, source_id, slug, type, title, compiled_truth, timeline, frontmatter, content_hash, created_at, updated_at, effective_date, effective_date_source, import_filename, source_kind, source_uri, ingested_via, ingested_at`,
           [sourceId, slug, page.type, pageKind, page.title, page.compiled_truth, page.timeline || '', JSON.stringify(frontmatter), hash, effectiveDate, effectiveDateSource, importFilename, chunkerVersion, sourcePath, sourceKind, sourceUri, ingestedVia, ingestedAt],
-        ).then(result => result.rows);
+        );
+      rows = result.rows;
+    }
     if (rows.length === 0 && opts?.expectedContentHash !== undefined) throw new PageWriteConflictError(slug, sourceId, opts.expectedContentHash);
     // PGLite can return zero rows from INSERT ... RETURNING in no-op/trigger
     // edge cases. Re-read the written row rather than crashing on undefined.
