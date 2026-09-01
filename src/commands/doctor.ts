@@ -129,6 +129,7 @@ export {
   computeExtractAtomsBacklogCheck,
   computeExtractHealthCheck,
   checkSyncFreshness,
+  checkStoreFileParity,
 } from './doctor/checks/extraction-sync.ts';
 export {
   checkSyncConsolidation,
@@ -211,6 +212,7 @@ import {
   computeExtractAtomsBacklogCheck,
   computeExtractHealthCheck,
   checkSyncFreshness,
+  checkStoreFileParity,
 } from './doctor/checks/extraction-sync.ts';
 import {
   checkSyncConsolidation,
@@ -3823,6 +3825,8 @@ export async function buildChecks(
     checks.push(await checkUndeclaredDbOnlyPages(engine));
     progress.heartbeat('db_only_collector_collision');
     checks.push(await checkDbOnlyCollectorCollision(engine));
+    progress.heartbeat('store_file_parity');
+    checks.push(await checkStoreFileParity(engine, { sourceId: orphanRatioSourceId }));
   }
 
   // v0.32.3 search-lite — mode + eval_drift surfaces. Status stays 'ok' per

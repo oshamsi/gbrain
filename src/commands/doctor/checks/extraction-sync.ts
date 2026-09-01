@@ -941,3 +941,34 @@ export async function checkSyncFreshness(
     };
   }
 }
+
+
+export async function checkStoreFileParity(
+  engine: BrainEngine,
+  opts: { sourceId?: string } = {},
+): Promise<Check> {
+  const name = 'store_file_parity';
+  try {
+    const { computeStoreFileParity } = await import('../../../core/page-plane-parity.ts');
+    const report = await computeStoreFileParity(engine, opts);
+    const sample = report.sample.map((s) => `${s.slug} (${s.reason})`).join(', ');
+    const sourceHint = opts.sourceId ?? '<source-id>';
+    const rem = `Fix: gbrain pages converge-canonical --source ${sourceHint}`;
+    if (report.divergent_pages === 0) {
+      return {
+        name,
+        status: 'ok',
+        message: `Canonical store/file parity: ${report.checked_pages} page(s) checked, 0 divergent (${report.not_projected_pages} not projected)`,
+        details: report as unknown as Record<string, unknown>,
+      };
+    }
+    return {
+      name,
+      status: 'warn',
+      message: `Canonical store/file parity: ${report.divergent_pages} divergent of ${report.eligible_pages} eligible (stale=${report.stale_projections}, hash=${report.hash_mismatches}, size=${report.size_mismatches}, missing=${report.missing_files}, unreadable=${report.unreadable_files}, unmeasured=${report.unmeasured_pages}). Sample: ${sample || 'none'}. ${rem}`,
+      details: report as unknown as Record<string, unknown>,
+    };
+  } catch (e) {
+    return { name, status: 'warn', message: `Could not check store/file parity: ${(e as Error).message}` };
+  }
+}

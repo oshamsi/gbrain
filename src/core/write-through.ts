@@ -238,73 +238,86 @@ export type PageWriteTarget =
  * path or the fence lands in a file sync never reads back and the next
  * extract_facts reconcile deletes the fence-owned DB rows.
  */
-export async function resolvePageWriteTarget(
-  engine: BrainEngine,
-  slug: string,
-  sourceId: string,
-): Promise<PageWriteTarget> {
+export function resolvePageWriteTargetFromLoadedMeta(args: {
+  sourceId: string;
+  slug: string;
+  sourceLocalPath: string | null;
+  sourcePath: string | null;
+  sourceUri: string | null;
+  repoPath: string | null;
+  otherSourceLocalPaths: ReadonlySet<string>;
+}): PageWriteTarget {
+  const recordedPath = sanitizeRecordedSourcePath(args.sourcePath);
+  const recordedUri = args.sourceUri;
+  const sourceLocalPath = args.sourceLocalPath ? msysToNativePath(args.sourceLocalPath) : null;
   let filePath: string;
   let writeRoot: string;
-  const srcRows = await engine.executeRaw<{ local_path: string | null }>(
-    `SELECT local_path FROM sources WHERE id = $1`,
-    [sourceId],
-  );
-  // gbrain#2955: heal an msys-style local_path (`/c/Users/x`, recorded by a
-  // Git Bash `sources add --path` on Windows) before it is joined — raw, it
-  // resolves to a phantom `C:\c\Users\x` and every write silently misses the
-  // real vault. Identity on POSIX and for already-native paths.
-  const rawLocalPath = srcRows[0]?.local_path ?? null;
-  const sourceLocalPath = rawLocalPath ? msysToNativePath(rawLocalPath) : null;
-
-  const pathRows = await engine.executeRaw<{ source_path: string | null; source_uri: string | null }>(
-    `SELECT source_path, source_uri FROM pages WHERE source_id = $1 AND slug = $2 AND deleted_at IS NULL LIMIT 1`,
-    [sourceId, slug],
-  );
-  const recordedPath = sanitizeRecordedSourcePath(pathRows[0]?.source_path);
-  const recordedUri = pathRows[0]?.source_uri ?? null;
 
   if (sourceLocalPath) {
     if (!existsSync(sourceLocalPath) || !statSync(sourceLocalPath).isDirectory()) {
       return { ok: false, skipped: 'repo_not_found' };
     }
     filePath = recordedPath
-      // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal -- result passes isWriteTargetContained before any write (#4204/#4289 guard)
-      ? resolveSourceLocalFilePath(sourceLocalPath, recordedPath) ?? join(sourceLocalPath, `${slug}.md`)
-      : join(sourceLocalPath, recordedPathFromFileUri(recordedUri, sourceLocalPath) ?? `${slug}.md`); // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal -- result passes isWriteTargetContained before any write (#4204/#4289 guard)
+      ? resolveSourceLocalFilePath(sourceLocalPath, recordedPath) ?? join(sourceLocalPath, `${args.slug}.md`)
+      : join(sourceLocalPath, recordedPathFromFileUri(recordedUri, sourceLocalPath) ?? `${args.slug}.md`);
     writeRoot = sourceLocalPath;
   } else {
-    const repoPath = await engine.getConfig('sync.repo_path');
+    const repoPath = args.repoPath;
     if (!repoPath) {
       return { ok: false, skipped: 'no_repo_configured' };
     }
     if (!existsSync(repoPath) || !statSync(repoPath).isDirectory()) {
       return { ok: false, skipped: 'repo_not_found' };
     }
-    // Leak guard: refuse to write into a path that is some OTHER source's
-    // own working tree (#2018).
-    const collide = await engine.executeRaw<{ one: number }>(
-      `SELECT 1 AS one FROM sources WHERE id <> $1 AND local_path = $2 LIMIT 1`,
-      [sourceId, repoPath],
-    );
-    if (collide.length > 0) {
+    if (args.otherSourceLocalPaths.has(msysToNativePath(repoPath))) {
       return { ok: false, skipped: 'source_repo_belongs_to_other_source' };
     }
-    const pageRoot = sourceId === 'default' ? repoPath : join(repoPath, '.sources', sourceId);
+    const pageRoot = args.sourceId === 'default' ? repoPath : join(repoPath, '.sources', args.sourceId);
     const knownPath = recordedPath ?? recordedPathFromFileUri(recordedUri, pageRoot);
-    filePath = knownPath ? join(pageRoot, knownPath) : resolvePageFilePath(repoPath, slug, sourceId);
+    filePath = knownPath ? join(pageRoot, knownPath) : resolvePageFilePath(repoPath, args.slug, args.sourceId);
     writeRoot = repoPath;
   }
 
-  // Defense-in-depth (#1647-slug / codex #6): confirm the computed file path
-  // stays within the source's working tree before any mkdir/write. validateSlug
-  // already rejects `..`/backslash/control/%2e in the slug at write time, so
-  // this guards a pre-existing hostile row or a symlinked intermediate dir
-  // under the source tree from escaping to an arbitrary filesystem location.
   if (!isWriteTargetContained(filePath, writeRoot)) {
     return { ok: false, skipped: 'path_escapes_source_root' };
   }
-
   return { ok: true, filePath, writeRoot };
+}
+
+export async function resolvePageWriteTarget(
+  engine: BrainEngine,
+  slug: string,
+  sourceId: string,
+): Promise<PageWriteTarget> {
+  const srcRows = await engine.executeRaw<{ local_path: string | null }>(
+    `SELECT local_path FROM sources WHERE id = $1`,
+    [sourceId],
+  );
+  const rawLocalPath = srcRows[0]?.local_path ?? null;
+  const pathRows = await engine.executeRaw<{ source_path: string | null; source_uri: string | null }>(
+    `SELECT source_path, source_uri FROM pages WHERE source_id = $1 AND slug = $2 AND deleted_at IS NULL LIMIT 1`,
+    [sourceId, slug],
+  );
+  const repoPath = rawLocalPath ? null : await engine.getConfig('sync.repo_path');
+  const otherSourceLocalPaths = new Set<string>();
+  if (repoPath) {
+    const collide = await engine.executeRaw<{ local_path: string | null }>(
+      `SELECT local_path FROM sources WHERE id <> $1 AND local_path IS NOT NULL`,
+      [sourceId],
+    );
+    for (const row of collide) {
+      if (row.local_path) otherSourceLocalPaths.add(msysToNativePath(row.local_path));
+    }
+  }
+  return resolvePageWriteTargetFromLoadedMeta({
+    sourceId,
+    slug,
+    sourceLocalPath: rawLocalPath,
+    sourcePath: pathRows[0]?.source_path ?? null,
+    sourceUri: pathRows[0]?.source_uri ?? null,
+    repoPath,
+    otherSourceLocalPaths,
+  });
 }
 
 /**
