@@ -5,7 +5,7 @@
 
 import {
   existsSync, readFileSync, writeFileSync, unlinkSync, openSync, closeSync,
-  copyFileSync, renameSync, fsyncSync, rmSync, linkSync, statSync,
+  copyFileSync, renameSync, fsyncSync, rmSync, linkSync, statSync, fstatSync,
 } from 'node:fs';
 import { join, resolve, relative, isAbsolute, dirname } from 'node:path';
 import { createHash, randomBytes } from 'node:crypto';
@@ -35,6 +35,7 @@ import { atomicWriteFileSync } from './atomic-write.ts';
 import { sourceCommitAnchorAllowed } from './sync-anchor.ts';
 import {
   commitWriteThroughFiles,
+  convergencePublicationRef,
   triggerManagedDurabilityPushOnly,
   type VerifiedBatchCommitOutcome,
 } from './brain-repo-durability.ts';
@@ -362,12 +363,40 @@ type VerifiedConvergencePath = {
   sha256: string;
 };
 
-type PendingRecovery =
-  | { kind: 'current'; journal: ConvergenceJournal; ref: string; head: string }
-  | { kind: 'legacy'; journal: LegacyConvergenceJournal; ref: string; head: string };
+type JournalFileReceipt = {
+  dev: string;
+  ino: string;
+  sha256: string;
+};
 
-type ConvergenceJournal = {
-  version: 4;
+type PublishedIndexProof = {
+  expectedRef: string;
+  targetHead: string;
+  indexIdentity: { dev: string; ino: string };
+};
+
+type PublishedIndexResult =
+  | { ok: true; proof: PublishedIndexProof }
+  | { ok: false; reason: string };
+
+type PendingRecovery =
+  | {
+      kind: 'current';
+      journal: ConvergenceJournal;
+      journalReceipt: JournalFileReceipt;
+      ref: string;
+      head: string;
+      indexProof: PublishedIndexProof;
+    }
+  | {
+      kind: 'legacy';
+      journal: LegacyConvergenceJournal;
+      journalReceipt: JournalFileReceipt;
+      ref: string;
+      head: string;
+    };
+
+type ConvergenceJournalBase = {
   sourceId: string;
   expectedRef: string;
   preHead: string;
@@ -387,6 +416,13 @@ type ConvergenceJournal = {
   }>;
 };
 
+type ConvergenceJournalV4 = ConvergenceJournalBase & { version: 4 };
+type ConvergenceJournalV5 = ConvergenceJournalBase & {
+  version: 5;
+  publicationNonce: string;
+};
+type ConvergenceJournal = ConvergenceJournalV4 | ConvergenceJournalV5;
+
 type LegacyConvergenceJournal = {
   sourceId: string;
   preHead: string;
@@ -395,9 +431,9 @@ type LegacyConvergenceJournal = {
 
 type ConvergenceJournalRead =
   | { kind: 'none' }
-  | { kind: 'current'; journal: ConvergenceJournal }
-  | { kind: 'legacy'; journal: LegacyConvergenceJournal }
-  | { kind: 'invalid'; reason: 'partial_or_malformed' };
+  | { kind: 'current'; journal: ConvergenceJournal; receipt: JournalFileReceipt }
+  | { kind: 'legacy'; journal: LegacyConvergenceJournal; receipt: JournalFileReceipt }
+  | { kind: 'invalid'; reason: 'partial_or_malformed'; receipt: JournalFileReceipt };
 
 type GitTreeEntry = { mode: string; type: string; oid: string };
 type GitIndexEntry = { mode: string; oid: string };
@@ -489,7 +525,7 @@ function reconcilePublishedIndex(
   journal: ConvergenceJournal,
   expectedRef: string,
   targetHead: string,
-): AnchorFenceResult {
+): PublishedIndexResult {
   const root = repositoryRoot(repo);
   const indexRaw = git(root, ['rev-parse', '--git-path', 'index']);
   const indexPath = isAbsolute(indexRaw) ? indexRaw : resolve(root, indexRaw);
@@ -554,47 +590,73 @@ function reconcilePublishedIndex(
         tryGit(root, ['symbolic-ref', '-q', 'HEAD']) !== expectedRef
         || tryGit(root, ['rev-parse', 'HEAD']) !== targetHead
       ) return { ok: false, reason: 'index_repair_head_moved' };
-      // Never let Git replace the owned standard lock inode. Build in a
-      // private index, verify it, then copy+fsync its complete bytes into the
-      // still-owned inode before the final atomic rename.
-      repairPath = `${lockPath}.repair-${process.pid}-${randomBytes(8).toString('hex')}`;
+
+      repairPath = `${lockPath}.repair-${process.pid}-${
+        randomBytes(8).toString('hex')
+      }`;
       copyFileSync(lockPath, repairPath);
       const repairEnv = { ...controlledGitEnv(), GIT_INDEX_FILE: repairPath };
       execFileSync('git', [
         '--literal-pathspecs', '-C', root,
         'reset', '--quiet', targetHead, '--', ...needsReset,
       ], {
-        stdio: 'ignore', timeout: 30_000,
-        env: repairEnv,
+        stdio: 'ignore', timeout: 30_000, env: repairEnv,
       });
-      if (
-        tryGit(root, ['symbolic-ref', '-q', 'HEAD']) !== expectedRef
-        || tryGit(root, ['rev-parse', 'HEAD']) !== targetHead
-      ) return { ok: false, reason: 'index_repair_head_moved' };
       const repaired = gitIndexSnapshot(repo, needsReset, repairEnv);
       for (const relPath of needsReset) {
         if (!sameIndexEntry(repaired.get(relPath), targetTree.get(relPath))) {
           return { ok: false, reason: `index_repair_verify_failed:${relPath}` };
         }
       }
+      // Copy complete bytes into the still-owned inode; do not replace its inode.
       copyFileSync(repairPath, lockPath);
-      const fd = openSync(lockPath, 'r');
-      try { fsyncSync(fd); } finally { closeSync(fd); }
-      if (!ownedIdentity || !sameLeaseIdentity(lockPath, ownedIdentity)) {
-        return { ok: false, reason: 'foreign_index_lock' };
-      }
-      // Publish the verified full-index copy atomically; unrelated staged
-      // entries came from the locked preimage and are preserved.
-      renameSync(lockPath, indexPath);
-      installed = true;
     }
-    // update-ref does not honor index.lock. If it raced the final rename, keep
-    // the WAL and let the next run reconcile these paths to the new live HEAD.
+
+    // This block is unconditional. An adopted equal-target lease is still the
+    // prepared transaction that SIGKILL prevented from being installed.
     if (
       tryGit(root, ['symbolic-ref', '-q', 'HEAD']) !== expectedRef
       || tryGit(root, ['rev-parse', 'HEAD']) !== targetHead
     ) return { ok: false, reason: 'index_repair_head_moved' };
-    return { ok: true };
+    if (!ownedIdentity || !sameLeaseIdentity(lockPath, ownedIdentity)) {
+      return { ok: false, reason: 'foreign_index_lock' };
+    }
+
+    const prepared = gitIndexSnapshot(repo, journal.commitPaths, lockEnv);
+    for (const relPath of journal.commitPaths) {
+      if (!sameIndexEntry(prepared.get(relPath), targetTree.get(relPath))) {
+        return { ok: false, reason: `index_repair_verify_failed:${relPath}` };
+      }
+    }
+    const fd = openSync(lockPath, 'r');
+    try { fsyncSync(fd); } finally { closeSync(fd); }
+    if (!sameLeaseIdentity(lockPath, ownedIdentity)) {
+      return { ok: false, reason: 'foreign_index_lock' };
+    }
+
+    renameSync(lockPath, indexPath);
+    installed = true; // set immediately: finally must not remove the renamed inode
+    fsyncParentDirectory(indexPath);
+
+    if (!sameLeaseIdentity(indexPath, ownedIdentity)) {
+      return { ok: false, reason: 'index_install_identity_mismatch' };
+    }
+    const realEnv = { ...controlledGitEnv(), GIT_INDEX_FILE: indexPath };
+    const live = gitIndexSnapshot(repo, journal.commitPaths, realEnv);
+    for (const relPath of journal.commitPaths) {
+      if (!sameIndexEntry(live.get(relPath), targetTree.get(relPath))) {
+        return { ok: false, reason: `index_install_verify_failed:${relPath}` };
+      }
+    }
+    if (
+      tryGit(root, ['symbolic-ref', '-q', 'HEAD']) !== expectedRef
+      || tryGit(root, ['rev-parse', 'HEAD']) !== targetHead
+    ) return { ok: false, reason: 'index_repair_head_moved' };
+
+    return {
+      ok: true,
+      proof: { expectedRef, targetHead, indexIdentity: ownedIdentity },
+    };
   } catch (error) {
     return {
       ok: false,
@@ -614,28 +676,83 @@ function reconcilePublishedIndex(
   }
 }
 
-function discardNeverPublishedIndexLease(
+function verifyAndDiscardUnpublishedLease(
   repo: string,
-  journal: ConvergenceJournal,
+  journal: ConvergenceJournalV5,
+  expectedRef: string,
+  liveHead: string,
 ): AnchorFenceResult {
   const root = repositoryRoot(repo);
   const indexRaw = git(root, ['rev-parse', '--git-path', 'index']);
   const indexPath = isAbsolute(indexRaw) ? indexRaw : resolve(root, indexRaw);
   const lockPath = `${indexPath}.lock`;
-  if (!existsSync(lockPath)) return { ok: true };
-  if (!sameLeaseIdentity(lockPath, journal.indexLeaseIdentity)) {
-    return { ok: false, reason: 'foreign_index_lock' };
+  let ownsTemporaryGuard = false;
+  let adoptedWalLease = false;
+  let ownedIdentity: { dev: string; ino: string } | null = null;
+  try {
+    if (
+      tryGit(root, ['symbolic-ref', '-q', 'HEAD']) !== expectedRef
+      || tryGit(root, ['rev-parse', 'HEAD']) !== liveHead
+    ) return { ok: false, reason: 'unpublished_head_moved' };
+
+    if (existsSync(lockPath)) {
+      if (!sameLeaseIdentity(lockPath, journal.indexLeaseIdentity)) {
+        return { ok: false, reason: 'foreign_index_lock' };
+      }
+      adoptedWalLease = true;
+      ownedIdentity = journal.indexLeaseIdentity;
+    } else {
+      const fd = openSync(lockPath, 'wx', 0o600);
+      closeSync(fd);
+      ownsTemporaryGuard = true;
+      const stat = statSync(lockPath, { bigint: true });
+      ownedIdentity = { dev: stat.dev.toString(), ino: stat.ino.toString() };
+    }
+
+    // Candidate was proven unpublished. The real index is authoritative; never
+    // copy candidate-prepared bytes into it. Merely prove its WAL paths agree
+    // with the current live HEAD while the standard lock blocks Git writers.
+    const liveTree = gitTreeSnapshot(repo, liveHead);
+    const realEnv = { ...controlledGitEnv(), GIT_INDEX_FILE: indexPath };
+    const realIndex = gitIndexSnapshot(repo, journal.commitPaths, realEnv);
+    for (const relPath of journal.commitPaths) {
+      if (!sameIndexEntry(realIndex.get(relPath), liveTree.get(relPath))) {
+        return { ok: false, reason: `unpublished_index_not_live:${relPath}` };
+      }
+    }
+    if (
+      tryGit(root, ['symbolic-ref', '-q', 'HEAD']) !== expectedRef
+      || tryGit(root, ['rev-parse', 'HEAD']) !== liveHead
+    ) return { ok: false, reason: 'unpublished_head_moved' };
+
+    if (!ownedIdentity || !sameLeaseIdentity(lockPath, ownedIdentity)) {
+      return { ok: false, reason: 'foreign_index_lock' };
+    }
+    unlinkSync(lockPath);
+    fsyncParentDirectory(lockPath);
+    adoptedWalLease = false;
+    ownsTemporaryGuard = false;
+    return (
+      tryGit(root, ['symbolic-ref', '-q', 'HEAD']) === expectedRef
+      && tryGit(root, ['rev-parse', 'HEAD']) === liveHead
+    ) ? { ok: true } : { ok: false, reason: 'unpublished_head_moved' };
+  } catch (error) {
+    return {
+      ok: false,
+      reason: `unpublished_index_probe_failed:${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    };
+  } finally {
+    // Preserve an adopted WAL lease on failure. It is recovery evidence. Remove
+    // only the temporary guard this invocation created.
+    if (ownsTemporaryGuard && ownedIdentity
+      && sameLeaseIdentity(lockPath, ownedIdentity)) {
+      unlinkSync(lockPath);
+      fsyncParentDirectory(lockPath);
+    }
+    void adoptedWalLease;
   }
-  // Candidate was never published: the real index is authoritative. Remove
-  // only the exact WAL-owned lease inode; never reset or rename the real index.
-  const before = statSync(lockPath, { bigint: true });
-  if (
-    before.dev.toString() !== journal.indexLeaseIdentity.dev
-    || before.ino.toString() !== journal.indexLeaseIdentity.ino
-  ) return { ok: false, reason: 'foreign_index_lock' };
-  unlinkSync(lockPath);
-  fsyncParentDirectory(lockPath);
-  return { ok: true };
 }
 
 function gitTreeContainsReceipts(
@@ -703,9 +820,10 @@ function writeJournal(
   routeEpoch: string,
   storageConfigFingerprint: OptionalFileFingerprint,
   indexLeaseIdentity: { dev: string; ino: string },
+  publicationNonce: string,
   commitFiles: readonly VerifiedConvergencePath[],
   files: readonly VerifiedConvergencePath[],
-): void {
+): JournalFileReceipt {
   const root = repositoryRoot(repo);
   if (
     expectedCommit === preHead
@@ -746,8 +864,11 @@ function writeJournal(
   if (commitPaths.length === 0 || new Set(commitPaths).size !== commitPaths.length) {
     throw new Error('invalid convergence WAL commit path set');
   }
-  const journal: ConvergenceJournal = {
-    version: 4,
+  convergencePublicationRef(
+    expectedRef, preHead, expectedCommit, publicationNonce,
+  );
+  const journal: ConvergenceJournalV5 = {
+    version: 5,
     sourceId,
     expectedRef,
     preHead,
@@ -756,31 +877,50 @@ function writeJournal(
     routeEpoch,
     storageConfigFingerprint,
     indexLeaseIdentity,
+    publicationNonce,
     commitPaths,
     files: serialized,
   };
-  // Never expose a partial final WAL. Build and fsync a same-directory inode,
-  // then hard-link it into the final name. link(2) is an atomic no-overwrite
-  // publication: EEXIST means another unresolved WAL owns the slot.
+  const bytes = Buffer.from(`${JSON.stringify(journal)}\n`, 'utf8');
   const journalFile = journalPath(repo, sourceId);
-  const tempFile = `${journalFile}.tmp-${process.pid}-${randomBytes(8).toString('hex')}`;
-  let fd: number | null = null;
+  const tmp = `${journalFile}.tmp-${process.pid}-${randomBytes(8).toString('hex')}`;
+  let tmpPublished = false;
   try {
-    fd = openSync(tempFile, 'wx', 0o600);
-    writeFileSync(fd, `${JSON.stringify(journal)}\n`, { encoding: 'utf8' });
-    fsyncSync(fd);
-    closeSync(fd);
-    fd = null;
-    linkSync(tempFile, journalFile);
+    const fd = openSync(tmp, 'wx', 0o600);
+    let tmpReceipt!: JournalFileReceipt;
+    try {
+      writeFileSync(fd, bytes);
+      fsyncSync(fd);
+      const stat = fstatSync(fd, { bigint: true });
+      tmpReceipt = {
+        dev: stat.dev.toString(),
+        ino: stat.ino.toString(),
+        sha256: createHash('sha256').update(bytes).digest('hex'),
+      };
+    } finally {
+      closeSync(fd);
+    }
+    // link, rather than rename, is the existing no-overwrite single-slot CAS.
+    linkSync(tmp, journalFile);
+    tmpPublished = true;
     fsyncParentDirectory(journalFile);
-    unlinkSync(tempFile);
+    const published = readJournalFile(journalFile);
+    if (!sameJournalReceipt(published.receipt, tmpReceipt)
+      || !published.bytes.equals(bytes)) {
+      throw new Error('published convergence WAL identity mismatch');
+    }
+    unlinkSync(tmp);
     fsyncParentDirectory(journalFile);
-  } catch (error) {
-    if (fd != null) closeSync(fd);
-    // Delete only our private temp name. If linkSync succeeded, the final name
-    // already denotes a complete fsynced inode and must remain for recovery.
-    try { unlinkSync(tempFile); } catch { /* absent is fine */ }
-    throw error;
+    tmpPublished = false;
+    return published.receipt;
+  } finally {
+    // Never remove journalFile here: it is the recovery record. Remove only the
+    // private hard-link name; if publication succeeded both names share an inode.
+    if (existsSync(tmp)) {
+      unlinkSync(tmp);
+      fsyncParentDirectory(tmp);
+    }
+    void tmpPublished;
   }
 }
 
@@ -790,18 +930,35 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function readJournal(repo: string, sourceId: string): ConvergenceJournalRead {
   const journalFile = journalPath(repo, sourceId);
-  if (!existsSync(journalFile)) return { kind: 'none' };
+  let fd: number;
+  try {
+    fd = openSync(journalFile, 'r');
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { kind: 'none' };
+    throw error;
+  }
+  let bytes: Buffer;
+  let stat: ReturnType<typeof fstatSync>;
+  try {
+    stat = fstatSync(fd, { bigint: true });
+    bytes = readFileSync(fd);
+  } finally {
+    closeSync(fd);
+  }
+  const receipt: JournalFileReceipt = {
+    dev: stat.dev.toString(),
+    ino: stat.ino.toString(),
+    sha256: createHash('sha256').update(bytes).digest('hex'),
+  };
+
   let parsed: unknown;
   try {
-    parsed = JSON.parse(readFileSync(journalFile, 'utf8')) as unknown;
+    parsed = JSON.parse(bytes.toString('utf8')) as unknown;
   } catch {
-    // A pre-round-3 writer exposed the final pathname before completing its
-    // write. Do not throw an unclassified parse exception or delete it here;
-    // recovery below may retire it only when HEAD is already anchored.
-    return { kind: 'invalid', reason: 'partial_or_malformed' };
+    return { kind: 'invalid', reason: 'partial_or_malformed', receipt };
   }
   if (!isRecord(parsed)) {
-    return { kind: 'invalid', reason: 'partial_or_malformed' };
+    return { kind: 'invalid', reason: 'partial_or_malformed', receipt };
   }
 
   // Exact 68d75a4 eager-WAL shape. It named only the preflight HEAD and could
@@ -821,6 +978,7 @@ function readJournal(repo: string, sourceId: string): ConvergenceJournalRead {
         preHead: parsed.preHead,
         ...(typeof parsed.at === 'string' ? { at: parsed.at } : {}),
       },
+      receipt,
     };
   }
 
@@ -828,7 +986,8 @@ function readJournal(repo: string, sourceId: string): ConvergenceJournalRead {
     const value = parsed as unknown as ConvergenceJournal;
     const root = repositoryRoot(repo);
     if (
-      value.version !== 4
+      (value.version !== 4 && value.version !== 5)
+      || (value.version === 5 && !/^[0-9a-f]{64}$/.test(value.publicationNonce))
       || value.sourceId !== sourceId
       || typeof value.expectedRef !== 'string'
       || !value.expectedRef.startsWith('refs/heads/')
@@ -882,9 +1041,17 @@ function readJournal(repo: string, sourceId: string): ConvergenceJournalRead {
       ) throw new Error('invalid commit path receipt');
       seenCommitPaths.add(relPath);
     }
-    return { kind: 'current', journal: value };
+    if (value.version === 5) {
+      convergencePublicationRef(
+        value.expectedRef,
+        value.preHead,
+        value.expectedCommit,
+        value.publicationNonce,
+      );
+    }
+    return { kind: 'current', journal: value, receipt };
   } catch {
-    return { kind: 'invalid', reason: 'partial_or_malformed' };
+    return { kind: 'invalid', reason: 'partial_or_malformed', receipt };
   }
 }
 
@@ -915,32 +1082,167 @@ function journalFiles(
   }));
 }
 
-function clearJournal(repo: string, sourceId: string): void {
-  const journalFile = journalPath(repo, sourceId);
+function readJournalFile(file: string): {
+  bytes: Buffer;
+  receipt: JournalFileReceipt;
+} {
+  const fd = openSync(file, 'r');
   try {
-    unlinkSync(journalFile);
-    fsyncParentDirectory(journalFile);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    const stat = fstatSync(fd, { bigint: true });
+    const bytes = readFileSync(fd);
+    return {
+      bytes,
+      receipt: {
+        dev: stat.dev.toString(),
+        ino: stat.ino.toString(),
+        sha256: createHash('sha256').update(bytes).digest('hex'),
+      },
+    };
+  } finally {
+    closeSync(fd);
   }
 }
 
-function clearJournalIfHead(
+function sameJournalReceipt(
+  actual: JournalFileReceipt,
+  expected: JournalFileReceipt,
+): boolean {
+  return actual.dev === expected.dev
+    && actual.ino === expected.ino
+    && actual.sha256 === expected.sha256;
+}
+
+type JournalRetireResult =
+  | { ok: true; retired: true; headStable: boolean }
+  | { ok: false; retired: false; reason: string; preservedAt: string }
+  | { ok: false; retired: true; reason: string };
+
+function restoreClaimedJournal(claimed: string, finalPath: string): string {
+  try {
+    linkSync(claimed, finalPath);
+    fsyncParentDirectory(finalPath);
+    unlinkSync(claimed);
+    fsyncParentDirectory(finalPath);
+    return finalPath;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'EEXIST') return claimed;
+    throw error;
+  }
+}
+
+function retireJournalIfHead(
   repo: string,
   sourceId: string,
   expectedRef: string,
   expectedHead: string,
-): boolean {
+  expectedReceipt: JournalFileReceipt,
+): JournalRetireResult {
+  const finalPath = journalPath(repo, sourceId);
+  const claimed = finalPath + '.retire-' + process.pid + '-'
+    + randomBytes(8).toString('hex');
   if (
     tryGit(repo, ['symbolic-ref', '-q', 'HEAD']) !== expectedRef
     || tryGit(repo, ['rev-parse', 'HEAD']) !== expectedHead
-  ) return false;
-  clearJournal(repo, sourceId);
-  // A direct update-ref does not honor index.lock. This postcheck cannot undo
-  // an unlink, but converts the race into a loud retry; the already-validated
-  // gbrain history remains the recovery source rather than a guessed commit.
-  return tryGit(repo, ['symbolic-ref', '-q', 'HEAD']) === expectedRef
-    && tryGit(repo, ['rev-parse', 'HEAD']) === expectedHead;
+  ) return {
+    ok: false, retired: false, reason: 'head_moved', preservedAt: finalPath,
+  };
+  let claimedByUs = false;
+  try {
+    // Claim first. Verification can no longer unlink a replacement pathname.
+    renameSync(finalPath, claimed);
+    claimedByUs = true;
+    fsyncParentDirectory(finalPath);
+  } catch (error) {
+    let preservedAt = finalPath;
+    if (claimedByUs && existsSync(claimed)) {
+      try { preservedAt = restoreClaimedJournal(claimed, finalPath); }
+      catch { preservedAt = claimed; }
+    }
+    return {
+      ok: false,
+      retired: false,
+      reason: 'journal_claim_failed:'
+        + (error instanceof Error ? error.message : String(error)),
+      preservedAt,
+    };
+  }
+  let unlinked = false;
+  try {
+    const actual = readJournalFile(claimed).receipt;
+    if (!sameJournalReceipt(actual, expectedReceipt)) {
+      const preservedAt = restoreClaimedJournal(claimed, finalPath);
+      return {
+        ok: false, retired: false, reason: 'journal_replaced', preservedAt,
+      };
+    }
+    if (
+      tryGit(repo, ['symbolic-ref', '-q', 'HEAD']) !== expectedRef
+      || tryGit(repo, ['rev-parse', 'HEAD']) !== expectedHead
+    ) {
+      const preservedAt = restoreClaimedJournal(claimed, finalPath);
+      return { ok: false, retired: false, reason: 'head_moved', preservedAt };
+    }
+    unlinkSync(claimed);
+    unlinked = true;
+    fsyncParentDirectory(finalPath);
+    // A concurrent invocation may have claimed the now-free slot. It is not
+    // ours and must survive; tell the caller not to start another publication.
+    if (existsSync(finalPath)) {
+      return { ok: false, retired: true, reason: 'replacement_wal_present' };
+    }
+    const headStable = tryGit(repo, ['symbolic-ref', '-q', 'HEAD']) === expectedRef
+      && tryGit(repo, ['rev-parse', 'HEAD']) === expectedHead;
+    return { ok: true, retired: true, headStable };
+  } catch (error) {
+    if (unlinked) {
+      return {
+        ok: false,
+        retired: true,
+        reason: 'journal_retire_durability_failed:'
+          + (error instanceof Error ? error.message : String(error)),
+      };
+    }
+    const preservedAt = existsSync(claimed)
+      ? restoreClaimedJournal(claimed, finalPath)
+      : finalPath;
+    return {
+      ok: false,
+      retired: false,
+      reason: 'journal_retire_failed:'
+        + (error instanceof Error ? error.message : String(error)),
+      preservedAt,
+    };
+  }
+}
+
+type ExactRefRead =
+  | { kind: 'present'; oid: string }
+  | { kind: 'missing' }
+  | { kind: 'error'; reason: string };
+
+function readExactRef(repo: string, ref: string): ExactRefRead {
+  try {
+    const oid = execFileSync(
+      'git', ['-C', repositoryRoot(repo), 'show-ref', '--verify', '--hash', ref],
+      {
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'pipe'],
+        timeout: 30_000,
+        env: controlledGitEnv(),
+      },
+    ).trim();
+    return /^[0-9a-f]{40,64}$/.test(oid)
+      ? { kind: 'present', oid }
+      : { kind: 'error', reason: 'invalid_oid' };
+  } catch (error) {
+    const status = (error as { status?: number | null }).status;
+    const reason = error instanceof Error ? error.message : String(error);
+    // `git show-ref --verify` exits 1 or 128 with "not a valid ref" when absent.
+    if (status === 1 || (status === 128 && /not a valid ref/.test(reason))) {
+      return { kind: 'missing' };
+    }
+    return { kind: 'error', reason };
+  }
 }
 
 function fsyncParentDirectory(filePath: string): void {
@@ -1129,6 +1431,7 @@ export async function runCanonicalPlaneConvergence(
   _beforeCommitIndexLeaseForTest?: () => void;
   _afterCommitSnapshotForTest?: () => void;
   _afterCommitRefPublishForTest?: () => void;
+  _beforeCommitRefCasForTest?: () => void;
   _afterPageScanForTest?: () => void | Promise<void>;
   _betweenAnchorProofAndCasForTest?: () => void | Promise<void>;
 },
@@ -1302,29 +1605,38 @@ export async function runCanonicalPlaneConvergence(
       absToSlug.set(key, row.slug);
     }
 
-    const dirtyAbs = new Set<string>();
-    if (trackedDirty.length > 0) {
-      let allResume = true;
-      for (const rel of trackedDirty) {
-        const abs = resolve(repo, rel);
-        dirtyAbs.add(abs);
+    async function validatedTrackedDirtyAbs(
+      relPaths: readonly string[],
+      countResume: boolean,
+      failureReason: string,
+    ): Promise<Set<string> | null> {
+      const next = new Set<string>();
+      const gitRepo = repo!;
+      for (const rel of relPaths) {
+        const abs = resolve(gitRepo, rel);
+        next.add(abs);
         const slug = absToSlug.get(abs);
         if (!slug) {
-          allResume = false;
-          break;
+          report.errors.push({ source_id: sourceId, slug: '', reason: failureReason });
+          return null;
         }
         const stored = await loadCanonicalProjection(engine, sourceId, slug);
-        if (!stored || !existsSync(abs) || sha256Utf8(readFileSync(abs)) !== stored.sha256) {
-          allResume = false;
-          break;
+        if (!stored || !existsSync(abs)
+          || sha256Utf8(readFileSync(abs)) !== stored.sha256) {
+          report.errors.push({ source_id: sourceId, slug, reason: failureReason });
+          return null;
         }
-        report.resumed_canonical_dirty++;
+        if (countResume) report.resumed_canonical_dirty++;
       }
-      if (!allResume) {
-        report.errors.push({ source_id: sourceId, slug: '', reason: 'dirty_tracked_tree' });
-        return { report, exitCode: 2 };
-      }
+      return next;
     }
+
+    let dirtyAbs = await validatedTrackedDirtyAbs(
+      trackedDirty,
+      true,
+      'dirty_tracked_tree',
+    );
+    if (!dirtyAbs) return { report, exitCode: 2 };
 
     if (recorded) {
       const mb = tryGit(repo, ['merge-base', recorded, head]);
@@ -1391,7 +1703,16 @@ export async function runCanonicalPlaneConvergence(
         // With no usable receipt, retirement is safe only when the source anchor
         // already names this exact live commit: there is no unanchored result to
         // recover. Otherwise preserve the file for explicit operator inspection.
-        if (recorded !== headNow || !clearJournalIfHead(repo, sourceId, refNow, headNow)) {
+        if (recorded !== headNow) {
+          report.errors.push({
+            source_id: sourceId, slug: '', reason: 'legacy_wal_unattributed',
+          });
+          return { report, exitCode: 2 };
+        }
+        const retired = retireJournalIfHead(
+          repo, sourceId, refNow, headNow, journalRead.receipt,
+        );
+        if (!retired.ok || !retired.headStable) {
           report.errors.push({
             source_id: sourceId, slug: '', reason: 'legacy_wal_unattributed',
           });
@@ -1400,7 +1721,10 @@ export async function runCanonicalPlaneConvergence(
       } else if (journalRead.kind === 'legacy') {
         const legacy = journalRead.journal;
         if (headNow === legacy.preHead || recorded === headNow) {
-          if (!clearJournalIfHead(repo, sourceId, refNow, headNow)) {
+          const retired = retireJournalIfHead(
+            repo, sourceId, refNow, headNow, journalRead.receipt,
+          );
+          if (!retired.ok || !retired.headStable) {
             report.errors.push({
               source_id: sourceId, slug: '', reason: 'head_moved_retiring_legacy_wal',
             });
@@ -1413,7 +1737,13 @@ export async function runCanonicalPlaneConvergence(
           // The old format has no tree/blob receipts. The already-completed
           // anchor..HEAD materialization preflight plus the full scan below are
           // the only admissible proof; do not anchor here.
-          pendingRecovery = { kind: 'legacy', journal: legacy, ref: refNow, head: headNow };
+          pendingRecovery = {
+            kind: 'legacy',
+            journal: legacy,
+            journalReceipt: journalRead.receipt,
+            ref: refNow,
+            head: headNow,
+          };
         } else {
           report.errors.push({
             source_id: sourceId, slug: '', reason: 'legacy_wal_unattributed',
@@ -1436,47 +1766,97 @@ export async function runCanonicalPlaneConvergence(
           return { report, exitCode: 2 };
         }
 
-        const candidateIsLive = headNow === journal.expectedCommit;
-        const candidateNeverPublished = headNow === journal.preHead;
-        const candidateIsAncestor = tryGit(
-          repo, ['merge-base', journal.expectedCommit, headNow],
-        ) === journal.expectedCommit;
-        if (!candidateIsLive && !candidateNeverPublished && !candidateIsAncestor) {
+        const liveDescendsPre = headNow === journal.preHead
+          || tryGit(repo, ['merge-base', journal.preHead, headNow]) === journal.preHead;
+        const subjects = liveDescendsPre
+          ? tryGit(repo, ['log', '--format=%s', `${journal.preHead}..${headNow}`])
+          : null;
+        if (
+          !liveDescendsPre
+          || subjects == null
+          || subjects.split('\n').filter(Boolean).some((s) => !isGbrainPlaneCommit(s))
+        ) {
           report.errors.push({
             source_id: sourceId, slug: '', reason: 'journal_head_unrelated',
           });
           return { report, exitCode: 2 };
         }
 
-        // State order is security-sensitive. An already anchored HEAD proves the
-        // publisher completed index publication before its DB anchor, so never
-        // touch the index. A never-published orphan likewise owns no real-index
-        // mutation; discard only its exact stale lease inode. Only published,
-        // unanchored history is eligible for index reconciliation.
-        if (recorded === headNow) {
-          if (!clearJournalIfHead(repo, sourceId, refNow, headNow)) {
+        const candidateInLiveHistory = headNow === journal.expectedCommit
+          || tryGit(repo, ['merge-base', journal.expectedCommit, headNow])
+            === journal.expectedCommit;
+
+        let publication: 'published' | 'published_superseded' | 'never_published';
+        if (journal.version === 4) {
+          if (!candidateInLiveHistory) {
             report.errors.push({
-              source_id: sourceId, slug: '', reason: 'head_moved_retiring_anchored_journal',
+              source_id: sourceId, slug: '', reason: 'journal_publication_ambiguous',
             });
             return { report, exitCode: 2 };
           }
-          pushAtTerminalReturn = { expectedRef: refNow, expectedHead: headNow };
-        } else if (candidateNeverPublished) {
-          const discarded = discardNeverPublishedIndexLease(repo, journal);
+          publication = 'published';
+        } else {
+          const proofRef = convergencePublicationRef(
+            journal.expectedRef,
+            journal.preHead,
+            journal.expectedCommit,
+            journal.publicationNonce,
+          );
+          const proof = readExactRef(repo, proofRef);
+          if (proof.kind === 'error') {
+            report.errors.push({
+              source_id: sourceId, slug: '',
+              reason: `journal_publication_probe_failed:${proof.reason}`,
+            });
+            return { report, exitCode: 2 };
+          }
+          if (proof.kind === 'present' && proof.oid !== journal.expectedCommit) {
+            report.errors.push({
+              source_id: sourceId, slug: '',
+              reason: 'journal_publication_marker_mismatch',
+            });
+            return { report, exitCode: 2 };
+          }
+          if (proof.kind === 'missing' && candidateInLiveHistory) {
+            report.errors.push({
+              source_id: sourceId, slug: '',
+              reason: 'journal_publication_evidence_inconsistent',
+            });
+            return { report, exitCode: 2 };
+          }
+          publication = proof.kind === 'missing'
+            ? 'never_published'
+            : (candidateInLiveHistory ? 'published' : 'published_superseded');
+        }
+
+        if (publication === 'never_published') {
+          // Only v5 can enter this branch.
+          const discarded = verifyAndDiscardUnpublishedLease(
+            repo, journal as ConvergenceJournalV5, refNow, headNow,
+          );
           if (!discarded.ok) {
             report.errors.push({
               source_id: sourceId, slug: '',
-              reason: `journal_recovery_failed:${discarded.reason}`,
+              reason: 'journal_recovery_failed:' + discarded.reason,
             });
             return { report, exitCode: 2 };
           }
-          if (!clearJournalIfHead(repo, sourceId, refNow, headNow)) {
+          const retired = retireJournalIfHead(
+            repo, sourceId, refNow, headNow, journalRead.receipt,
+          );
+          if (!retired.ok || !retired.headStable) {
             report.errors.push({
-              source_id: sourceId, slug: '', reason: 'head_moved_retiring_unpublished_journal',
+              source_id: sourceId, slug: '',
+              reason: retired.ok
+                ? 'head_moved_after_retiring_unpublished_wal'
+                : 'unpublished_wal_retire_failed:' + retired.reason,
             });
             return { report, exitCode: 2 };
           }
+          // Continue the normal scan on live HEAD. Never assign/anchor expectedCommit.
         } else {
+          // Both live/ancestor and published-then-superseded candidates are known to
+          // have published. A superseding recognized HEAD is the target, never C.
           if (
             journal.routeEpoch !== expectedCanonicalRouteEpoch
             || !sameOptionalFileFingerprint(
@@ -1493,22 +1873,35 @@ export async function runCanonicalPlaneConvergence(
           if (!indexRepair.ok) {
             report.errors.push({
               source_id: sourceId, slug: '',
-              reason: `journal_recovery_failed:${indexRepair.reason}`,
+              reason: 'journal_recovery_failed:' + indexRepair.reason,
             });
             return { report, exitCode: 2 };
           }
-          if (candidateIsLive) {
-          pendingRecovery = { kind: 'current', journal, ref: refNow, head: headNow };
-          } else {
-            // A recognized descendant supersedes the candidate. Reconciliation
-            // targeted the live descendant tree; no source-anchor guess is made.
-            if (!clearJournalIfHead(repo, sourceId, refNow, headNow)) {
-              report.errors.push({
-                source_id: sourceId, slug: '', reason: 'head_moved_retiring_journal',
-              });
-              return { report, exitCode: 2 };
-            }
+          const repairedStatus = tryGit(repo, ['status', '--porcelain=v1', '-uall']);
+          if (repairedStatus == null) {
+            report.errors.push({
+              source_id: sourceId, slug: '',
+              reason: 'git_status_failed_after_index_repair',
+            });
+            return { report, exitCode: 2 }; // WAL retained
           }
+          const refreshed = await validatedTrackedDirtyAbs(
+            repairedStatus.split('\n').filter(Boolean)
+              .filter(isTrackedDirty)
+              .map(dirtyPath),
+            false,
+            'dirty_tracked_tree_after_index_repair',
+          );
+          if (!refreshed) return { report, exitCode: 2 }; // WAL retained
+          dirtyAbs = refreshed;
+          pendingRecovery = {
+            kind: 'current',
+            journal,
+            journalReceipt: journalRead.receipt,
+            ref: refNow,
+            head: headNow,
+            indexProof: indexRepair.proof,
+          };
         }
       }
     }
@@ -1827,21 +2220,41 @@ export async function runCanonicalPlaneConvergence(
 
     await opts._afterPageScanForTest?.();
 
-    // A recovered commit is now fully classified by history preflight and this
-    // run's complete scan. If new verified bytes need a successor commit, retire
-    // the old crash receipt first so beforePublish can atomically claim the one
-    // WAL slot. The old commit remains recoverable from validated Git history.
+    // Construction of a current PendingRecovery was possible only after
+    // reconcilePublishedIndex installed and reread the real index; the status
+    // refresh in §5.1 also completed. It is now safe to free the single WAL slot
+    // for the successor. If this process dies in the following gap, the old
+    // source anchor plus recognized, fully materialized Git history recovers H.
     if (mutate && pendingRecovery && verifiedPaths.size > 0) {
-      if (!clearJournalIfHead(
-        repo, sourceId, pendingRecovery.ref, pendingRecovery.head,
-      )) {
+      const retired = retireJournalIfHead(
+        repo,
+        sourceId,
+        pendingRecovery.ref,
+        pendingRecovery.head,
+        pendingRecovery.journalReceipt,
+      );
+      if (!retired.ok || !retired.headStable) {
         report.errors.push({
-          source_id: sourceId, slug: '', reason: 'head_moved_settling_recovery',
+          source_id: sourceId,
+          slug: '',
+          reason: retired.ok
+            ? 'head_moved_after_settling_recovery'
+            : `recovered_wal_retire_failed:${retired.reason}`,
         });
         report.anchor_not_advanced = true;
         return { report, exitCode: 1 };
       }
-      pendingRecovery = null;
+      pendingRecovery = null; // exact receipt is gone, never before index proof
+    }
+
+    let freshJournalReceipt: JournalFileReceipt | null = null;
+    function requireFreshJournalReceipt(): JournalFileReceipt | null {
+      if (freshJournalReceipt) return freshJournalReceipt;
+      report.errors.push({
+        source_id: sourceId, slug: '', reason: 'fresh_wal_receipt_missing',
+      });
+      report.anchor_not_advanced = true;
+      return null;
     }
 
     if (mutate && verifiedPaths.size > 0) {
@@ -1953,7 +2366,11 @@ export async function runCanonicalPlaneConvergence(
                 expectedHead: report.pre_head!,
                 expectedRef: report.pre_ref!,
                 beforePublish: ({
-                  commitSha, treeSha, publishedFiles, indexLeaseIdentity,
+                  commitSha,
+                  treeSha,
+                  publishedFiles,
+                  indexLeaseIdentity,
+                  publicationNonce,
                 }) => {
                   const published = new Set(
                     publishedFiles.map((file) => resolve(file.absPath)),
@@ -1964,7 +2381,7 @@ export async function runCanonicalPlaneConvergence(
                   if (commitFiles.length !== published.size) {
                     throw new Error('published path lacks convergence receipt');
                   }
-                  writeJournal(
+                  freshJournalReceipt = writeJournal(
                     repo,
                     sourceId,
                     report.pre_ref!,
@@ -1974,12 +2391,14 @@ export async function runCanonicalPlaneConvergence(
                     expectedCanonicalRouteEpoch,
                     routing.storageConfig.fingerprint,
                     indexLeaseIdentity,
+                    publicationNonce,
                     commitFiles,
                     anchorFiles,
                   );
                 },
                 _beforeIndexLeaseForTest: opts._beforeCommitIndexLeaseForTest,
                 _afterSnapshotForTest: opts._afterCommitSnapshotForTest,
+                _beforeRefCasForTest: opts._beforeCommitRefCasForTest,
                 _afterRefPublishForTest: opts._afterCommitRefPublishForTest,
               },
             );
@@ -2075,16 +2494,24 @@ export async function runCanonicalPlaneConvergence(
 
       if (outcome.status === 'committed' && advanceFreshAnchor) {
         if (publication.fence.ok && publication.anchored) {
-          if (clearJournalIfHead(repo, sourceId, report.pre_ref!, outcome.sha)) {
-            recorded = outcome.sha;
-            pushAtTerminalReturn = {
-              expectedRef: report.pre_ref!, expectedHead: outcome.sha,
-            };
-          } else {
+          // The source transaction is already committed here.
+          recorded = outcome.sha;
+          pushAtTerminalReturn = {
+            expectedRef: report.pre_ref!, expectedHead: outcome.sha,
+          };
+          const receipt = requireFreshJournalReceipt();
+          const retired = receipt == null ? null : retireJournalIfHead(
+            repo, sourceId, report.pre_ref!, outcome.sha, receipt,
+          );
+          if (!retired || !retired.ok || !retired.headStable) {
             report.errors.push({
-              source_id: sourceId, slug: '', reason: 'head_moved_clearing_anchored_wal',
+              source_id: sourceId, slug: '',
+              reason: !retired
+                ? 'anchored_wal_receipt_unavailable'
+                : retired.ok
+                  ? 'head_moved_after_retiring_anchored_wal'
+                  : `anchored_wal_retire_failed:${retired.reason}`,
             });
-            report.anchor_not_advanced = true;
           }
         } else {
           report.errors.push({
@@ -2097,14 +2524,22 @@ export async function runCanonicalPlaneConvergence(
           report.anchor_not_advanced = true;
         }
       } else if (outcome.status === 'committed' && publication.fence.ok) {
-        // The verified subset may be committed, as S3.4 permits, but missing,
-        // conflicted, or unverified eligible pages make this a deliberate partial
-        // batch. Retire the crash WAL only after the helper's ref/index/blob proof;
-        // keep the old source anchor so the next preflight validates all history.
+        // commitWriteThroughFiles returned committed only after ref, real index,
+        // commit blobs, and final disk receipts were proved. S3 permits this verified
+        // subset commit while the source anchor remains old.
         report.anchor_not_advanced = true;
-        if (!clearJournalIfHead(repo, sourceId, report.pre_ref!, outcome.sha)) {
+        const receipt = requireFreshJournalReceipt();
+        const retired = receipt == null ? null : retireJournalIfHead(
+          repo, sourceId, report.pre_ref!, outcome.sha, receipt,
+        );
+        if (!retired || !retired.ok || !retired.headStable) {
           report.errors.push({
-            source_id: sourceId, slug: '', reason: 'head_moved_settling_partial_commit',
+            source_id: sourceId, slug: '',
+            reason: !retired
+              ? 'partial_wal_receipt_unavailable'
+              : retired.ok
+                ? 'head_moved_after_settling_partial_commit'
+                : `partial_wal_retire_failed:${retired.reason}`,
           });
         }
       } else if (!publication.fence.ok) {
@@ -2139,23 +2574,34 @@ export async function runCanonicalPlaneConvergence(
         opts._betweenAnchorProofAndCasForTest,
       );
       if (caughtUp.ok) {
-        if (
-          pendingRecovery
-          && !clearJournalIfHead(
-            repo, sourceId, pendingRecovery.ref, pendingRecovery.head,
-          )
-        ) {
-          report.errors.push({
-            source_id: sourceId, slug: '', reason: 'head_moved_clearing_recovered_wal',
-          });
-          report.anchor_not_advanced = true;
-        } else {
-          pendingRecovery = null;
-          recorded = report.pre_head!;
-          report.commit = { created: false, sha: report.pre_head!, path_count: 0 };
-          pushAtTerminalReturn = {
-            expectedRef: report.pre_ref!, expectedHead: report.pre_head!,
-          };
+        // The DB transaction has committed. Report that truth even if WAL retirement
+        // subsequently fails; never pretend or try to roll the anchor back.
+        recorded = report.pre_head!;
+        report.commit = { created: false, sha: report.pre_head!, path_count: 0 };
+        pushAtTerminalReturn = {
+          expectedRef: report.pre_ref!, expectedHead: report.pre_head!,
+        };
+
+        if (pendingRecovery) {
+          const retired = retireJournalIfHead(
+            repo,
+            sourceId,
+            pendingRecovery.ref,
+            pendingRecovery.head,
+            pendingRecovery.journalReceipt,
+          );
+          if (!retired.ok || !retired.headStable) {
+            report.errors.push({
+              source_id: sourceId,
+              slug: '',
+              reason: retired.ok
+                ? 'head_moved_after_retiring_anchored_wal'
+                : `anchored_wal_retire_failed:${retired.reason}`,
+            });
+            // The anchor DID advance. The nonzero result means cleanup is incomplete.
+          } else {
+            pendingRecovery = null;
+          }
         }
       } else {
         report.errors.push({
@@ -2195,21 +2641,30 @@ export async function runCanonicalPlaneConvergence(
           reason: `completion_fence_failed:${provenClean.reason}`,
         });
         report.anchor_not_advanced = true;
-      }
-    }
-    if (mutate && !complete) {
-      report.anchor_not_advanced = true;
-      if (pendingRecovery) {
-        if (!clearJournalIfHead(
-          repo, sourceId, pendingRecovery.ref, pendingRecovery.head,
-        )) {
+      } else if (pendingRecovery) {
+        const retired = retireJournalIfHead(
+          repo,
+          sourceId,
+          pendingRecovery.ref,
+          pendingRecovery.head,
+          pendingRecovery.journalReceipt,
+        );
+        if (!retired.ok || !retired.headStable) {
           report.errors.push({
-            source_id: sourceId, slug: '', reason: 'head_moved_settling_partial_recovery',
+            source_id: sourceId, slug: '',
+            reason: retired.ok
+              ? 'head_moved_after_retiring_proven_clean_wal'
+              : `proven_clean_wal_retire_failed:${retired.reason}`,
           });
         } else {
           pendingRecovery = null;
         }
       }
+    }
+    if (mutate && !complete) {
+      report.anchor_not_advanced = true;
+      // Incomplete scan that did not enter a successor publication must preserve
+      // pendingRecovery and its WAL. A later run repeats classification.
     }
     complete = convergenceComplete(report);
 

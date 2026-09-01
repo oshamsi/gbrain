@@ -232,6 +232,72 @@ CREATE TRIGGER bump_canonical_routing_from_config_trg
   FOR EACH ROW EXECUTE FUNCTION bump_canonical_routing_from_config_fn();
 `;
 
+const CANONICAL_ROUTING_DISTINCT_TRIGGERS_SQL = String.raw`
+CREATE OR REPLACE FUNCTION bump_canonical_routing_epoch_fn()
+RETURNS trigger SET search_path = pg_catalog, public AS $func$
+BEGIN
+  UPDATE canonical_routing_state SET epoch = epoch + 1 WHERE singleton = 1;
+  IF TG_OP = 'DELETE' THEN RETURN OLD; END IF;
+  RETURN NEW;
+END;
+$func$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS bump_canonical_routing_from_page_trg ON pages;
+DROP TRIGGER IF EXISTS bump_canonical_routing_from_page_insert_delete_trg ON pages;
+DROP TRIGGER IF EXISTS bump_canonical_routing_from_page_update_trg ON pages;
+CREATE TRIGGER bump_canonical_routing_from_page_insert_delete_trg
+  AFTER INSERT OR DELETE ON pages
+  FOR EACH ROW EXECUTE FUNCTION bump_canonical_routing_epoch_fn();
+CREATE TRIGGER bump_canonical_routing_from_page_update_trg
+  AFTER UPDATE OF source_id, slug, deleted_at, page_kind, source_path, source_uri
+  ON pages
+  FOR EACH ROW
+  WHEN (
+    ROW(OLD.source_id, OLD.slug, OLD.deleted_at, OLD.page_kind, OLD.source_path, OLD.source_uri)
+      IS DISTINCT FROM
+    ROW(NEW.source_id, NEW.slug, NEW.deleted_at, NEW.page_kind, NEW.source_path, NEW.source_uri)
+  )
+  EXECUTE FUNCTION bump_canonical_routing_epoch_fn();
+
+DROP TRIGGER IF EXISTS bump_canonical_routing_from_source_trg ON sources;
+DROP TRIGGER IF EXISTS bump_canonical_routing_from_source_insert_delete_trg ON sources;
+DROP TRIGGER IF EXISTS bump_canonical_routing_from_source_update_trg ON sources;
+CREATE TRIGGER bump_canonical_routing_from_source_insert_delete_trg
+  AFTER INSERT OR DELETE ON sources
+  FOR EACH ROW EXECUTE FUNCTION bump_canonical_routing_epoch_fn();
+CREATE TRIGGER bump_canonical_routing_from_source_update_trg
+  AFTER UPDATE OF id, local_path, archived, config, trust_frontmatter_overrides
+  ON sources
+  FOR EACH ROW
+  WHEN (
+    ROW(OLD.id, OLD.local_path, OLD.archived, OLD.config, OLD.trust_frontmatter_overrides)
+      IS DISTINCT FROM
+    ROW(NEW.id, NEW.local_path, NEW.archived, NEW.config, NEW.trust_frontmatter_overrides)
+  )
+  EXECUTE FUNCTION bump_canonical_routing_epoch_fn();
+
+CREATE OR REPLACE FUNCTION bump_canonical_routing_from_config_fn()
+RETURNS trigger SET search_path = pg_catalog, public AS $func$
+BEGIN
+  IF (TG_OP = 'INSERT' AND NEW.key IN ('sync.repo_path', 'sync.write_through'))
+     OR (TG_OP = 'DELETE' AND OLD.key IN ('sync.repo_path', 'sync.write_through'))
+     OR (TG_OP = 'UPDATE'
+         AND (OLD.key IN ('sync.repo_path', 'sync.write_through')
+              OR NEW.key IN ('sync.repo_path', 'sync.write_through'))
+         AND ROW(OLD.key, OLD.value) IS DISTINCT FROM ROW(NEW.key, NEW.value)) THEN
+    UPDATE canonical_routing_state SET epoch = epoch + 1 WHERE singleton = 1;
+  END IF;
+  IF TG_OP = 'DELETE' THEN RETURN OLD; END IF;
+  RETURN NEW;
+END;
+$func$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS bump_canonical_routing_from_config_trg ON config;
+CREATE TRIGGER bump_canonical_routing_from_config_trg
+  AFTER INSERT OR UPDATE OR DELETE ON config
+  FOR EACH ROW EXECUTE FUNCTION bump_canonical_routing_from_config_fn();
+`;
+
 export const MIGRATIONS: Migration[] = [
   // Version 1 is the baseline (schema.sql creates everything with IF NOT EXISTS).
   {
@@ -6311,6 +6377,12 @@ export const MIGRATIONS: Migration[] = [
     name: 'canonical_routing_state',
     idempotent: true,
     sql: CANONICAL_ROUTING_STATE_SQL,
+  },
+  {
+    version: 143,
+    name: 'canonical_routing_distinct_value_triggers',
+    idempotent: true,
+    sql: CANONICAL_ROUTING_DISTINCT_TRIGGERS_SQL,
   },
 ];
 

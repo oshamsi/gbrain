@@ -2,7 +2,7 @@
  * Canonical-plane adversarial matrix (FIX ROUND 2 S5).
  */
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from 'bun:test';
-import { execFileSync, execSync } from 'node:child_process';
+import { execFileSync, execSync, spawnSync } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
@@ -24,6 +24,7 @@ import {
   sha256Utf8,
 } from '../src/core/page-canonical.ts';
 import { runCanonicalPlaneConvergence } from '../src/core/page-plane-convergence.ts';
+import { convergencePublicationRef } from '../src/core/brain-repo-durability.ts';
 import {
   FACTS_FENCE_BEGIN,
   FACTS_FENCE_END,
@@ -441,7 +442,7 @@ describe('canonical-plane adversarial matrix', () => {
     expect(names).not.toContain('unrelated.md');
   });
 
-  test('exact v3 WAL repairs ref/index then anchors only after a complete rerun', async () => {
+  test('exception after ref publish still leaves a recoverable WAL (cleanup path)', async () => {
     const slug = 'inbox/v3-restart';
     await importFromContent(
       engine, slug, '---\ntitle: V3 Restart\n---\n\nCANONICAL\n',
@@ -473,7 +474,7 @@ describe('canonical-plane adversarial matrix', () => {
     const receipt = JSON.parse(fs.readFileSync(journal, 'utf8')) as {
       version: number; expectedCommit: string; expectedTree: string; commitPaths: string[];
     };
-    expect(receipt.version).toBe(4);
+    expect(receipt.version).toBe(5);
     expect(receipt.expectedCommit).toBe(execFileSync(
       'git', ['-C', repo, 'rev-parse', 'HEAD'], { encoding: 'utf8' },
     ).trim());
@@ -503,6 +504,393 @@ describe('canonical-plane adversarial matrix', () => {
     expect(execFileSync(
       'git', ['-C', repo, 'show', `:${slug}.md`],
     )).toEqual(canonical);
+  });
+
+  test('SIGKILL leaves an equal-target prepared inode that recovery installs before anchor/WAL retirement', async () => {
+    if (process.platform === 'win32') return; // POSIX durability contract
+    const slug = 'inbox/sigkill-index';
+    const relPath = `${slug}.md`;
+    await importFromContent(
+      engine,
+      slug,
+      '---\ntitle: SIGKILL Index\n---\n\nCANONICAL\n',
+      { noEmbed: true, sourceId: 'default', sourcePath: relPath },
+    );
+    await writePageThrough(engine, slug, { sourceId: 'default' });
+    const file = path.join(repo, relPath);
+    const canonical = fs.readFileSync(file);
+
+    execFileSync('git', [
+      '-C', repo, '--literal-pathspecs',
+      'rm', '--cached', '--ignore-unmatch', '--', relPath,
+    ]);
+    execFileSync('git', [
+      '-C', repo, 'commit', '--allow-empty', '-m', 'fixture base without page',
+    ]);
+    const preHead = git(repo, 'rev-parse', 'HEAD');
+    const expectedRef = git(repo, 'symbolic-ref', '-q', 'HEAD');
+    await engine.executeRaw(
+      `UPDATE sources SET last_commit=$1 WHERE id='default'`, [preHead],
+    );
+    const [route] = await engine.executeRaw<{ epoch: string }>(
+      `SELECT epoch::text AS epoch FROM canonical_routing_state WHERE singleton=1`,
+    );
+
+    const gitPath = (name: string): string => {
+      const raw = git(repo, 'rev-parse', '--git-path', name);
+      return path.isAbsolute(raw) ? raw : path.resolve(repo, raw);
+    };
+    const journal = gitPath('gbrain-converge-default.json');
+    const indexPath = gitPath('index');
+    const lockPath = `${indexPath}.lock`;
+    const manifest = path.join(tmp, 'sigkill-manifest.json');
+    fs.writeFileSync(manifest, JSON.stringify({
+      repo,
+      sourceId: 'default',
+      slug,
+      relPath,
+      absPath: file,
+      sha256: sha256Utf8(canonical),
+      expectedRef,
+      expectedHead: preHead,
+      routeEpoch: route!.epoch,
+      journalPath: journal,
+    }));
+
+    const killed = spawnSync(process.execPath, [
+      path.join(import.meta.dir, 'fixtures/convergence-sigkill-child.ts'),
+      manifest,
+    ], { cwd: repo, stdio: 'pipe' });
+    expect(killed.status).toBeNull();
+    expect(killed.signal).toBe('SIGKILL');
+    expect(fs.existsSync(journal)).toBe(true);
+    expect(fs.existsSync(lockPath)).toBe(true);
+
+    const walBytesAfterKill = fs.readFileSync(journal);
+    const walStatAfterKill = fs.statSync(journal, { bigint: true });
+
+    const receipt = JSON.parse(fs.readFileSync(journal, 'utf8')) as {
+      expectedCommit: string;
+      publicationNonce: string;
+      indexLeaseIdentity: { dev: string; ino: string };
+    };
+    expect(git(repo, 'rev-parse', 'HEAD')).toBe(receipt.expectedCommit);
+    const lockStat = fs.statSync(lockPath, { bigint: true });
+    expect(lockStat.dev.toString()).toBe(receipt.indexLeaseIdentity.dev);
+    expect(lockStat.ino.toString()).toBe(receipt.indexLeaseIdentity.ino);
+    const proofRef = convergencePublicationRef(
+      expectedRef, preHead, receipt.expectedCommit, receipt.publicationNonce,
+    );
+    expect(git(repo, 'show-ref', '--verify', '--hash', proofRef))
+      .toBe(receipt.expectedCommit);
+    expect(execFileSync('git', ['-C', repo, 'show', `:${relPath}`], {
+      env: { ...process.env, GIT_INDEX_FILE: lockPath },
+    })).toEqual(canonical);
+    expect(() => execFileSync('git', ['-C', repo, 'show', `:${relPath}`], {
+      stdio: 'pipe',
+    })).toThrow();
+
+    // §5.3 is part of the real recovery path: an ordinary same-value upsert must
+    // not invalidate the WAL between process death and retry.
+    await engine.executeRaw(
+      `UPDATE pages SET page_kind=page_kind, source_path=source_path,
+                        source_uri=source_uri
+        WHERE source_id='default' AND slug=$1`,
+      [slug],
+    );
+    expect((await engine.executeRaw<{ epoch: string }>(
+      `SELECT epoch::text AS epoch FROM canonical_routing_state WHERE singleton=1`,
+    ))[0]!.epoch).toBe(route!.epoch);
+
+    const sourceBefore = (await engine.executeRaw<{ last_commit: string | null }>(
+      `SELECT last_commit FROM sources WHERE id='default'`,
+    ))[0]!.last_commit;
+    const blocked = await runCanonicalPlaneConvergence(engine, {
+      sourceId: 'default',
+      yes: true,
+      _betweenAnchorProofAndCasForTest: () => { throw new Error('BLOCK_ANCHOR'); },
+    });
+    expect(blocked.exitCode).toBe(1);
+    expect(blocked.report.commit.created).toBe(false);
+    expect(fs.existsSync(journal)).toBe(true);
+    expect(fs.readFileSync(journal)).toEqual(walBytesAfterKill);
+    const walStatAfterBlockedAnchor = fs.statSync(journal, { bigint: true });
+    expect(walStatAfterBlockedAnchor.dev).toBe(walStatAfterKill.dev);
+    expect(walStatAfterBlockedAnchor.ino).toBe(walStatAfterKill.ino);
+    expect(fs.existsSync(lockPath)).toBe(false);
+    const installed = fs.statSync(indexPath, { bigint: true });
+    expect(installed.dev).toBe(lockStat.dev);
+    expect(installed.ino).toBe(lockStat.ino);
+    expect(execFileSync('git', ['-C', repo, 'show', `:${relPath}`]))
+      .toEqual(canonical);
+    expect((await engine.executeRaw<{ last_commit: string | null }>(
+      `SELECT last_commit FROM sources WHERE id='default'`,
+    ))[0]!.last_commit).toBe(sourceBefore);
+
+    const recovered = await runCanonicalPlaneConvergence(engine, {
+      sourceId: 'default', yes: true,
+    });
+    expect(recovered.exitCode).toBe(0);
+    expect(recovered.report.commit.created).toBe(false);
+    expect(fs.existsSync(journal)).toBe(false);
+    expect(fs.existsSync(lockPath)).toBe(false);
+    expect((await engine.executeRaw<{ last_commit: string | null }>(
+      `SELECT last_commit FROM sources WHERE id='default'`,
+    ))[0]!.last_commit).toBe(git(repo, 'rev-parse', 'HEAD'));
+    expect(execFileSync('git', ['-C', repo, 'show', `:${relPath}`]))
+      .toEqual(canonical);
+  });
+
+  test('losing branch CAS proves candidate unpublished and continues from the sibling', async () => {
+    const slug = 'inbox/sibling-cas';
+    const relPath = `${slug}.md`;
+    await importFromContent(
+      engine,
+      slug,
+      '---\ntitle: Sibling CAS\n---\n\nCANONICAL\n',
+      { noEmbed: true, sourceId: 'default', sourcePath: relPath },
+    );
+    await writePageThrough(engine, slug, { sourceId: 'default' });
+    const file = path.join(repo, relPath);
+    const canonical = fs.readFileSync(file);
+    execFileSync('git', [
+      '-C', repo, '--literal-pathspecs',
+      'rm', '--cached', '--ignore-unmatch', '--', relPath,
+    ]);
+    execFileSync('git', [
+      '-C', repo, 'commit', '--allow-empty', '-m', 'fixture sibling base',
+    ]);
+    const preHead = git(repo, 'rev-parse', 'HEAD');
+    await engine.executeRaw(
+      `UPDATE sources SET last_commit=$1 WHERE id='default'`, [preHead],
+    );
+    const journalRaw = git(repo, 'rev-parse', '--git-path',
+      'gbrain-converge-default.json');
+    const journal = path.isAbsolute(journalRaw)
+      ? journalRaw : path.resolve(repo, journalRaw);
+    const indexRaw = git(repo, 'rev-parse', '--git-path', 'index');
+    const indexPath = path.isAbsolute(indexRaw)
+      ? indexRaw : path.resolve(repo, indexRaw);
+    const lockPath = `${indexPath}.lock`;
+
+    let sibling = '';
+    const raced = await runCanonicalPlaneConvergence(engine, {
+      sourceId: 'default',
+      yes: true,
+      _beforeCommitRefCasForTest: () => {
+        const p = git(repo, 'rev-parse', 'HEAD');
+        const ref = git(repo, 'symbolic-ref', '-q', 'HEAD');
+        sibling = execFileSync('git', [
+          '-C', repo, 'commit-tree', `${p}^{tree}`, '-p', p,
+          '-m', 'gbrain: converge canonical page planes (competing)',
+        ], { encoding: 'utf8' }).trim();
+        execFileSync('git', ['-C', repo, 'update-ref', ref, sibling, p]);
+      },
+    });
+    expect(raced.exitCode).toBe(1);
+    expect(raced.report.conflicts.some((c) => c.reason === 'git_head_moved'))
+      .toBe(true);
+    const wal = JSON.parse(fs.readFileSync(journal, 'utf8')) as {
+      expectedRef: string; preHead: string; expectedCommit: string;
+      publicationNonce: string;
+    };
+    const proofRef = convergencePublicationRef(
+      wal.expectedRef, wal.preHead, wal.expectedCommit, wal.publicationNonce,
+    );
+    expect(() => git(repo, 'show-ref', '--verify', '--hash', proofRef)).toThrow();
+    const candidateWasNotPublished = spawnSync('git', [
+      '-C', repo, 'merge-base', '--is-ancestor', wal.expectedCommit, sibling,
+    ], { stdio: 'pipe' });
+    expect(candidateWasNotPublished.status).toBe(1);
+
+    const walBytesBeforeRefusedRetry = fs.readFileSync(journal);
+    const walStatBeforeRefusedRetry = fs.statSync(journal, { bigint: true });
+
+    // A foreign lock must survive byte- and inode-identical.
+    const foreign = Buffer.from('FOREIGN-INDEX-LOCK\n');
+    fs.writeFileSync(lockPath, foreign, { flag: 'wx' });
+    const foreignStat = fs.statSync(lockPath, { bigint: true });
+    const refused = await runCanonicalPlaneConvergence(engine, {
+      sourceId: 'default', yes: true,
+    });
+    expect(refused.exitCode).toBe(2);
+    expect(fs.readFileSync(lockPath)).toEqual(foreign);
+    expect(fs.statSync(lockPath, { bigint: true }).ino).toBe(foreignStat.ino);
+    expect(fs.existsSync(journal)).toBe(true);
+    expect(fs.readFileSync(journal)).toEqual(walBytesBeforeRefusedRetry);
+    expect(fs.statSync(journal, { bigint: true }).ino)
+      .toBe(walStatBeforeRefusedRetry.ino);
+
+    fs.unlinkSync(lockPath);
+    const recovered = await runCanonicalPlaneConvergence(engine, {
+      sourceId: 'default', yes: true,
+    });
+    expect(recovered.exitCode).toBe(0);
+    expect(fs.existsSync(journal)).toBe(false);
+    const finalHead = git(repo, 'rev-parse', 'HEAD');
+    expect(spawnSync('git', [
+      '-C', repo, 'merge-base', '--is-ancestor', sibling, finalHead,
+    ], { stdio: 'pipe' }).status).toBe(0);
+    expect(spawnSync('git', [
+      '-C', repo, 'merge-base', '--is-ancestor', wal.expectedCommit, finalHead,
+    ], { stdio: 'pipe' }).status).toBe(1);
+    expect((await engine.executeRaw<{ last_commit: string | null }>(
+      `SELECT last_commit FROM sources WHERE id='default'`,
+    ))[0]!.last_commit).toBe(finalHead);
+    expect(execFileSync('git', ['-C', repo, 'show', `HEAD:${relPath}`]))
+      .toEqual(canonical);
+    expect(execFileSync('git', ['-C', repo, 'show', `:${relPath}`]))
+      .toEqual(canonical);
+  });
+
+  test('unpublished equal-tree sibling never resets a non-live real index', async () => {
+    const slug = 'inbox/sibling-equal-tree';
+    const relPath = `${slug}.md`;
+    await importFromContent(
+      engine,
+      slug,
+      '---\ntitle: Equal-tree Sibling\n---\n\nCANONICAL\n',
+      { noEmbed: true, sourceId: 'default', sourcePath: relPath },
+    );
+    await writePageThrough(engine, slug, { sourceId: 'default' });
+    execFileSync('git', [
+      '-C', repo, '--literal-pathspecs',
+      'rm', '--cached', '--ignore-unmatch', '--', relPath,
+    ]);
+    execFileSync('git', [
+      '-C', repo, 'commit', '--allow-empty', '-m', 'fixture equal-tree base',
+    ]);
+    const preHead = git(repo, 'rev-parse', 'HEAD');
+    await engine.executeRaw(
+      `UPDATE sources SET last_commit=$1 WHERE id='default'`, [preHead],
+    );
+
+    const journalRaw = git(repo, 'rev-parse', '--git-path',
+      'gbrain-converge-default.json');
+    const journal = path.isAbsolute(journalRaw)
+      ? journalRaw : path.resolve(repo, journalRaw);
+    const indexRaw = git(repo, 'rev-parse', '--git-path', 'index');
+    const indexPath = path.isAbsolute(indexRaw)
+      ? indexRaw : path.resolve(repo, indexRaw);
+    const indexBefore = fs.readFileSync(indexPath);
+    const indexStatBefore = fs.statSync(indexPath, { bigint: true });
+
+    let sibling = '';
+    const raced = await runCanonicalPlaneConvergence(engine, {
+      sourceId: 'default',
+      yes: true,
+      _beforeCommitRefCasForTest: () => {
+        // beforePublish has already fsynced the WAL at this seam.
+        const wal = JSON.parse(fs.readFileSync(journal, 'utf8')) as {
+          expectedTree: string;
+        };
+        const p = git(repo, 'rev-parse', 'HEAD');
+        const ref = git(repo, 'symbolic-ref', '-q', 'HEAD');
+        sibling = execFileSync('git', [
+          '-C', repo, 'commit-tree', wal.expectedTree, '-p', p,
+          '-m', 'gbrain: converge canonical page planes (equal-tree competitor)',
+        ], { encoding: 'utf8' }).trim();
+        execFileSync('git', ['-C', repo, 'update-ref', ref, sibling, p]);
+      },
+    });
+    expect(raced.exitCode).toBe(1);
+    const walBytes = fs.readFileSync(journal);
+    const walStat = fs.statSync(journal, { bigint: true });
+    const wal = JSON.parse(walBytes.toString('utf8')) as {
+      expectedRef: string; preHead: string; expectedCommit: string;
+      publicationNonce: string;
+    };
+    const proofRef = convergencePublicationRef(
+      wal.expectedRef, wal.preHead, wal.expectedCommit, wal.publicationNonce,
+    );
+    expect(() => git(repo, 'show-ref', '--verify', '--hash', proofRef)).toThrow();
+
+    const refused = await runCanonicalPlaneConvergence(engine, {
+      sourceId: 'default', yes: true,
+    });
+    expect(refused.exitCode).toBe(2);
+    expect(refused.report.errors.some((e) =>
+      e.reason.includes('unpublished_index_not_live'),
+    )).toBe(true);
+    expect(git(repo, 'rev-parse', 'HEAD')).toBe(sibling);
+    expect(fs.readFileSync(journal)).toEqual(walBytes);
+    const walAfter = fs.statSync(journal, { bigint: true });
+    expect(walAfter.dev).toBe(walStat.dev);
+    expect(walAfter.ino).toBe(walStat.ino);
+    expect(fs.readFileSync(indexPath)).toEqual(indexBefore);
+    const indexAfter = fs.statSync(indexPath, { bigint: true });
+    expect(indexAfter.dev).toBe(indexStatBefore.dev);
+    expect(indexAfter.ino).toBe(indexStatBefore.ino);
+    expect((await engine.executeRaw<{ last_commit: string | null }>(
+      `SELECT last_commit FROM sources WHERE id='default'`,
+    ))[0]!.last_commit).toBe(preHead);
+  });
+
+  test('v4 sibling WAL is publication-ambiguous and a live v4 candidate still recovers', async () => {
+    const slug = 'inbox/v4-ambiguous';
+    const relPath = `${slug}.md`;
+    await importFromContent(
+      engine,
+      slug,
+      '---\ntitle: V4 Ambiguous\n---\n\nCANONICAL\n',
+      { noEmbed: true, sourceId: 'default', sourcePath: relPath },
+    );
+    await writePageThrough(engine, slug, { sourceId: 'default' });
+    execFileSync('git', [
+      '-C', repo, '--literal-pathspecs',
+      'rm', '--cached', '--ignore-unmatch', '--', relPath,
+    ]);
+    execFileSync('git', [
+      '-C', repo, 'commit', '--allow-empty', '-m', 'fixture v4 sibling base',
+    ]);
+    const preHead = git(repo, 'rev-parse', 'HEAD');
+    await engine.executeRaw(
+      `UPDATE sources SET last_commit=$1 WHERE id='default'`, [preHead],
+    );
+    const journalRaw = git(repo, 'rev-parse', '--git-path',
+      'gbrain-converge-default.json');
+    const journal = path.isAbsolute(journalRaw)
+      ? journalRaw : path.resolve(repo, journalRaw);
+    const indexRaw = git(repo, 'rev-parse', '--git-path', 'index');
+    const indexPath = path.isAbsolute(indexRaw)
+      ? indexRaw : path.resolve(repo, indexRaw);
+    const indexBefore = fs.readFileSync(indexPath);
+    const indexStatBefore = fs.statSync(indexPath, { bigint: true });
+
+    const raced = await runCanonicalPlaneConvergence(engine, {
+      sourceId: 'default',
+      yes: true,
+      _beforeCommitRefCasForTest: () => {
+        const p = git(repo, 'rev-parse', 'HEAD');
+        const ref = git(repo, 'symbolic-ref', '-q', 'HEAD');
+        const sibling = execFileSync('git', [
+          '-C', repo, 'commit-tree', `${p}^{tree}`, '-p', p,
+          '-m', 'gbrain: converge canonical page planes (v4 competitor)',
+        ], { encoding: 'utf8' }).trim();
+        execFileSync('git', ['-C', repo, 'update-ref', ref, sibling, p]);
+      },
+    });
+    expect(raced.exitCode).toBe(1);
+    const walObj = JSON.parse(fs.readFileSync(journal, 'utf8')) as Record<string, unknown>;
+    const { publicationNonce: _nonce, ...v4 } = walObj;
+    fs.writeFileSync(journal, `${JSON.stringify({ ...v4, version: 4 })}\n`);
+    const walBytes = fs.readFileSync(journal);
+    const walStat = fs.statSync(journal, { bigint: true });
+
+    const refused = await runCanonicalPlaneConvergence(engine, {
+      sourceId: 'default', yes: true,
+    });
+    expect(refused.exitCode).toBe(2);
+    expect(refused.report.errors.some((e) =>
+      e.reason === 'journal_publication_ambiguous',
+    )).toBe(true);
+    expect(fs.readFileSync(journal)).toEqual(walBytes);
+    expect(fs.statSync(journal, { bigint: true }).ino).toBe(walStat.ino);
+    expect(fs.readFileSync(indexPath)).toEqual(indexBefore);
+    expect(fs.statSync(indexPath, { bigint: true }).ino).toBe(indexStatBefore.ino);
+    expect((await engine.executeRaw<{ last_commit: string | null }>(
+      `SELECT last_commit FROM sources WHERE id='default'`,
+    ))[0]!.last_commit).toBe(preHead);
   });
 
   test('legacy and malformed prepublish WALs retire only at an anchored HEAD', async () => {

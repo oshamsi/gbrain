@@ -528,21 +528,80 @@ type VerifiedBatchCommitOptions = {
   expectedHead: string;
   /** Exact symbolic branch captured with expectedHead; OID alone is ambiguous. */
   expectedRef: string;
-  /** Persist a receipt for the exact orphan commit before publishing its ref. */
+  /** Persist the v5 WAL before the atomic branch/proof-ref transaction. */
   beforePublish: (candidate: {
     commitSha: string;
     treeSha: string;
     publishedFiles: readonly VerifiedCommitFile[];
     /** Identity of the standard Git index.lock this process owns. */
     indexLeaseIdentity: { dev: string; ino: string };
+    publicationNonce: string;
   }) => void;
   /** Deterministic race seam; production never supplies it. */
   _beforeIndexLeaseForTest?: () => void;
   /** Deterministic file/ref race seam; index.lock is already held here. */
   _afterSnapshotForTest?: () => void;
+  /** Runs after the final read precheck, immediately before update-ref --stdin. */
+  _beforeRefCasForTest?: () => void;
   /** Deterministic crash seam immediately after successful ref CAS. */
   _afterRefPublishForTest?: () => void;
 };
+
+export function convergencePublicationRef(
+  expectedRef: string,
+  preHead: string,
+  candidate: string,
+  nonce: string,
+): string {
+  if (!/^refs\/heads\//.test(expectedRef)) {
+    throw new Error('invalid convergence publication branch');
+  }
+  if (!/^[0-9a-f]{40,64}$/.test(preHead)
+    || !/^[0-9a-f]{40,64}$/.test(candidate)
+    || !/^[0-9a-f]{64}$/.test(nonce)) {
+    throw new Error('invalid convergence publication identity');
+  }
+  const id = createHash('sha256')
+    .update(expectedRef).update('\0')
+    .update(preHead).update('\0')
+    .update(candidate).update('\0')
+    .update(nonce)
+    .digest('hex');
+  return `refs/gbrain/converge/${id}`;
+}
+
+type ExactCommitRef =
+  | { kind: 'present'; oid: string }
+  | { kind: 'missing' }
+  | { kind: 'error'; detail: string };
+
+function readCommitRefExactly(gitRoot: string, ref: string): ExactCommitRef {
+  try {
+    const oid = execFileSync(
+      'git', ['-C', gitRoot, 'show-ref', '--verify', '--hash', ref],
+      {
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'pipe'],
+        timeout: 30_000,
+        env: controlledGitEnv(),
+      },
+    ).trim();
+    return /^[0-9a-f]{40,64}$/.test(oid)
+      ? { kind: 'present', oid }
+      : { kind: 'error', detail: 'invalid ref OID' };
+  } catch (error) {
+    const status = (error as { status?: number | null }).status;
+    const detail = error instanceof Error ? error.message : String(error);
+    // `git show-ref --verify` exits 1 or 128 with "not a valid ref" when absent.
+    if (status === 1 || (status === 128 && /not a valid ref/.test(detail))) {
+      return { kind: 'missing' };
+    }
+    return {
+      kind: 'error',
+      detail,
+    };
+  }
+}
 
 type CapturedCommitFile = VerifiedCommitFile & {
   rel: string;
@@ -1023,10 +1082,19 @@ export function commitWriteThroughFiles(
     }
     // The orphan is immutable but not published. Persist its exact identity
     // before the ref CAS so recovery can never attribute a lookalike commit.
+    const publicationNonce = randomBytes(32).toString('hex');
+    const proofRef = convergencePublicationRef(
+      opts.expectedRef,
+      opts.expectedHead,
+      newCommit,
+      publicationNonce,
+    );
+
     opts.beforePublish({
       commitSha: newCommit,
       treeSha: tree,
       indexLeaseIdentity: realIndexLease.identity,
+      publicationNonce,
       publishedFiles: published.map(({ absPath, expectedSha256 }) => ({
         absPath, expectedSha256,
       })),
@@ -1040,14 +1108,56 @@ export function commitWriteThroughFiles(
     ) {
       return { status: 'conflict', reason: 'head_moved' };
     }
+
+    opts._beforeRefCasForTest?.();
+    const refTransaction = Buffer.from([
+      'start',
+      `create ${proofRef} ${newCommit}`,
+      `update ${opts.expectedRef} ${newCommit} ${opts.expectedHead}`,
+      'prepare',
+      'commit',
+      '',
+    ].join('\n'), 'utf8');
+
+    let refTransactionPublished = false;
     try {
       gitText(
         gitRoot,
-        ['update-ref', opts.expectedRef, newCommit, opts.expectedHead],
+        ['update-ref', '-m', 'gbrain convergence publication', '--stdin'],
         baseEnv,
+        refTransaction,
       );
-    } catch {
-      return { status: 'conflict', reason: 'head_moved' };
+      refTransactionPublished = true;
+    } catch (error) {
+      // Do not translate every update-ref failure to head_moved. The transaction
+      // can fail for an I/O/config/proof-ref error, and a late transport failure can
+      // even be observed after the transaction committed. Read both refs exactly.
+      const branchAfter = readCommitRefExactly(gitRoot, opts.expectedRef);
+      const proofAfter = readCommitRefExactly(gitRoot, proofRef);
+      if (proofAfter.kind === 'present' && proofAfter.oid === newCommit) {
+        committedSha = newCommit;
+        refTransactionPublished = true; // durable proof, regardless of live branch
+      } else if (
+        proofAfter.kind === 'missing'
+        && branchAfter.kind === 'present'
+        && branchAfter.oid !== opts.expectedHead
+      ) {
+        return { status: 'conflict', reason: 'head_moved' };
+      } else {
+        return {
+          status: 'error',
+          reason: 'git_failed',
+          detail: `ref_transaction_failed:${
+            error instanceof Error ? error.message : String(error)
+          };branch=${branchAfter.kind};proof=${proofAfter.kind}`,
+        };
+      }
+    }
+    if (!refTransactionPublished) {
+      return {
+        status: 'error', reason: 'git_failed',
+        detail: 'ref transaction returned without publication proof',
+      };
     }
     committedSha = newCommit;
     opts._afterRefPublishForTest?.();
