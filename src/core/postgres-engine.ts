@@ -1367,8 +1367,8 @@ export class PostgresEngine implements BrainEngine {
     const sourceKind = page.source_kind ?? null;
     const sourceUri = page.source_uri ?? null;
     const ingestedVia = page.ingested_via ?? null;
-    const ingestedAt = (sourceKind || sourceUri || ingestedVia) ? new Date() : null;
-    const rows = opts?.expectedContentHash !== undefined ? await this.executeRaw(PAGE_CAS_UPDATE_SQL, [page.type, pageKind, page.title, page.compiled_truth, page.timeline || '', JSON.stringify(frontmatter), hash, effectiveDate, effectiveDateSource, importFilename, chunkerVersion, sourcePath, sourceKind, sourceUri, ingestedVia, ingestedAt, sourceId, slug, opts.expectedContentHash]) : await sql`
+    const ingestedAt = page.ingested_at ?? ((sourceKind || sourceUri || ingestedVia) ? new Date() : null);
+    const rows = opts?.expectedContentHash !== undefined ? await this.executeRaw(PAGE_CAS_UPDATE_SQL, [page.type, pageKind, page.title, page.compiled_truth, page.timeline || '', JSON.stringify(frontmatter), hash, effectiveDate, effectiveDateSource, importFilename, chunkerVersion, sourcePath, sourceKind, sourceUri, ingestedVia, ingestedAt, sourceId, slug, opts.expectedContentHash, opts.expectedProvenance !== undefined, opts.expectedProvenance?.source_kind ?? null, opts.expectedProvenance?.ingested_via ?? null, opts.expectedProvenance?.ingested_at ?? null]) : await sql`
           INSERT INTO pages (source_id, slug, type, page_kind, title, compiled_truth, timeline, frontmatter, content_hash, updated_at, effective_date, effective_date_source, import_filename, chunker_version, source_path, source_kind, source_uri, ingested_via, ingested_at)
           VALUES (${sourceId}, ${slug}, ${page.type}, ${pageKind}, ${page.title}, ${page.compiled_truth}, ${page.timeline || ''}, ${sql.json(frontmatter as Parameters<typeof sql.json>[0])}, ${hash}, now(), ${effectiveDate}, ${effectiveDateSource}, ${importFilename}, COALESCE(${chunkerVersion}::smallint, ${MARKDOWN_CHUNKER_VERSION}), ${sourcePath}, ${sourceKind}, ${sourceUri}, ${ingestedVia}, ${ingestedAt})
           ON CONFLICT (source_id, slug) DO UPDATE SET
@@ -1386,10 +1386,10 @@ export class PostgresEngine implements BrainEngine {
             import_filename       = COALESCE(EXCLUDED.import_filename,       pages.import_filename),
             chunker_version       = COALESCE(EXCLUDED.chunker_version,       pages.chunker_version),
             source_path           = COALESCE(EXCLUDED.source_path,           pages.source_path),
-            source_kind           = COALESCE(EXCLUDED.source_kind,           pages.source_kind),
+            source_kind           = COALESCE(pages.source_kind,           EXCLUDED.source_kind),
             source_uri            = COALESCE(EXCLUDED.source_uri,            pages.source_uri),
-            ingested_via          = COALESCE(EXCLUDED.ingested_via,          pages.ingested_via),
-            ingested_at           = COALESCE(EXCLUDED.ingested_at,           pages.ingested_at)
+            ingested_via          = COALESCE(pages.ingested_via,          EXCLUDED.ingested_via),
+            ingested_at           = COALESCE(pages.ingested_at,           EXCLUDED.ingested_at)
           RETURNING id, source_id, slug, type, title, compiled_truth, timeline, frontmatter, content_hash, created_at, updated_at, effective_date, effective_date_source, import_filename, source_kind, source_uri, ingested_via, ingested_at
         `;
     if (rows.length === 0 && opts?.expectedContentHash !== undefined) throw new PageWriteConflictError(slug, sourceId, opts.expectedContentHash);

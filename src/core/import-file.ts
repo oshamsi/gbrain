@@ -2,7 +2,7 @@ import { readFileSync, statSync, lstatSync } from 'fs';
 import { basename, extname } from 'path';
 import { createHash } from 'crypto';
 import type { BrainEngine, FileSpec } from './engine.ts';
-import { assertExpectedPageHash, pageHashStillMatches } from './page-cas.ts';
+import { assertExpectedPageHash, pageHashStillMatches, PageWriteConflictError } from './page-cas.ts';
 import { verifyPageReadable } from './page-write-verify.ts';
 import { parseMarkdown } from './markdown.ts';
 import { classifyStoredType } from './schema-pack/type-usage.ts';
@@ -51,7 +51,14 @@ import { DEFAULT_SYNOPSIS_MODEL } from './page-summary.ts';
 import { runGuardrails } from './guardrails.ts';
 import { FACTS_FENCE_BEGIN, FACTS_FENCE_END, parseFactsFence } from './facts-fence.ts';
 import { scanFencedBlocks, MAX_FENCES_PER_PAGE } from './fence-scan.ts';
-import { persistCanonicalProjectionFromRow, loadCanonicalProjection } from './page-canonical.ts';
+import {
+  loadCanonicalProjection,
+  materializeProvenanceFrontmatter,
+  persistCanonicalProjectionFromRow,
+  provenanceTuplesEqual,
+  resolveSetOnceProvenance,
+  stripReservedProvenanceKeys,
+} from './page-canonical.ts';
 import { atomicWriteFileSync } from './atomic-write.ts';
 
 /**
@@ -452,8 +459,8 @@ export async function importFromContent(
      * `put_page` op layer — by the time importFromContent sees these, the
      * caller is already trusted (capture CLI sets them; remote MCP callers
      * had theirs overridden to `mcp:put_page` upstream). `ingested_at` is
-     * NOT a caller-controllable param; the engine's putPage stamps it
-     * server-side via now() when any provenance write fires.
+     * resolved once in importFromContent (set-once + single clock) and
+     * passed through to putPage.
      */
     source_kind?: string | null;
     source_uri?: string | null;
@@ -526,10 +533,23 @@ export async function importFromContent(
   // trusted "this looks odd" channel) on clean content. Only the content-
   // sanity gate (below) and trusted local CLIs may set these. Fail-closed:
   // strip whenever opts.remote === true.
+  const sourceFileProvenance = parsed.frontmatter
+    ? {
+        source_kind: parsed.frontmatter.source_kind,
+        ingested_via: parsed.frontmatter.ingested_via,
+        ingested_at: parsed.frontmatter.ingested_at,
+      }
+    : null;
+  if (parsed.frontmatter) {
+    // Reserved provenance keys are never a put_page fallback; strip them
+    // before hashing and materialize the resolved store tuple later.
+    stripReservedProvenanceKeys(parsed.frontmatter);
+  }
   if (opts.remote === true && parsed.frontmatter) {
     delete parsed.frontmatter[QUARANTINE_KEY];
     delete parsed.frontmatter[CONTENT_FLAG_KEY];
     delete parsed.frontmatter[EMBED_SKIP_KEY];
+    stripReservedProvenanceKeys(parsed.frontmatter);
   }
 
   // Vendor-neutral guardrail seam (observe-only, fail-open). Runs AFTER
@@ -794,6 +814,21 @@ export async function importFromContent(
     }
   }
 
+  const provenanceNow = new Date();
+  const isTrustedSync = Boolean(opts.sourcePath) && opts.remote !== true;
+  const resolvedProvenance = resolveSetOnceProvenance(
+    existing,
+    { source_kind: opts.source_kind, ingested_via: opts.ingested_via },
+    provenanceNow,
+    {
+      legacyAdoption: isTrustedSync ? 'source-file' : false,
+      sourceFrontmatter: isTrustedSync ? sourceFileProvenance : null,
+      inventTimestamp: true,
+    },
+  );
+  if (!parsed.frontmatter) parsed.frontmatter = {};
+  materializeProvenanceFrontmatter(parsed.frontmatter, resolvedProvenance);
+
   // #3694: the hash formula lives in ONE place — utils.contentHash — shared
   // with both engines' putPage fallback, so a page written via putPage and
   // the same page re-imported by sync produce the SAME hash (pre-fix they
@@ -1055,14 +1090,27 @@ export async function importFromContent(
       // v0.39.3.0 provenance write-through (WARN-8). Engine layer applies
       // COALESCE-preserve UPDATE so omitting these on a later put_page
       // doesn't erase the original ingestion's audit trail.
-      source_kind: opts.source_kind ?? null,
+      source_kind: resolvedProvenance.source_kind,
       source_uri: opts.source_uri ?? null,
-      ingested_via: opts.ingested_via ?? null,
-      // ingested_at is server-stamped at the engine layer when any
-      // provenance write fires; never client-controlled.
+      ingested_via: resolvedProvenance.ingested_via,
+      ingested_at: resolvedProvenance.ingested_at,
       // Empty-overwrite escape hatch only when the caller vouched (file
       // import / explicit allow_empty); otherwise the engine guard stays on.
-    }, { ...txOpts, ...(opts.allowEmptyOverwrite === true ? { allowEmptyOverwrite: true } : {}), ...(opts.expectedContentHash !== undefined ? { expectedContentHash: opts.expectedContentHash } : {}) });
+    }, {
+      ...txOpts,
+      ...(opts.allowEmptyOverwrite === true ? { allowEmptyOverwrite: true } : {}),
+      ...(opts.expectedContentHash !== undefined ? { expectedContentHash: opts.expectedContentHash } : {}),
+      ...(opts.expectedContentHash !== undefined ? {
+        expectedProvenance: {
+          source_kind: existing?.source_kind ?? null,
+          ingested_via: existing?.ingested_via ?? null,
+          ingested_at: existing?.ingested_at ?? null,
+        },
+      } : {}),
+    });
+    if (!provenanceTuplesEqual(resolvedProvenance, committedPage)) {
+      throw new PageWriteConflictError(slug, txOpts.sourceId, opts.expectedContentHash ?? (existing?.content_hash ?? ''));
+    }
 
     // v0.40.3.0: stamp the contextual retrieval state columns alongside
     // the page write. updatePageContextualRetrievalState is a narrow

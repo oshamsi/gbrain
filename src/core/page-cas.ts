@@ -4,6 +4,12 @@ export interface PutPageOptions {
   allowEmptyOverwrite?: boolean;
   /** Existing-row optimistic-concurrency precondition. */
   expectedContentHash?: string;
+  /** Snapshotted set-once provenance; CAS refuses if the live tuple moved. */
+  expectedProvenance?: {
+    source_kind: string | null;
+    ingested_via: string | null;
+    ingested_at: Date | string | null;
+  };
 }
 
 /** Stable engine-layer signal for an optimistic page-write conflict. */
@@ -51,12 +57,20 @@ export const PAGE_CAS_UPDATE_SQL = `
     import_filename = COALESCE($10, pages.import_filename),
     chunker_version = COALESCE($11, pages.chunker_version),
     source_path = COALESCE($12, pages.source_path),
-    source_kind = COALESCE($13, pages.source_kind),
+    source_kind = COALESCE(pages.source_kind, $13),
     source_uri = COALESCE($14, pages.source_uri),
-    ingested_via = COALESCE($15, pages.ingested_via),
-    ingested_at = COALESCE($16::timestamptz, pages.ingested_at)
+    ingested_via = COALESCE(pages.ingested_via, $15),
+    ingested_at = COALESCE(pages.ingested_at, $16::timestamptz)
   WHERE source_id = $17 AND slug = $18 AND content_hash = $19
     AND deleted_at IS NULL
+    AND (
+      $20::boolean IS NOT TRUE
+      OR (
+        pages.source_kind IS NOT DISTINCT FROM $21
+        AND pages.ingested_via IS NOT DISTINCT FROM $22
+        AND pages.ingested_at IS NOT DISTINCT FROM $23::timestamptz
+      )
+    )
   RETURNING id, source_id, slug, type, title, compiled_truth, timeline,
     frontmatter, content_hash, created_at, updated_at, effective_date,
     effective_date_source, import_filename, source_kind, source_uri,

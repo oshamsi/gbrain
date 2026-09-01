@@ -14,6 +14,97 @@ import type { BrainEngine } from './engine.ts';
 
 export const RESERVED_PROVENANCE_KEYS = ['source_kind', 'ingested_via', 'ingested_at'] as const;
 
+export type ProvenanceTuple = {
+  source_kind: string | null;
+  ingested_via: string | null;
+  ingested_at: Date | null;
+};
+
+export type ProvenanceCandidate = {
+  source_kind?: string | null;
+  ingested_via?: string | null;
+};
+
+export type ProvenanceLegacyAdoption = 'existing-frontmatter' | 'source-file' | false;
+
+function validProvenanceString(value: unknown): string | null {
+  if (typeof value !== 'string') return null;
+  const trimmed = value.trim();
+  return trimmed ? trimmed : null;
+}
+
+function validProvenanceTimestamp(value: unknown): Date | null {
+  if (value == null || value === '') return null;
+  const date = value instanceof Date ? value : new Date(String(value));
+  return Number.isNaN(date.getTime()) ? null : date;
+}
+
+/**
+ * Set-once provenance: a non-NULL stored column wins. Ordinary put_page never
+ * falls back to the incoming request's reserved frontmatter. Sync may adopt a
+ * reviewed source-file stamp. Convergence may adopt a pre-snapshot stored/file
+ * stamp but must not invent ingested_at.
+ */
+export function resolveSetOnceProvenance(
+  existing: {
+    source_kind?: string | null;
+    ingested_via?: string | null;
+    ingested_at?: Date | string | null;
+    frontmatter?: Record<string, unknown> | null;
+  } | null,
+  candidate: ProvenanceCandidate,
+  now: Date,
+  opts: {
+    legacyAdoption?: ProvenanceLegacyAdoption;
+    sourceFrontmatter?: Record<string, unknown> | null;
+    inventTimestamp?: boolean;
+  } = {},
+): ProvenanceTuple {
+  const legacyFm = opts.legacyAdoption === 'existing-frontmatter'
+    ? (existing?.frontmatter ?? null)
+    : opts.legacyAdoption === 'source-file'
+      ? (opts.sourceFrontmatter ?? null)
+      : null;
+  const source_kind = validProvenanceString(existing?.source_kind)
+    ?? (legacyFm ? validProvenanceString(legacyFm.source_kind) : null)
+    ?? validProvenanceString(candidate.source_kind);
+  const ingested_via = validProvenanceString(existing?.ingested_via)
+    ?? (legacyFm ? validProvenanceString(legacyFm.ingested_via) : null)
+    ?? validProvenanceString(candidate.ingested_via);
+  const ingested_at = validProvenanceTimestamp(existing?.ingested_at)
+    ?? (legacyFm ? validProvenanceTimestamp(legacyFm.ingested_at) : null)
+    ?? ((opts.inventTimestamp !== false && (source_kind || ingested_via)) ? now : null);
+  return { source_kind, ingested_via, ingested_at };
+}
+
+export function stripReservedProvenanceKeys(frontmatter: Record<string, unknown> | null | undefined): void {
+  if (!frontmatter) return;
+  for (const key of RESERVED_PROVENANCE_KEYS) delete frontmatter[key];
+}
+
+export function materializeProvenanceFrontmatter(
+  frontmatter: Record<string, unknown>,
+  tuple: ProvenanceTuple,
+): void {
+  stripReservedProvenanceKeys(frontmatter);
+  if (tuple.source_kind) frontmatter.source_kind = tuple.source_kind;
+  if (tuple.ingested_via) frontmatter.ingested_via = tuple.ingested_via;
+  if (tuple.ingested_at) frontmatter.ingested_at = tuple.ingested_at.toISOString();
+}
+
+export function provenanceTuplesEqual(
+  a: ProvenanceTuple,
+  b: { source_kind?: string | null; ingested_via?: string | null; ingested_at?: Date | string | null },
+): boolean {
+  if ((a.source_kind ?? null) !== (b.source_kind ?? null)) return false;
+  if ((a.ingested_via ?? null) !== (b.ingested_via ?? null)) return false;
+  const aAt = a.ingested_at ? a.ingested_at.toISOString() : null;
+  const bAt = b.ingested_at == null || b.ingested_at === ''
+    ? null
+    : (b.ingested_at instanceof Date ? b.ingested_at : new Date(String(b.ingested_at))).toISOString();
+  return aAt === bAt;
+}
+
 export type CanonicalPageProjection = {
   content: string;
   sha256: string;

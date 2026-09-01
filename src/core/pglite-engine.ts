@@ -1741,8 +1741,8 @@ export class PGLiteEngine implements BrainEngine {
     const sourceKind = page.source_kind ?? null;
     const sourceUri = page.source_uri ?? null;
     const ingestedVia = page.ingested_via ?? null;
-    const ingestedAt = (sourceKind || sourceUri || ingestedVia) ? new Date().toISOString() : null;
-    const rows = opts?.expectedContentHash !== undefined ? await this.executeRaw(PAGE_CAS_UPDATE_SQL, [page.type, pageKind, page.title, page.compiled_truth, page.timeline || '', JSON.stringify(frontmatter), hash, effectiveDate, effectiveDateSource, importFilename, chunkerVersion, sourcePath, sourceKind, sourceUri, ingestedVia, ingestedAt, sourceId, slug, opts.expectedContentHash]) : await this.db.query(
+    const ingestedAt = page.ingested_at ? (page.ingested_at instanceof Date ? page.ingested_at.toISOString() : String(page.ingested_at)) : ((sourceKind || sourceUri || ingestedVia) ? new Date().toISOString() : null);
+    const rows = opts?.expectedContentHash !== undefined ? await this.executeRaw(PAGE_CAS_UPDATE_SQL, [page.type, pageKind, page.title, page.compiled_truth, page.timeline || '', JSON.stringify(frontmatter), hash, effectiveDate, effectiveDateSource, importFilename, chunkerVersion, sourcePath, sourceKind, sourceUri, ingestedVia, ingestedAt, sourceId, slug, opts.expectedContentHash, opts.expectedProvenance !== undefined, opts.expectedProvenance?.source_kind ?? null, opts.expectedProvenance?.ingested_via ?? null, opts.expectedProvenance?.ingested_at ?? null]) : await this.db.query(
           `INSERT INTO pages (source_id, slug, type, page_kind, title, compiled_truth, timeline, frontmatter, content_hash, updated_at, effective_date, effective_date_source, import_filename, chunker_version, source_path, source_kind, source_uri, ingested_via, ingested_at)
            VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, now(), $10::timestamptz, $11, $12, COALESCE($13, ${MARKDOWN_CHUNKER_VERSION}), $14, $15, $16, $17, $18::timestamptz)
            ON CONFLICT (source_id, slug) DO UPDATE SET
@@ -1760,10 +1760,10 @@ export class PGLiteEngine implements BrainEngine {
              import_filename       = COALESCE(EXCLUDED.import_filename,       pages.import_filename),
              chunker_version       = COALESCE(EXCLUDED.chunker_version,       pages.chunker_version),
              source_path           = COALESCE(EXCLUDED.source_path,           pages.source_path),
-             source_kind           = COALESCE(EXCLUDED.source_kind,           pages.source_kind),
+             source_kind           = COALESCE(pages.source_kind,           EXCLUDED.source_kind),
              source_uri            = COALESCE(EXCLUDED.source_uri,            pages.source_uri),
-             ingested_via          = COALESCE(EXCLUDED.ingested_via,          pages.ingested_via),
-             ingested_at           = COALESCE(EXCLUDED.ingested_at,           pages.ingested_at)
+             ingested_via          = COALESCE(pages.ingested_via,          EXCLUDED.ingested_via),
+             ingested_at           = COALESCE(pages.ingested_at,           EXCLUDED.ingested_at)
            RETURNING id, source_id, slug, type, title, compiled_truth, timeline, frontmatter, content_hash, created_at, updated_at, effective_date, effective_date_source, import_filename, source_kind, source_uri, ingested_via, ingested_at`,
           [sourceId, slug, page.type, pageKind, page.title, page.compiled_truth, page.timeline || '', JSON.stringify(frontmatter), hash, effectiveDate, effectiveDateSource, importFilename, chunkerVersion, sourcePath, sourceKind, sourceUri, ingestedVia, ingestedAt],
         ).then(result => result.rows);

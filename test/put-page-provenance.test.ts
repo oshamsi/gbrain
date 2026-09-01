@@ -228,7 +228,7 @@ describe('put_page provenance — CV12 COALESCE-preserve UPDATE', () => {
     expect(second.ingested_at!.getTime()).toBe(firstStamp);
   });
 
-  test('second write WITH new provenance overwrites (explicit re-ingestion)', async () => {
+  test('second write WITH new provenance retains the first-write tuple', async () => {
     const ctx = makeCtx({ remote: false });
 
     await putPageOp.handler(ctx, {
@@ -241,15 +241,17 @@ describe('put_page provenance — CV12 COALESCE-preserve UPDATE', () => {
     await putPageOp.handler(ctx, {
       slug: 'wiki/p3a-reingest',
       content: '---\ntype: note\ntitle: V2\n---\n\nbody',
-      source_kind: 'file-watcher', // explicit re-ingest under different kind
+      source_kind: 'file-watcher', // explicit candidate must not churn set-once
       source_uri: 'file:///watched/path.md',
       ingested_via: 'file-watcher',
     });
     const prov = await readProvenance('wiki/p3a-reingest');
-    // COALESCE(EXCLUDED.source_kind, pages.source_kind) — EXCLUDED non-null wins
-    expect(prov.source_kind).toBe('file-watcher');
-    expect(prov.source_uri).toBe('file:///watched/path.md');
-    expect(prov.ingested_via).toBe('file-watcher');
+    expect(prov.source_kind).toBe('capture-cli');
+    expect(prov.ingested_via).not.toBe('file-watcher');
+    const page = await engine.getPage('wiki/p3a-reingest');
+    const fm = (page?.frontmatter ?? {}) as Record<string, unknown>;
+    expect(fm.source_kind).toBe('capture-cli');
+    expect(JSON.stringify(fm)).not.toContain('file-watcher');
   });
 
   test('remote second write WITHOUT explicit provenance does NOT erase local first-write', async () => {
@@ -269,15 +271,9 @@ describe('put_page provenance — CV12 COALESCE-preserve UPDATE', () => {
       content: '---\ntype: note\ntitle: V2\n---\n\nremote edit',
     });
 
-    // Remote second write is itself a provenance write (server-stamped),
-    // so COALESCE(EXCLUDED.source_kind='mcp:put_page', pages.source_kind='capture-cli')
-    // resolves to EXCLUDED's non-null value: 'mcp:put_page'. This is the
-    // honest answer — the MOST RECENT ingestion source is mcp:put_page,
-    // and the system says so. CV12 first-write-wins applies when the second
-    // write OMITS provenance entirely (covered by the earlier test); when
-    // the second write IS an ingestion, it gets to record itself.
     const prov = await readProvenance('wiki/p3a-local-then-remote');
-    expect(prov.source_kind).toBe('mcp:put_page');
+    expect(prov.source_kind).toBe('capture-cli');
+    expect(prov.ingested_via).toBe('put_page');
   });
 });
 
