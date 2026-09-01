@@ -442,8 +442,8 @@ export function commitWriteThroughFile(repoPath: string, absPath: string, slug: 
     const rel = relative(repoPath, absPath);
     if (!rel || rel.startsWith('..') || isAbsolute(rel)) return false;
     const gitOpts = { stdio: 'ignore', timeout: 30_000, env: { ...process.env, ...GIT_ENV } } as const;
-    execFileSync('git', ['-C', repoPath, 'add', '--', rel], gitOpts);
-    execFileSync('git', ['-C', repoPath, 'commit', '-m', `gbrain: write-through ${slug}`, '--', rel], gitOpts);
+    execFileSync('git', ['--literal-pathspecs', '-C', repoPath, 'add', '--', rel], gitOpts);
+    execFileSync('git', ['--literal-pathspecs', '-C', repoPath, 'commit', '-m', `gbrain: write-through ${slug}`, '--', rel], gitOpts);
     return true;
   } catch {
     return false;
@@ -463,8 +463,8 @@ export function commitWriteThroughFiles(repoPath: string, absPaths: string[], me
     const unique = [...new Set(rels)];
     if (unique.length === 0) return null;
     const gitOpts = { stdio: 'ignore', timeout: 60_000, env: { ...process.env, ...GIT_ENV } } as const;
-    execFileSync('git', ['-C', repoPath, 'add', '--', ...unique], gitOpts);
-    execFileSync('git', ['-C', repoPath, 'commit', '--only', '--no-gpg-sign', '-m', message, '--', ...unique], gitOpts);
+    execFileSync('git', ['--literal-pathspecs', '-C', repoPath, 'add', '--', ...unique], gitOpts);
+    execFileSync('git', ['--literal-pathspecs', '-C', repoPath, 'commit', '--only', '--no-gpg-sign', '-m', message, '--', ...unique], gitOpts);
     const sha = execFileSync('git', ['-C', repoPath, 'rev-parse', 'HEAD'], {
       encoding: 'utf8',
       timeout: 15_000,

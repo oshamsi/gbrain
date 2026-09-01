@@ -84,8 +84,9 @@ describe('converge-canonical', () => {
   test('missing file is reported and not recreated', async () => {
     await importFromContent(engine, 'inbox/missing', '---\ntitle: M\n---\n\nbody\n', { noEmbed: true, sourceId: 'default' });
     await persistCanonicalProjectionFromRow(engine, 'default', 'inbox/missing');
-    const { report } = await runCanonicalPlaneConvergence(engine, { sourceId: 'default' });
+    const { report, exitCode } = await runCanonicalPlaneConvergence(engine, { sourceId: 'default' });
     expect(report.missing_file).toBeGreaterThan(0);
+    expect(exitCode).toBe(1);
     expect(fs.existsSync(path.join(repo, 'inbox/missing.md'))).toBe(false);
   });
 });
