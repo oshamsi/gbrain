@@ -153,6 +153,21 @@ CREATE TABLE IF NOT EXISTS pages (
   -- the content allow-list IS DISTINCT FROM. Read by the per-page snapshot
   -- check in query-cache-gate.ts.
   generation     BIGINT NOT NULL DEFAULT 1,
+  source_kind    TEXT,
+  source_uri     TEXT,
+  ingested_via   TEXT,
+  ingested_at    TIMESTAMPTZ,
+  -- Canonical stored markdown projection (exact file-plane UTF-8 bytes).
+  canonical_content    TEXT,
+  canonical_sha256     TEXT,
+  canonical_size_bytes BIGINT,
+  canonical_input_generation BIGINT NOT NULL DEFAULT 1,
+  canonical_basis_generation BIGINT,
+  CONSTRAINT pages_canonical_projection_ck CHECK (
+    (canonical_content IS NULL AND canonical_sha256 IS NULL AND canonical_size_bytes IS NULL AND canonical_basis_generation IS NULL)
+    OR
+    (canonical_content IS NOT NULL AND canonical_sha256 IS NOT NULL AND canonical_size_bytes IS NOT NULL AND canonical_basis_generation IS NOT NULL)
+  ),
   CONSTRAINT pages_source_slug_key UNIQUE (source_id, slug)
 );
 
@@ -190,6 +205,36 @@ CREATE TRIGGER bump_page_generation_trg
   BEFORE INSERT OR UPDATE ON pages
   FOR EACH ROW
   EXECUTE FUNCTION bump_page_generation_fn();
+
+-- Canonical-input generation: bumps only when a field that can change
+-- canonical markdown bytes changes. Projection columns themselves must not
+-- bump it. Tags bump via a separate tags-table trigger.
+CREATE OR REPLACE FUNCTION bump_canonical_input_generation_fn() RETURNS trigger SET search_path = pg_catalog, public AS \$func\$
+BEGIN
+  IF (TG_OP = 'INSERT') THEN
+    NEW.canonical_input_generation := COALESCE(NEW.canonical_input_generation, 1);
+    RETURN NEW;
+  END IF;
+  IF (OLD.type IS DISTINCT FROM NEW.type)
+     OR (OLD.title IS DISTINCT FROM NEW.title)
+     OR (OLD.compiled_truth IS DISTINCT FROM NEW.compiled_truth)
+     OR (OLD.timeline IS DISTINCT FROM NEW.timeline)
+     OR (OLD.frontmatter IS DISTINCT FROM NEW.frontmatter)
+     OR (OLD.source_kind IS DISTINCT FROM NEW.source_kind)
+     OR (OLD.ingested_via IS DISTINCT FROM NEW.ingested_via)
+     OR (OLD.ingested_at IS DISTINCT FROM NEW.ingested_at)
+  THEN
+    NEW.canonical_input_generation := COALESCE(OLD.canonical_input_generation, 1) + 1;
+  END IF;
+  RETURN NEW;
+END;
+\$func\$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS bump_canonical_input_generation_trg ON pages;
+CREATE TRIGGER bump_canonical_input_generation_trg
+  BEFORE INSERT OR UPDATE ON pages
+  FOR EACH ROW
+  EXECUTE FUNCTION bump_canonical_input_generation_fn();
 
 -- v0.40.3.0 supports O(log N) MAX(generation) for the Layer 1 bookmark
 -- check in query-cache-gate.ts. Plain btree (DESC unnecessary; Postgres
@@ -518,6 +563,25 @@ CREATE TABLE IF NOT EXISTS tags (
 
 CREATE INDEX IF NOT EXISTS idx_tags_tag ON tags(tag);
 CREATE INDEX IF NOT EXISTS idx_tags_page_id ON tags(page_id);
+
+CREATE OR REPLACE FUNCTION bump_canonical_input_on_tag_fn() RETURNS trigger SET search_path = pg_catalog, public AS \$func\$
+BEGIN
+  IF TG_OP = 'INSERT' THEN
+    UPDATE pages SET canonical_input_generation = canonical_input_generation + 1 WHERE id = NEW.page_id;
+    RETURN NEW;
+  ELSIF TG_OP = 'DELETE' THEN
+    UPDATE pages SET canonical_input_generation = canonical_input_generation + 1 WHERE id = OLD.page_id;
+    RETURN OLD;
+  END IF;
+  RETURN NULL;
+END;
+\$func\$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS bump_canonical_input_on_tag_trg ON tags;
+CREATE TRIGGER bump_canonical_input_on_tag_trg
+  AFTER INSERT OR DELETE ON tags
+  FOR EACH ROW
+  EXECUTE FUNCTION bump_canonical_input_on_tag_fn();
 
 -- ============================================================
 -- raw_data: sidecar data (replaces .raw/ JSON files)

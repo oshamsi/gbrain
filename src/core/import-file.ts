@@ -51,6 +51,8 @@ import { DEFAULT_SYNOPSIS_MODEL } from './page-summary.ts';
 import { runGuardrails } from './guardrails.ts';
 import { FACTS_FENCE_BEGIN, FACTS_FENCE_END, parseFactsFence } from './facts-fence.ts';
 import { scanFencedBlocks, MAX_FENCES_PER_PAGE } from './fence-scan.ts';
+import { persistCanonicalProjectionFromRow, loadCanonicalProjection } from './page-canonical.ts';
+import { atomicWriteFileSync } from './atomic-write.ts';
 
 /**
  * v0.20.0 Cathedral II Layer 8 D2 — markdown fence extraction helper.
@@ -306,6 +308,10 @@ async function reconcileUnchangedProjections(
       );
     } catch { /* provenance COALESCE repair is fail-soft */ }
   }
+  try {
+    const existingProj = await loadCanonicalProjection(engine, sourceId ?? 'default', slug);
+    if (!existingProj) await persistCanonicalProjectionFromRow(engine, sourceId ?? 'default', slug);
+  } catch { /* projection backfill on a semantic no-op is fail-soft */ }
   const codeRefs = extractCodeRefs(parsed.compiled_truth + '\n' + (parsed.timeline || ''));
   const linkOpts = sourceId
     ? { fromSourceId: sourceId, toSourceId: sourceId, originSourceId: sourceId }
@@ -1095,6 +1101,11 @@ export async function importFromContent(
       await tx.addTag(slug, tag, txOpts);
     }
 
+    // Store the canonical markdown projection in the same transaction as the
+    // structured row + tags. Built from the committed row so engine-stamped
+    // ingested_at is included (S2 will pass a single clock into putPage).
+    await persistCanonicalProjectionFromRow(tx, txOpts.sourceId, slug);
+
     if (chunks.length > 0) {
       await tx.upsertChunks(slug, chunks, txOpts);
       // v0.41.31: stamp embedding provenance when this import actually
@@ -1394,7 +1405,7 @@ export async function importFromFile(
   // precedence in computeEffectiveDate. e.g. `daily/2024-03-15.md` →
   // filename `2024-03-15`.
   const fileBasename = basename(relativePath, '.md');
-  return importFromContent(engine, resolvedSlug, content, {
+  const result = await importFromContent(engine, resolvedSlug, content, {
     ...opts,
     filename: fileBasename,
     sourcePath: relativePath,
@@ -1402,6 +1413,21 @@ export async function importFromFile(
     // deliberate clear, so it passes putPage's empty-overwrite guard.
     allowEmptyOverwrite: true,
   });
+  // File→store authority: if the stored canonical projection differs from the
+  // source file, rewrite that same file under the importer. Sync's Git/anchor
+  // flow owns commit handling — do not call per-page write-through commit.
+  if (result.status !== 'error' && result.skip_reason !== 'malformed_path') {
+    try {
+      const sourceId = opts.sourceId ?? 'default';
+      const stored = (await loadCanonicalProjection(engine, sourceId, result.slug))?.content
+        ?? (await persistCanonicalProjectionFromRow(engine, sourceId, result.slug)).content;
+      if (content !== stored) atomicWriteFileSync(filePath, stored);
+    } catch {
+      // Rewrite is best-effort relative to the durable DB projection; doctor
+      // reports remaining file divergence. Do not fail the import.
+    }
+  }
+  return result;
 }
 
 /**

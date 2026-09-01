@@ -13,6 +13,7 @@ import type { BrainEngine } from '../core/engine.ts';
 import { isQuarantined, getContentFlag, QUARANTINE_KEY, CONTENT_FLAG_KEY } from '../core/quarantine.ts';
 import { serializePageToMarkdown, serializeMarkdown } from '../core/markdown.ts';
 import { importFromContent } from '../core/import-file.ts';
+import { writePageThrough } from '../core/write-through.ts';
 import type { PageType } from '../core/types.ts';
 
 export interface QuarantineRow {
@@ -230,6 +231,9 @@ async function runClear(engine: BrainEngine, args: string[]): Promise<void> {
       noEmbed,
       forceRechunk: true,
     });
+    if (result.status !== 'error') {
+      await writePageThrough(engine, slug, { sourceId: page.source_id });
+    }
   } finally {
     if (force) {
       if (prevNoSanity === undefined) delete process.env.GBRAIN_NO_SANITY;
@@ -328,6 +332,9 @@ async function runScan(engine: BrainEngine, args: string[]): Promise<void> {
       noEmbed,
       forceRechunk: true,
     });
+    if (result.status !== 'error') {
+      await writePageThrough(engine, ref.slug, { sourceId: ref.source_id });
+    }
     if (result.quarantined) {
       quarantined++;
       touched.push({ slug: ref.slug, outcome: 'quarantine' });

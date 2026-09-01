@@ -16,7 +16,8 @@ import { resetPgliteState } from './helpers/reset-pglite.ts';
 import { resetGateway } from '../src/core/ai/gateway.ts';
 import { writePageThrough, isWriteThroughDisabled, _resetWriteThroughCacheForTest } from '../src/core/write-through.ts';
 import { importFromContent } from '../src/core/import-file.ts';
-import { serializePageToMarkdown, resolvePageFilePath } from '../src/core/markdown.ts';
+import { resolvePageFilePath } from '../src/core/markdown.ts';
+import { loadCanonicalProjection } from '../src/core/page-canonical.ts';
 
 let engine: PGLiteEngine;
 let tmpRoot: string;
@@ -75,7 +76,6 @@ describe('writePageThrough', () => {
 
     const res = await writePageThrough(engine, slug, {
       sourceId: 'default',
-      frontmatterOverrides: { source_kind: 'lsd' },
     });
 
     expect(res.written).toBe(true);
@@ -83,14 +83,10 @@ describe('writePageThrough', () => {
     expect(res.path).toBe(expectedPath);
     expect(fs.existsSync(expectedPath)).toBe(true);
 
-    // Content is the canonical serialization of the saved row (the file is
-    // rendered FROM the row, so the sinks can't diverge).
-    const page = await engine.getPage(slug, { sourceId: 'default' });
-    const tags = await engine.getTags(slug, { sourceId: 'default' });
-    const expected = serializePageToMarkdown(page!, tags, {
-      frontmatterOverrides: { source_kind: 'lsd' },
-    });
-    expect(fs.readFileSync(expectedPath, 'utf8')).toBe(expected);
+    // File bytes are the stored canonical projection, not a second render.
+    const projection = await loadCanonicalProjection(engine, 'default', slug);
+    expect(projection).not.toBeNull();
+    expect(fs.readFileSync(expectedPath, 'utf8')).toBe(projection!.content);
 
     // Atomic write left no temp sibling.
     const dir = path.dirname(expectedPath);

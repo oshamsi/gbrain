@@ -2,10 +2,10 @@
  * Shared disk write-through for the canonical ingestion path.
  *
  * After a page row lands in the DB (via importFromContent / putPage), this
- * renders the row to markdown via `serializePageToMarkdown` and writes it to
- * `sync.repo_path` so the brain repo has a committable `.md` artifact that
- * round-trips cleanly through `gbrain sync`. The file is rendered FROM the DB
- * row, so the two sinks cannot diverge.
+ * writes `pages.canonical_content` verbatim to `sync.repo_path` so the brain
+ * repo has a committable `.md` artifact that is byte-equal to the stored
+ * projection and to trusted get_page content. Callers must not pass
+ * frontmatterOverrides or a second clock.
  *
  * Extracted from the v0.38 `put_page` write-through (operations.ts) so the
  * `put_page` op AND `gbrain brainstorm/lsd --save` share one implementation
@@ -18,16 +18,20 @@
  * import-checkpoint.ts / op-checkpoint.ts.
  *
  * Trust gating (subagent sandbox, dry-run) stays at the CALLER — this helper
- * only does "row exists + repo is a real dir → render + atomic write".
+ * only does "row exists + repo is a real dir → stored canonical bytes + atomic write".
  */
 
 import { existsSync, statSync, mkdirSync, writeFileSync, renameSync, unlinkSync, readdirSync, readFileSync } from 'fs';
 import { basename, dirname, isAbsolute, join, relative, resolve } from 'path';
 import { randomBytes } from 'crypto';
 import type { BrainEngine } from './engine.ts';
-import { serializePageToMarkdown, resolvePageFilePath, resolveSourceLocalFilePath, parseMarkdown } from './markdown.ts';
-import { contentHash } from './utils.ts';
+import { resolvePageFilePath, resolveSourceLocalFilePath } from './markdown.ts';
 import { isWriteTargetContained, msysToNativePath } from './path-confine.ts';
+import {
+  loadCanonicalProjection,
+  persistCanonicalProjectionFromRow,
+  sha256Utf8,
+} from './page-canonical.ts';
 import {
   isDurabilityHardened, commitWriteThroughFile, currentBranch, getLastPushOutcome,
   type PushLogOutcome,
@@ -94,8 +98,6 @@ export interface WriteThroughResult {
 
 export interface WritePageThroughOpts {
   sourceId?: string;
-  /** Merged over the page's own frontmatter at render time (e.g. provenance). */
-  frontmatterOverrides?: Record<string, unknown>;
   logger?: WriteThroughLogger;
 }
 
@@ -306,10 +308,11 @@ export async function resolvePageWriteTarget(
 }
 
 /**
- * Render the DB row for `slug` to markdown and atomically write it under
- * `sync.repo_path`. Never throws — failures are reported via the result's
+ * Write the stored canonical projection for `slug` atomically under the
+ * resolved repo path. Never throws — failures are reported via the result's
  * `skipped` / `error` fields (the DB write is the durable sink; the file is
- * best-effort and reconciled by the next `gbrain sync`).
+ * best-effort and reconciled by the next `gbrain sync`). Full success still
+ * requires sha256(file) === pages.canonical_sha256 after rename.
  */
 export async function writePageThrough(
   engine: BrainEngine,
@@ -337,10 +340,15 @@ export async function writePageThrough(
       return { written: false, skipped: 'page_not_found_after_write' };
     }
 
-    const tags = await engine.getTags(slug, { sourceId });
-    const md = serializePageToMarkdown(writtenPage, tags, {
-      frontmatterOverrides: opts.frontmatterOverrides,
-    });
+    let projection = await loadCanonicalProjection(engine, sourceId, slug);
+    if (!projection) {
+      projection = {
+        ...(await persistCanonicalProjectionFromRow(engine, sourceId, slug)),
+        inputGeneration: null,
+        basisGeneration: null,
+      };
+    }
+    const md = projection.content;
 
     // #2831: two distinct DB slugs differing only by case (FOO vs foo) resolve
     // to the SAME file on a case-insensitive filesystem — the second write
@@ -389,6 +397,11 @@ export async function writePageThrough(
       throw writeErr;
     }
 
+    const onDisk = readFileSync(filePath);
+    if (sha256Utf8(onDisk) !== projection.sha256 || onDisk.length !== projection.sizeBytes) {
+      return { written: false, error: 'post_write_digest_mismatch', path: filePath };
+    }
+
     // #2426: on a durability-hardened repo (user ran `gbrain sources harden`),
     // commit the artifact so it reaches git — pre-fix, write-through content
     // stayed uncommitted forever: never pushed, `last_sync_at` frozen, and
@@ -428,14 +441,13 @@ export interface FileProjectionResult extends WriteThroughResult {
 }
 
 /**
- * Semantic no-op file fence: compare the resolved canonical file's parsed
- * hash to the store. Rewrite from the DB row only when the file is missing
- * or divergent. Healthy files are not restamped (no ingested_at bump).
+ * Raw-byte file fence: compare file SHA/size to the stored canonical digest.
+ * Rewrite only on mismatch/missing using stored canonical_content.
  */
 export async function verifyOrRepairPageFile(
   engine: BrainEngine,
   slug: string,
-  storeHash: string,
+  _storeHash: string,
   opts: WritePageThroughOpts = {},
 ): Promise<FileProjectionResult> {
   const sourceId = opts.sourceId ?? 'default';
@@ -447,63 +459,20 @@ export async function verifyOrRepairPageFile(
     return { written: false, skipped: target.skipped, file_status: 'not_projected', file_repaired: false };
   }
   const { filePath } = target;
+  let projection = await loadCanonicalProjection(engine, sourceId, slug);
+  if (!projection) {
+    try {
+      const built = await persistCanonicalProjectionFromRow(engine, sourceId, slug);
+      projection = { ...built, inputGeneration: null, basisGeneration: null };
+    } catch {
+      return { written: false, error: 'canonical_projection_missing', file_status: 'repair_failed', file_repaired: false };
+    }
+  }
   let needsRepair = !existsSync(filePath);
   if (!needsRepair) {
     try {
-      const raw = readFileSync(filePath, 'utf8');
-      const parsed = parseMarkdown(raw, `${slug}.md`, { validate: true });
-      if (parsed.errors?.some((error) => error.code === 'YAML_PARSE')) {
-        needsRepair = true;
-      } else {
-        const page = await engine.getPage(slug, { sourceId });
-        if (parsed.typeExplicit !== true && page?.type) {
-          parsed.type = page.type;
-        }
-        parsed.tags.sort();
-        const diskAsIs = contentHash({
-          title: parsed.title,
-          type: parsed.type,
-          compiled_truth: parsed.compiled_truth,
-          timeline: parsed.timeline,
-          frontmatter: parsed.frontmatter,
-          tags: parsed.tags,
-        });
-        const storeRehash = page
-          ? contentHash({
-              title: page.title,
-              type: page.type,
-              compiled_truth: page.compiled_truth,
-              timeline: page.timeline,
-              frontmatter: (page.frontmatter ?? {}) as Record<string, unknown>,
-              tags: parsed.tags,
-            })
-          : null;
-        if (diskAsIs === storeHash || (storeRehash !== null && diskAsIs === storeRehash)) {
-          needsRepair = false;
-        } else {
-          // Compatibility path for older files that carry write-through
-          // provenance stamps not present on the stored frontmatter.
-          // Strip a key only when the store row itself lacks it — live
-          // tracker pages keep ingested_via/source_kind in BOTH planes.
-          const storeFm = (page?.frontmatter ?? {}) as Record<string, unknown>;
-          const fm = { ...parsed.frontmatter };
-          if (!Object.prototype.hasOwnProperty.call(storeFm, 'ingested_via')) {
-            delete fm.ingested_via;
-          }
-          if (!Object.prototype.hasOwnProperty.call(storeFm, 'source_kind')) {
-            delete fm.source_kind;
-          }
-          const compat = contentHash({
-            title: parsed.title,
-            type: parsed.type,
-            compiled_truth: parsed.compiled_truth,
-            timeline: parsed.timeline,
-            frontmatter: fm,
-            tags: parsed.tags,
-          });
-          needsRepair = compat !== storeHash && (storeRehash === null || compat !== storeRehash);
-        }
-      }
+      const onDisk = readFileSync(filePath);
+      needsRepair = sha256Utf8(onDisk) !== projection.sha256 || onDisk.length !== projection.sizeBytes;
     } catch {
       needsRepair = true;
     }
@@ -517,8 +486,6 @@ export async function verifyOrRepairPageFile(
       file_repaired: false,
     };
   }
-  // Project the stored row. Do not pass provenance overrides — repair is
-  // not a new ingest and must not restamp ingested_at on a rewrite.
   const result = await writePageThrough(engine, slug, {
     sourceId,
     logger: opts.logger,

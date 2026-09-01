@@ -5,8 +5,39 @@
  * ../operations.ts. Never import from '../operations.ts' here (cycle).
  */
 
-import type { Operation } from './contract.ts';
+import type { Operation, OperationContext } from './contract.ts';
 import { enforceClientSlugFence, sourceScopeOpts } from './context.ts';
+import { withPutPageOperationLock } from './put-page-lock.ts';
+import { persistCanonicalProjectionFromRow } from '../page-canonical.ts';
+import { verifyOrRepairPageFile } from '../write-through.ts';
+import type { BrainEngine } from '../engine.ts';
+
+async function mutateTagAndProject(
+  ctx: OperationContext,
+  slug: string,
+  mutate: (tx: BrainEngine, sourceId: string) => Promise<void>,
+): Promise<Record<string, unknown>> {
+  const sourceId = ctx.sourceId ?? 'default';
+  return withPutPageOperationLock(ctx.engine, sourceId, slug, async () => {
+    await ctx.engine.transaction(async (tx) => {
+      await mutate(tx, sourceId);
+      await persistCanonicalProjectionFromRow(tx, sourceId, slug);
+    });
+    const projection = await verifyOrRepairPageFile(ctx.engine, slug, '', {
+      sourceId,
+      logger: ctx.logger,
+    });
+    const notProjected = projection.file_status === 'not_projected';
+    const healthy = projection.file_status === 'healthy' || projection.skipped === 'unchanged';
+    const partial = !notProjected && !healthy && projection.file_status === 'repair_failed';
+    return {
+      status: partial ? 'partial' : 'ok',
+      write_through: projection,
+      file_status: projection.file_status,
+      ...(partial ? { partial: true } : {}),
+    };
+  });
+}
 
 // --- Tags ---
 
@@ -22,10 +53,11 @@ const add_tag: Operation = {
   handler: async (ctx, p) => {
     enforceClientSlugFence(ctx, p.slug as string, 'add_tag');
     if (ctx.dryRun) return { dry_run: true, action: 'add_tag', slug: p.slug, tag: p.tag };
-    // v0.31.8 (D7): thread ctx.sourceId.
-    const sourceOpts = ctx.sourceId ? { sourceId: ctx.sourceId } : {};
-    await ctx.engine.addTag(p.slug as string, p.tag as string, sourceOpts);
-    return { status: 'ok' };
+    const slug = p.slug as string;
+    const tag = p.tag as string;
+    return mutateTagAndProject(ctx, slug, async (tx, sourceId) => {
+      await tx.addTag(slug, tag, { sourceId });
+    });
   },
   cliHints: { name: 'tag', positional: ['slug', 'tag'] },
 };
@@ -42,9 +74,11 @@ const remove_tag: Operation = {
   handler: async (ctx, p) => {
     enforceClientSlugFence(ctx, p.slug as string, 'remove_tag');
     if (ctx.dryRun) return { dry_run: true, action: 'remove_tag', slug: p.slug, tag: p.tag };
-    const sourceOpts = ctx.sourceId ? { sourceId: ctx.sourceId } : {};
-    await ctx.engine.removeTag(p.slug as string, p.tag as string, sourceOpts);
-    return { status: 'ok' };
+    const slug = p.slug as string;
+    const tag = p.tag as string;
+    return mutateTagAndProject(ctx, slug, async (tx, sourceId) => {
+      await tx.removeTag(slug, tag, { sourceId });
+    });
   },
   cliHints: { name: 'untag', positional: ['slug', 'tag'] },
 };

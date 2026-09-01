@@ -2589,6 +2589,8 @@ async function stampDreamProvenance(
           ...(raw_source ? { raw_source } : {}),
         }],
       );
+      const { persistCanonicalProjectionFromRow } = await import('../page-canonical.ts');
+      await persistCanonicalProjectionFromRow(engine, source_id, slug);
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       process.stderr.write(`[dream] provenance stamp ${slug}@${source_id} failed: ${msg}\n`);
@@ -2610,9 +2612,14 @@ async function reverseWriteRefs(
     validateSourceId(source_id);
     const page = await engine.getPage(slug, { sourceId: source_id });
     if (!page) continue;
-    const tags = await engine.getTags(slug, { sourceId: source_id });
     try {
-      const md = renderPageToMarkdown(page, tags);
+      const { loadCanonicalProjection, persistCanonicalProjectionFromRow } = await import('../page-canonical.ts');
+      let projection = await loadCanonicalProjection(engine, source_id, slug);
+      if (!projection) {
+        const built = await persistCanonicalProjectionFromRow(engine, source_id, slug);
+        projection = { ...built, inputGeneration: null, basisGeneration: null };
+      }
+      const md = projection.content;
       // v0.32.8 F6: foreign-source pages land at brainDir/.sources/<id>/<slug>.md
       // so same-slug-different-source pages don't collide. Pages belonging to
       // the cycle's own source (#1586: brainDir IS that source's checkout —

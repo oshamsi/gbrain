@@ -6184,6 +6184,75 @@ export const MIGRATIONS: Migration[] = [
         ON chat_usage_log (model, created_at);
     `,
   },
+  {
+    version: 141,
+    name: 'pages_canonical_projection',
+    // Canonical stored markdown projection for file-backed pages.
+    // Dual-write columns + generation triggers so doctor can detect a
+    // mutator that forgot to refresh pages.canonical_content. Keep in
+    // sync with src/schema.sql and src/core/pglite-schema.ts.
+    idempotent: true,
+    sql: `
+      ALTER TABLE pages ADD COLUMN IF NOT EXISTS canonical_content TEXT;
+      ALTER TABLE pages ADD COLUMN IF NOT EXISTS canonical_sha256 TEXT;
+      ALTER TABLE pages ADD COLUMN IF NOT EXISTS canonical_size_bytes BIGINT;
+      ALTER TABLE pages ADD COLUMN IF NOT EXISTS canonical_input_generation BIGINT NOT NULL DEFAULT 1;
+      ALTER TABLE pages ADD COLUMN IF NOT EXISTS canonical_basis_generation BIGINT;
+
+      ALTER TABLE pages DROP CONSTRAINT IF EXISTS pages_canonical_projection_ck;
+      ALTER TABLE pages ADD CONSTRAINT pages_canonical_projection_ck CHECK (
+        (canonical_content IS NULL AND canonical_sha256 IS NULL AND canonical_size_bytes IS NULL AND canonical_basis_generation IS NULL)
+        OR
+        (canonical_content IS NOT NULL AND canonical_sha256 IS NOT NULL AND canonical_size_bytes IS NOT NULL AND canonical_basis_generation IS NOT NULL)
+      );
+
+      CREATE OR REPLACE FUNCTION bump_canonical_input_generation_fn() RETURNS trigger SET search_path = pg_catalog, public AS $func$
+      BEGIN
+        IF (TG_OP = 'INSERT') THEN
+          NEW.canonical_input_generation := COALESCE(NEW.canonical_input_generation, 1);
+          RETURN NEW;
+        END IF;
+        IF (OLD.type IS DISTINCT FROM NEW.type)
+           OR (OLD.title IS DISTINCT FROM NEW.title)
+           OR (OLD.compiled_truth IS DISTINCT FROM NEW.compiled_truth)
+           OR (OLD.timeline IS DISTINCT FROM NEW.timeline)
+           OR (OLD.frontmatter IS DISTINCT FROM NEW.frontmatter)
+           OR (OLD.source_kind IS DISTINCT FROM NEW.source_kind)
+           OR (OLD.ingested_via IS DISTINCT FROM NEW.ingested_via)
+           OR (OLD.ingested_at IS DISTINCT FROM NEW.ingested_at)
+        THEN
+          NEW.canonical_input_generation := COALESCE(OLD.canonical_input_generation, 1) + 1;
+        END IF;
+        RETURN NEW;
+      END;
+      $func$ LANGUAGE plpgsql;
+
+      DROP TRIGGER IF EXISTS bump_canonical_input_generation_trg ON pages;
+      CREATE TRIGGER bump_canonical_input_generation_trg
+        BEFORE INSERT OR UPDATE ON pages
+        FOR EACH ROW
+        EXECUTE FUNCTION bump_canonical_input_generation_fn();
+
+      CREATE OR REPLACE FUNCTION bump_canonical_input_on_tag_fn() RETURNS trigger SET search_path = pg_catalog, public AS $func$
+      BEGIN
+        IF TG_OP = 'INSERT' THEN
+          UPDATE pages SET canonical_input_generation = canonical_input_generation + 1 WHERE id = NEW.page_id;
+          RETURN NEW;
+        ELSIF TG_OP = 'DELETE' THEN
+          UPDATE pages SET canonical_input_generation = canonical_input_generation + 1 WHERE id = OLD.page_id;
+          RETURN OLD;
+        END IF;
+        RETURN NULL;
+      END;
+      $func$ LANGUAGE plpgsql;
+
+      DROP TRIGGER IF EXISTS bump_canonical_input_on_tag_trg ON tags;
+      CREATE TRIGGER bump_canonical_input_on_tag_trg
+        AFTER INSERT OR DELETE ON tags
+        FOR EACH ROW
+        EXECUTE FUNCTION bump_canonical_input_on_tag_fn();
+    `,
+  },
 ];
 
 export const LATEST_VERSION = MIGRATIONS.length > 0

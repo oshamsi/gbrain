@@ -12,8 +12,13 @@ import { clampSearchLimit } from '../engine.ts';
 import { PageWriteConflictError } from '../page-cas.ts';
 import type { Page, PageType } from '../types.ts';
 import { DuplicatePageIdentityError, importFromContent, type ImportResult } from '../import-file.ts';
-import { parseMarkdown, serializePageToMarkdown } from '../markdown.ts';
+import { parseMarkdown } from '../markdown.ts';
 import { writePageThrough, verifyOrRepairPageFile, type WriteThroughResult } from '../write-through.ts';
+import {
+  buildCanonicalPageProjection,
+  loadCanonicalProjection,
+  serializeRedactedPageForRead,
+} from '../page-canonical.ts';
 import { extractPageLinks, isAutoLinkEnabled, isAutoTimelineEnabled, isGlobalBasenameEnabled, parseTimelineEntries, makeResolver, type UnresolvedFrontmatterRef } from '../link-extraction.ts';
 // #3190: pack-aware link typing on the put_page auto-link path.
 import { loadActivePackForLocalEngine } from '../schema-pack/best-effort.ts';
@@ -173,11 +178,11 @@ async function dropPrivateSlugs(
 
 const get_page: Operation = {
   name: 'get_page',
-  description: 'Read a page by slug (supports optional fuzzy matching). To edit a page, pass include_content: true — the returned `content` field is the canonical full markdown (frontmatter + body + timeline sentinel); edit THAT and pass it back to put_page to round-trip losslessly. Reassembling compiled_truth/timeline by hand risks dropping sections. Soft-deleted pages are hidden by default; pass include_deleted: true to surface them with deleted_at populated (see v0.26.5 recovery window).',
+  description: 'Read a page by slug (supports optional fuzzy matching). To edit a page, pass include_content: true — trusted/local callers receive the stored canonical markdown bytes (frontmatter + body + timeline sentinel) verbatim; remote callers receive a redacted response-only rendering (`content_redacted: true`) that is never stored. Edit the trusted `content` and pass it back to put_page to round-trip losslessly. Reassembling compiled_truth/timeline by hand risks dropping sections. Soft-deleted pages are hidden by default; pass include_deleted: true to surface them with deleted_at populated (see v0.26.5 recovery window).',
   params: {
     slug: { type: 'string', required: true, description: 'Page slug' },
     fuzzy: { type: 'boolean', description: 'Enable fuzzy slug resolution (default: false)' },
-    include_content: { type: 'boolean', description: '#2225: include the canonical serialized `content` field (frontmatter + body + timeline sentinel) for lossless get→edit→put_page round-trips. Default false — it roughly duplicates compiled_truth + timeline, so read-only callers should not pay for it.' },
+    include_content: { type: 'boolean', description: '#2225: include stored canonical `content` (trusted) or a redacted response-only rendering (remote). Default false — it roughly duplicates compiled_truth + timeline, so read-only callers should not pay for it.' },
     include_deleted: { type: 'boolean', description: 'v0.26.5: surface soft-deleted pages with deleted_at populated (default: false). Used by restore workflows.' },
     source_id: { type: 'string', description: "#4329: scope the lookup to a single source (a multi-source brain can hold the same slug in several sources). Defaults to ctx.sourceId / the caller's grant. '__all__' spans every source for trusted local callers, your granted sources for remote callers." },
   },
@@ -288,19 +293,32 @@ const get_page: Operation = {
     // it" signal it would get from search. The marker is also in frontmatter;
     // this is the clean, documented accessor.
     const content_flag = getContentFlag(page.frontmatter as Record<string, unknown> | null);
-    // #2225: `content` is the canonical serialized markdown (frontmatter +
-    // compiled_truth + `<!-- timeline -->` sentinel + timeline). Clients that
-    // edit-and-put_page this field round-trip losslessly; hand-concatenating
-    // compiled_truth + timeline without the sentinel used to silently destroy
-    // pages.timeline on the next write. Built from visibleBody so the
-    // privacy-fence strip above applies to untrusted readers here too.
-    // Opt-in (include_content: true): get_page is the most-called read op, and
-    // `content` roughly duplicates compiled_truth + timeline — always emitting
-    // it would double every reader's payload for the round-trip minority.
+    // Trusted/local include_content returns pages.canonical_content verbatim
+    // (stored-byte contract). Remote readers get a response-only redacted
+    // rendering that is never stored or assigned canonical_sha256.
+    let content: string | undefined;
+    let contentRedacted = false;
+    let canonicalProjectionMissing = false;
+    if (includeContent) {
+      if (isUntrustedReader) {
+        content = serializeRedactedPageForRead(visibleBody as Page, tags);
+        contentRedacted = true;
+      } else {
+        const projection = await loadCanonicalProjection(ctx.engine, page.source_id, page.slug);
+        if (projection) {
+          content = projection.content;
+        } else {
+          content = buildCanonicalPageProjection(page, tags).content;
+          canonicalProjectionMissing = true;
+        }
+      }
+    }
     return {
       ...visibleBody,
       tags,
-      ...(includeContent ? { content: serializePageToMarkdown(visibleBody as Page, tags) } : {}),
+      ...(includeContent ? { content } : {}),
+      ...(contentRedacted ? { content_redacted: true } : {}),
+      ...(canonicalProjectionMissing ? { canonical_projection_missing: true } : {}),
       ...(resolved_slug ? { resolved_slug } : {}),
       ...(content_flag ? { content_flag } : {}),
     };
@@ -322,7 +340,7 @@ const get_page: Operation = {
  */
 const fetch_page: Operation = {
   name: 'fetch',
-  description: "Fetch the full text of one search result by its `id` (OpenAI deep-research contract: the search/fetch pair). `id` is the page slug stamped on every `search` result. Returns { id, title, text, url, metadata } — `text` is the page's canonical markdown. For the richer gbrain-native read (fuzzy slugs, soft-delete recovery, lossless edit round-trips), use get_page.",
+  description: "Fetch the full text of one search result by its `id` (OpenAI deep-research contract: the search/fetch pair). `id` is the page slug stamped on every `search` result. Returns { id, title, text, url, metadata } — trusted `text` is the stored canonical markdown; remote `text` is a redacted response-only rendering with metadata.content_redacted. For the richer gbrain-native read (fuzzy slugs, soft-delete recovery, lossless edit round-trips), use get_page.",
   params: {
     id: { type: 'string', required: true, description: 'Result id from a prior `search` call (= the page slug).' },
   },
@@ -350,28 +368,43 @@ const fetch_page: Operation = {
     const tags = await ctx.engine.getTags(page.slug, { sourceId: page.source_id });
     // Same privacy boundary as get_page: untrusted readers (ctx.remote ===
     // true — every MCP transport) never see takes or private facts fences.
-    const visibleBody = ctx.remote === false
-      ? page
-      : {
+    const isUntrustedReader = ctx.remote === true;
+    const visibleBody = isUntrustedReader
+      ? {
           ...page,
           compiled_truth: stripFactsFence(
             stripTakesFence(page.compiled_truth),
             { keepVisibility: ['world'] },
           ),
-        };
+        }
+      : page;
+    let text: string;
+    const metadata: Record<string, unknown> = {
+      type: page.type,
+      source_id: page.source_id,
+      updated_at: page.updated_at,
+      tags,
+    };
+    if (isUntrustedReader) {
+      text = serializeRedactedPageForRead(visibleBody as Page, tags);
+      metadata.content_redacted = true;
+    } else {
+      const projection = await loadCanonicalProjection(ctx.engine, page.source_id, page.slug);
+      if (projection) {
+        text = projection.content;
+      } else {
+        text = buildCanonicalPageProjection(page, tags).content;
+        metadata.canonical_projection_missing = true;
+      }
+    }
     return {
       id: page.slug,
       title: page.title,
-      text: serializePageToMarkdown(visibleBody as Page, tags),
+      text,
       // Pages have no public http home; a stable brain-local URI satisfies
       // the contract's citation slot without inventing a fake web URL.
       url: `gbrain://page/${page.source_id}/${page.slug}`,
-      metadata: {
-        type: page.type,
-        source_id: page.source_id,
-        updated_at: page.updated_at,
-        tags,
-      },
+      metadata,
     };
   },
   scope: 'read',
@@ -437,14 +470,16 @@ const put_page: Operation = {
     let provenanceUri: string | null;
     let provenanceVia: string | null;
     if (ctx.remote === false) {
-      // Trusted local caller: honor the client params (may be null/undefined
-      // for legacy local callers that don't set them).
+      // Trusted local caller: honor explicit params. Omitted kind/via stay
+      // null here so incoming-first SQL preserves an existing tuple (CV12).
+      // Defaults for a first write (no stored value) are filled after the
+      // existing-row read below.
       provenanceKind = (p.source_kind as string | undefined) ?? null;
       provenanceUri = (p.source_uri as string | undefined) ?? null;
       provenanceVia = (p.ingested_via as string | undefined) ?? null;
     } else {
-      // Remote caller or unset trust: server stamps. Mirrors the existing
-      // write-through stamping at the file-side (~:637).
+      // Remote caller or unset trust: server stamps. Never honor client
+      // provenance on this path.
       provenanceKind = 'mcp:put_page';
       provenanceUri = null;
       provenanceVia = 'mcp:put_page';
@@ -543,6 +578,15 @@ const put_page: Operation = {
     } catch {
       // Pack load failed; fall through to legacy inferType behavior.
       activePack = undefined;
+    }
+    // S2.1 pulled into S1: local omitted kind/via default to put_page only
+    // when the stored field is absent, so a later omitted write still
+    // preserves the first-write tuple under incoming-first SQL (S2 flips
+    // COALESCE to existing-first).
+    if (ctx.remote === false && (provenanceKind == null || provenanceVia == null)) {
+      const existingProv = currentPage ?? await ctx.engine.getPage(slug, { sourceId: ctx.sourceId ?? 'default' });
+      if (provenanceKind == null && !existingProv?.source_kind) provenanceKind = 'put_page';
+      if (provenanceVia == null && !existingProv?.ingested_via) provenanceVia = 'put_page';
     }
     let result: ImportResult;
     try {
@@ -681,17 +725,10 @@ const put_page: Operation = {
       fileStatus = projection.file_status;
     } else if (!ctx.dryRun && result.status !== 'error' && !isSandboxSubagent) {
       const sourceId = ctx.sourceId ?? 'default';
-      const provenanceVia = ctx.remote === false ? 'put_page' : 'mcp:put_page';
-      // Shared canonical write-through (also used by `gbrain brainstorm/lsd
-      // --save`). Renders the file from the saved DB row and writes it
-      // atomically; never throws (failures land in skipped/error).
+      // Write the stored canonical projection bytes. Provenance is resolved
+      // once before import and stored once; no file-only stamp/clock.
       writeThrough = await writePageThrough(ctx.engine, result.slug, {
         sourceId,
-        frontmatterOverrides: {
-          ingested_via: provenanceVia,
-          ingested_at: new Date().toISOString(),
-          source_kind: provenanceVia,
-        },
         logger: ctx.logger,
       });
     } else if (isSandboxSubagent) {
