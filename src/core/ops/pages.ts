@@ -17,14 +17,21 @@ import {
   importFromContent,
   type ImportResult,
 } from '../import-file.ts';
+import { readFileSync } from 'node:fs';
 import { parseMarkdown } from '../markdown.ts';
-import { writePageThrough, verifyOrRepairPageFile, type WriteThroughResult } from '../write-through.ts';
+import {
+  writePageThrough,
+  verifyOrRepairPageFile,
+  type FileProjectionStatus,
+  type WriteThroughResult,
+} from '../write-through.ts';
 import {
   buildCanonicalPageProjection,
   loadCanonicalProjection,
   persistCanonicalProjectionFromRow,
   projectionIsFresh,
   serializeRedactedPageForRead,
+  sha256Utf8,
 } from '../page-canonical.ts';
 import { extractPageLinks, isAutoLinkEnabled, isAutoTimelineEnabled, isGlobalBasenameEnabled, parseTimelineEntries, makeResolver, type UnresolvedFrontmatterRef } from '../link-extraction.ts';
 // #3190: pack-aware link typing on the put_page auto-link path.
@@ -101,6 +108,132 @@ function pageWriteConflict(slug: string): OperationError {
     `Run get_page for '${slug}' with include_content: true, reapply only the intended edit to that fresh content, then retry with its content_hash as expected_content_hash.`,
   );
 }
+
+type TrustedCanonicalRead = {
+  page: Page;
+  tags: string[];
+  content: string;
+  projectionMissing: boolean;
+  projectionStale: boolean;
+  fileStatus: FileProjectionStatus;
+  fileRepaired: boolean;
+  planesDegraded: boolean;
+};
+
+async function loadTrustedCanonicalRead(
+  ctx: OperationContext,
+  sourceId: string,
+  slug: string,
+  _afterFileRepairForTest?: () => void,
+): Promise<TrustedCanonicalRead> {
+  return withPutPageOperationLock(ctx.engine, sourceId, slug, async () => {
+    let projection = await loadCanonicalProjection(ctx.engine, sourceId, slug);
+    if (!projection || !projectionIsFresh(projection)) {
+      try {
+        projection = await persistCanonicalProjectionFromRow(ctx.engine, sourceId, slug);
+      } catch {
+        projection = await loadCanonicalProjection(ctx.engine, sourceId, slug);
+      }
+    }
+
+    let page = await ctx.engine.getPage(slug, { sourceId });
+    if (!page) throw new OperationError('page_not_found', `Page not found: ${slug}`);
+    let tags = await ctx.engine.getTags(slug, { sourceId });
+
+    if (!projection || !projectionIsFresh(projection)) {
+      return {
+        page,
+        tags,
+        content: buildCanonicalPageProjection(page, tags).content,
+        projectionMissing: projection == null,
+        projectionStale: projection != null,
+        fileStatus: 'repair_failed',
+        fileRepaired: false,
+        planesDegraded: true,
+      };
+    }
+
+    const expectedSha = projection.sha256;
+    let fileStatus: FileProjectionStatus = 'repair_failed';
+    let fileRepaired = false;
+    let verifiedPath: string | undefined;
+    try {
+      const file = await verifyOrRepairPageFile(
+        ctx.engine,
+        slug,
+        projection.semanticContentHash,
+        { sourceId, logger: ctx.logger },
+      );
+      fileStatus = file.file_status;
+      fileRepaired = file.file_repaired;
+      verifiedPath = file.path;
+    } catch {
+      // The response stays useful, but is marked degraded below.
+    }
+
+    // Test seam only: production callers omit it. It pins the otherwise tiny
+    // external-editor window after repair and before the final raw-file fence.
+    _afterFileRepairForTest?.();
+
+    const after = await loadCanonicalProjection(ctx.engine, sourceId, slug);
+    const refreshedPage = await ctx.engine.getPage(slug, { sourceId });
+    if (!refreshedPage) throw new OperationError('page_not_found', `Page not found: ${slug}`);
+    page = refreshedPage;
+    tags = await ctx.engine.getTags(slug, { sourceId });
+
+    const afterFresh = after != null && projectionIsFresh(after);
+    const afterMatchesRow = afterFresh && after.semanticContentHash === page.content_hash;
+    const snapshotStable = afterMatchesRow && after.sha256 === expectedSha;
+    const explicitlyDbOnly = fileStatus === 'not_projected';
+    if (!snapshotStable) {
+      return {
+        page,
+        tags,
+        content: afterMatchesRow
+          ? after!.content
+          : buildCanonicalPageProjection(page, tags).content,
+        projectionMissing: after == null,
+        projectionStale: after != null && !afterMatchesRow,
+        fileStatus: 'repair_failed',
+        fileRepaired: false,
+        planesDegraded: true,
+      };
+    }
+
+    let finalFileMatches = explicitlyDbOnly;
+    if (!explicitlyDbOnly && verifiedPath) {
+      try {
+        const bytes = readFileSync(verifiedPath);
+        finalFileMatches = sha256Utf8(bytes) === after!.sha256
+          && bytes.length === after!.sizeBytes;
+      } catch { finalFileMatches = false; }
+    }
+    if (!finalFileMatches) {
+      return {
+        page,
+        tags,
+        content: after!.content,
+        projectionMissing: false,
+        projectionStale: false,
+        fileStatus: 'repair_failed',
+        fileRepaired: false,
+        planesDegraded: true,
+      };
+    }
+    return {
+      page,
+      tags,
+      content: after!.content,
+      projectionMissing: false,
+      projectionStale: false,
+      fileStatus,
+      fileRepaired,
+      planesDegraded: !explicitlyDbOnly && fileStatus === 'repair_failed',
+    };
+  });
+}
+
+export const __testing = Object.freeze({ loadTrustedCanonicalRead });
 
 /**
  * #4329: parse a per-call `source_id` param. Pre-fix, get_page / delete_page /
@@ -260,7 +393,7 @@ const get_page: Operation = {
     // would otherwise fall back to 'default' for — the wrong source for a
     // non-default page. We already hold the resolved page, so its source is
     // unambiguous.
-    const tags = await ctx.engine.getTags(page.slug, { sourceId: page.source_id });
+    let tags = await ctx.engine.getTags(page.slug, { sourceId: page.source_id });
     // Privacy boundary for the per-token allow-list (v0.28.6 for takes,
     // v0.32.2 for facts).
     //
@@ -285,6 +418,12 @@ const get_page: Operation = {
     //    drops private. World facts are public knowledge by definition;
     //    untrusted readers see them. Private facts never cross the boundary.
     const isUntrustedReader = ctx.remote === true;
+    let trustedRead: TrustedCanonicalRead | undefined;
+    if (includeContent && !isUntrustedReader && !page.deleted_at) {
+      trustedRead = await loadTrustedCanonicalRead(ctx, page.source_id, page.slug);
+      page = trustedRead.page;
+      tags = trustedRead.tags;
+    }
     const visibleBody = isUntrustedReader
       ? {
           ...page,
@@ -306,29 +445,24 @@ const get_page: Operation = {
     let contentRedacted = false;
     let canonicalProjectionMissing = false;
     let canonicalProjectionStale = false;
+    let canonicalFileStatus: FileProjectionStatus | undefined;
+    let canonicalFileRepaired = false;
+    let canonicalPlanesDegraded = false;
     if (includeContent) {
       if (isUntrustedReader) {
         content = serializeRedactedPageForRead(visibleBody as Page, tags);
         contentRedacted = true;
+      } else if (trustedRead) {
+        content = trustedRead.content;
+        canonicalProjectionMissing = trustedRead.projectionMissing;
+        canonicalProjectionStale = trustedRead.projectionStale;
+        canonicalFileStatus = trustedRead.fileStatus;
+        canonicalFileRepaired = trustedRead.fileRepaired;
+        canonicalPlanesDegraded = trustedRead.planesDegraded;
       } else {
-        let projection = await loadCanonicalProjection(ctx.engine, page.source_id, page.slug);
-        if (projection && !projectionIsFresh(projection)) {
-          try {
-            const built = await persistCanonicalProjectionFromRow(ctx.engine, page.source_id, page.slug);
-            projection = { ...built, inputGeneration: built.inputGeneration, basisGeneration: built.basisGeneration };
-          } catch {
-            projection = null;
-          }
-        }
-        if (projection && projectionIsFresh(projection)) {
-          content = projection.content;
-        } else if (projection) {
-          content = buildCanonicalPageProjection(page, tags).content;
-          canonicalProjectionStale = true;
-        } else {
-          content = buildCanonicalPageProjection(page, tags).content;
-          canonicalProjectionMissing = true;
-        }
+        content = buildCanonicalPageProjection(page, tags).content;
+        canonicalProjectionMissing = true;
+        canonicalFileStatus = 'not_projected';
       }
     }
     return {
@@ -338,6 +472,9 @@ const get_page: Operation = {
       ...(contentRedacted ? { content_redacted: true } : {}),
       ...(canonicalProjectionMissing ? { canonical_projection_missing: true } : {}),
       ...(canonicalProjectionStale ? { canonical_projection_stale: true } : {}),
+      ...(canonicalFileStatus ? { canonical_file_status: canonicalFileStatus } : {}),
+      ...(canonicalFileRepaired ? { canonical_file_repaired: true } : {}),
+      ...(canonicalPlanesDegraded ? { canonical_planes_degraded: true } : {}),
       ...(resolved_slug ? { resolved_slug } : {}),
       ...(content_flag ? { content_flag } : {}),
     };
@@ -384,10 +521,14 @@ const fetch_page: Operation = {
       throw new OperationError('page_not_found', `Page not found: ${slug}`, 'Pass an id returned by a `search` call.');
     }
     bumpLastRetrievedAt(ctx.engine, [page.id]);
-    const tags = await ctx.engine.getTags(page.slug, { sourceId: page.source_id });
-    // Same privacy boundary as get_page: untrusted readers (ctx.remote ===
-    // true — every MCP transport) never see takes or private facts fences.
+    let tags = await ctx.engine.getTags(page.slug, { sourceId: page.source_id });
     const isUntrustedReader = ctx.remote === true;
+    let trustedRead: TrustedCanonicalRead | undefined;
+    if (!isUntrustedReader) {
+      trustedRead = await loadTrustedCanonicalRead(ctx, page.source_id, page.slug);
+      page = trustedRead.page;
+      tags = trustedRead.tags;
+    }
     const visibleBody = isUntrustedReader
       ? {
           ...page,
@@ -407,24 +548,12 @@ const fetch_page: Operation = {
       text = serializeRedactedPageForRead(visibleBody as Page, tags);
       metadata.content_redacted = true;
     } else {
-      let projection = await loadCanonicalProjection(ctx.engine, page.source_id, page.slug);
-      if (projection && !projectionIsFresh(projection)) {
-        try {
-          const built = await persistCanonicalProjectionFromRow(ctx.engine, page.source_id, page.slug);
-          projection = { ...built, inputGeneration: built.inputGeneration, basisGeneration: built.basisGeneration };
-        } catch {
-          projection = null;
-        }
-      }
-      if (projection && projectionIsFresh(projection)) {
-        text = projection.content;
-      } else if (projection) {
-        text = buildCanonicalPageProjection(page, tags).content;
-        metadata.canonical_projection_stale = true;
-      } else {
-        text = buildCanonicalPageProjection(page, tags).content;
-        metadata.canonical_projection_missing = true;
-      }
+      text = trustedRead!.content;
+      if (trustedRead!.projectionMissing) metadata.canonical_projection_missing = true;
+      if (trustedRead!.projectionStale) metadata.canonical_projection_stale = true;
+      metadata.canonical_file_status = trustedRead!.fileStatus;
+      if (trustedRead!.fileRepaired) metadata.canonical_file_repaired = true;
+      if (trustedRead!.planesDegraded) metadata.canonical_planes_degraded = true;
     }
     return {
       id: page.slug,

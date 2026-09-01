@@ -35,6 +35,7 @@ import {
   takesRedactedPlaceholder,
 } from '../src/core/takes-fence.ts';
 import { registerSelfWrite, _resetSelfWriteGuardForTest } from '../src/core/self-write-guard.ts';
+import { __testing as pagesTesting } from '../src/core/ops/pages.ts';
 import { createFileWatcherSource } from '../src/core/ingestion/sources/file-watcher.ts';
 import { IngestionTestHarness } from '../src/core/ingestion/test-harness.ts';
 import type { FSWatcher } from 'chokidar';
@@ -285,6 +286,57 @@ describe('canonical-plane adversarial matrix', () => {
       expect(redacted).not.toContain('SECRET');
       expect(redacted).toBe('');
     }
+  });
+
+  test('trusted stale reads repair the file or expose degraded planes', async () => {
+    const slug = 'inbox/stale-trusted-read';
+    await putPage.handler(makeCtx(), {
+      slug, content: '---\ntitle: Stale Read\n---\n\nOLD\n',
+    });
+    const file = path.join(repo, `${slug}.md`);
+    const oldDisk = fs.readFileSync(file, 'utf8');
+    await engine.executeRaw(
+      `UPDATE pages SET compiled_truth=$1, updated_at=now()
+        WHERE source_id=$2 AND slug=$3`,
+      ['NEW\n', 'default', slug],
+    );
+    await engine.executeRaw(
+      `UPDATE sources SET local_path=$1 WHERE id='default'`,
+      [path.join(repo, 'missing-repo')],
+    );
+
+    const degraded = await getPage.handler(makeCtx(), {
+      slug, include_content: true,
+    }) as Record<string, unknown>;
+    expect(degraded.content).toContain('NEW');
+    expect(degraded.canonical_file_status).toBe('repair_failed');
+    expect(degraded.canonical_planes_degraded).toBe(true);
+    expect(fs.readFileSync(file, 'utf8')).toBe(oldDisk);
+
+    await engine.executeRaw(`UPDATE sources SET local_path=$1 WHERE id='default'`, [repo]);
+
+    const raced = await pagesTesting.loadTrustedCanonicalRead(
+      makeCtx(),
+      'default',
+      slug,
+      () => fs.writeFileSync(file, 'EXTERNAL EDIT\n'),
+    );
+    expect(raced.content).toContain('NEW');
+    expect(raced.fileStatus).toBe('repair_failed');
+    expect(raced.planesDegraded).toBe(true);
+    expect(fs.readFileSync(file, 'utf8')).toBe('EXTERNAL EDIT\n');
+
+    const repaired = await fetchPage.handler(makeCtx(), { id: slug }) as {
+      text: string;
+      metadata: Record<string, unknown>;
+    };
+    expect(repaired.metadata.canonical_file_status).toBe('repaired');
+    expect(repaired.metadata.canonical_planes_degraded).toBeUndefined();
+    expect(repaired.metadata.canonical_projection_missing).toBeUndefined();
+    expect(repaired.metadata.canonical_projection_stale).toBeUndefined();
+    expect(repaired.text).toContain('NEW');
+    expect(fs.readFileSync(file, 'utf8')).toBe(repaired.text);
+    expect((await loadCanonicalProjection(engine, 'default', slug))!.content).toBe(repaired.text);
   });
 
   test('--yes rewrites, one literal-path commit, then idempotent zero-change', async () => {
