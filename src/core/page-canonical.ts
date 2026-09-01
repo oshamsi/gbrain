@@ -291,6 +291,9 @@ export async function persistCanonicalProjectionFromRow(
   );
   const row = Array.isArray(rows) ? rows[0] : undefined;
   if (!row) {
+    if (typeof engine.getPage !== 'function') {
+      throw new Error(`persistCanonicalProjectionFromRow: page ${sourceId}/${slug} not found`);
+    }
     const page = await engine.getPage(slug, { sourceId });
     if (!page) {
       throw new Error(`persistCanonicalProjectionFromRow: page ${sourceId}/${slug} not found`);

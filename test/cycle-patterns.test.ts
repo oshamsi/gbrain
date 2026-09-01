@@ -60,9 +60,8 @@ describe('patterns phase wiring', () => {
     expect(patternsSrc).toContain('insufficient_evidence');
   });
 
-  test('reverse-writes pages to disk via serializeMarkdown', () => {
-    expect(patternsSrc).toContain('serializeMarkdown');
-    expect(patternsSrc).toContain('writeFileSync');
+  test('reverse-writes pages to disk via writePageThrough', () => {
+    expect(patternsSrc).toContain('writePageThrough');
   });
 
   test('runs after extract — queries fresh graph', () => {

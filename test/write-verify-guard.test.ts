@@ -220,8 +220,9 @@ describe('post-write read-back verification', () => {
     ) => {
       const count = (slugCallCount.get(s) ?? 0) + 1;
       slugCallCount.set(s, count);
-      // Intercept the read-back call (callCount == 2 for this slug).
-      if (s === slug && count === 2) {
+      // Intercept after the first existing-page probe. put_page now
+      // reads the row more than twice (provenance + import + verify).
+      if (s === slug && count >= 2) {
         return null;
       }
       return originalGetPage(s, opts);

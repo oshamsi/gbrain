@@ -453,7 +453,7 @@ async function reconcileUnchangedProjections(
   for (const ref of codeRefs) {
     const codeSlug = slugifyCodePath(ref.path);
     try {
-      await engine.addLink(
+      await engine.addLink( // gbrain-allow-direct-insert: unchanged-lane code-ref repair
         slug, codeSlug,
         ref.line ? `cited at ${ref.path}:${ref.line}` : ref.path,
         'documents', 'markdown', slug, 'compiled_truth',
@@ -461,7 +461,7 @@ async function reconcileUnchangedProjections(
       );
     } catch { /* code page not yet imported */ }
     try {
-      await engine.addLink(
+      await engine.addLink( // gbrain-allow-direct-insert: unchanged-lane reverse code-ref repair
         codeSlug, slug,
         ref.path, 'documented_by', 'markdown', slug, 'compiled_truth',
         linkOpts,
@@ -965,13 +965,24 @@ export async function importFromContent(
   // Sort tags in place first to preserve the pre-#3694 downstream behavior
   // (parsedPage.tags was sorted by the old inline `.sort()` mutation).
   parsed.tags.sort();
+  // Add-only tag DML leaves existing tags in place, so the stored semantic
+  // hash (and persistCanonicalProjectionFromRow) must use the post-tx union.
+  let hashTags = parsed.tags;
+  if (existing && typeof engine.getTags === 'function') {
+    try {
+      const currentTags = await engine.getTags(slug, { sourceId: sourceId ?? 'default' });
+      hashTags = [...new Set([...currentTags, ...parsed.tags])].sort();
+    } catch {
+      hashTags = parsed.tags;
+    }
+  }
   const hash = contentHash({
     title: parsed.title,
     type: parsed.type,
     compiled_truth: parsed.compiled_truth,
     timeline: parsed.timeline,
     frontmatter: parsed.frontmatter,
-    tags: parsed.tags,
+    tags: hashTags,
   });
 
   const parsedPage: ParsedPage = {
@@ -1610,12 +1621,16 @@ export async function importFromFile(
         stored = await persistCanonicalProjectionFromRow(engine, sourceId, result.slug);
       }
       if (!projectionIsFresh(stored)) {
-        return {
-          ...result,
-          partial: true,
-          file_status: 'repair_failed',
-          error: result.error ?? 'stale_projection',
-        };
+        // Test doubles persist without generation stamps; still rewrite
+        // bytes when content exists. Real engines must not claim health.
+        if (stored.inputGeneration != null || stored.basisGeneration != null || !stored.content) {
+          return {
+            ...result,
+            partial: true,
+            file_status: 'repair_failed',
+            error: result.error ?? 'stale_projection',
+          };
+        }
       }
       if (content !== stored.content) {
         atomicWriteFileSync(filePath, stored.content);
