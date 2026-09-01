@@ -28,7 +28,7 @@ import {
   unlinkSync,
   writeSync,
 } from 'fs';
-import { randomBytes } from 'crypto';
+import { createHash, randomBytes } from 'crypto';
 import { dirname } from 'path';
 
 export interface AtomicWriteOpts {
@@ -39,6 +39,8 @@ export interface AtomicWriteOpts {
    * still parses (backlinks uses parseMarkdown here).
    */
   verify?: (onDisk: string) => void;
+  /** If set, refuse the rename when the current target SHA differs. */
+  expectedTargetHash?: string;
 }
 
 export function atomicWriteFileSync(filePath: string, content: string, opts?: AtomicWriteOpts): void {
@@ -76,6 +78,16 @@ export function atomicWriteFileSync(filePath: string, content: string, opts?: At
     // target's mode across the rename — the pre-wave in-place write kept the
     // inode's mode exactly; this keeps that property.
     if (mode !== null) chmodSync(tmpPath, mode);
+
+    if (opts?.expectedTargetHash) {
+      if (!existsSync(filePath)) {
+        throw new Error('atomic-write: expected target missing');
+      }
+      const actual = createHash('sha256').update(readFileSync(filePath)).digest('hex');
+      if (actual !== opts.expectedTargetHash) {
+        throw new Error('atomic-write: target hash mismatch');
+      }
+    }
     if (opts?.verify) {
       opts.verify(readFileSync(tmpPath, 'utf-8'));
     }

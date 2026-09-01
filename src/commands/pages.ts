@@ -1,12 +1,12 @@
 /**
  * gbrain pages — page-level operator commands. v0.26.5+.
  *
- * The first subcommand: `pages purge-deleted [--older-than HOURS] [--dry-run]`.
- * Manual escape hatch alongside the autopilot purge phase. Hard-deletes pages
- * whose `deleted_at` is older than the cutoff; cascades to content_chunks,
- * page_links, chunk_relations via existing FKs.
+ * Subcommands:
+ *   pages purge-deleted [--older-than HOURS] [--dry-run]
+ *   pages converge-canonical --source <id> [--dry-run | --yes] [--json]
  */
 import type { BrainEngine } from '../core/engine.ts';
+import { formatConvergenceReport, runCanonicalPlaneConvergence } from '../core/page-plane-convergence.ts';
 
 const SOFT_DELETE_TTL_HOURS_DEFAULT = 72;
 
@@ -14,7 +14,6 @@ function parseOlderThanHours(args: string[]): number {
   const idx = args.indexOf('--older-than');
   if (idx === -1 || idx === args.length - 1) return SOFT_DELETE_TTL_HOURS_DEFAULT;
   const raw = args[idx + 1];
-  // Accept bare numbers (hours) or `<N>h` / `<N>d`. Reject anything ambiguous.
   const trimmed = raw.trim();
   const dayMatch = trimmed.match(/^(\d+)d$/);
   if (dayMatch) return Math.max(0, parseInt(dayMatch[1], 10) * 24);
@@ -24,16 +23,20 @@ function parseOlderThanHours(args: string[]): number {
   process.exit(2);
 }
 
+function parseSourceFlag(args: string[]): string | null {
+  const idx = args.indexOf('--source');
+  if (idx === -1 || idx === args.length - 1) return null;
+  const value = args[idx + 1];
+  if (!value || value.startsWith('--')) return null;
+  return value;
+}
+
 async function runPurgeDeleted(engine: BrainEngine, args: string[]): Promise<void> {
   const olderThanHours = parseOlderThanHours(args);
   const dryRun = args.includes('--dry-run');
   const json = args.includes('--json');
 
   if (dryRun) {
-    // Same engine method, same WHERE predicate, same DB now() clock as the
-    // real purge — only the verb differs (SELECT, stays read-only). The old
-    // listPages enumeration capped at 10000 rows (live pages included), so
-    // brains past the cap under-reported the purge set.
     const preview = await engine.purgeDeletedPages(olderThanHours, { dryRun: true });
     if (json) {
       console.log(JSON.stringify({ dry_run: true, older_than_hours: olderThanHours, count: preview.count, slugs: preview.slugs }, null, 2));
@@ -57,6 +60,28 @@ async function runPurgeDeleted(engine: BrainEngine, args: string[]): Promise<voi
   }
 }
 
+async function runConvergeCanonical(engine: BrainEngine, args: string[]): Promise<void> {
+  const sourceId = parseSourceFlag(args);
+  const json = args.includes('--json');
+  const yes = args.includes('--yes');
+  const dryRunFlag = args.includes('--dry-run');
+  if (!sourceId) {
+    console.error('gbrain pages converge-canonical requires --source <source-id>.');
+    process.exit(2);
+  }
+  if (yes && dryRunFlag) {
+    console.error('Pass either --dry-run or --yes, not both.');
+    process.exit(2);
+  }
+  const { report, exitCode } = await runCanonicalPlaneConvergence(engine, {
+    sourceId,
+    yes,
+    json,
+  });
+  console.log(formatConvergenceReport(report, json));
+  if (exitCode !== 0) process.exit(exitCode);
+}
+
 function printHelp(): void {
   console.log(`gbrain pages — page-level operator commands (v0.26.5)
 
@@ -65,6 +90,12 @@ Subcommands:
                                     Hard-delete soft-deleted pages older than the cutoff
                                     (default 72h). Cascades to chunks/links/edges.
                                     Mirror of the autopilot purge phase.
+
+  converge-canonical --source <id> [--dry-run | --yes] [--json]
+                                    Backfill stored canonical projections and rewrite
+                                    existing files that differ. Dry-run is the default;
+                                    refuse mutation without --yes. Never recreates
+                                    missing files.
 
 Notes:
   Soft-delete a page via the MCP \`delete_page\` op. Restore via \`restore_page\`.
@@ -79,6 +110,7 @@ export async function runPages(engine: BrainEngine, args: string[]): Promise<voi
 
   switch (sub) {
     case 'purge-deleted': return runPurgeDeleted(engine, rest);
+    case 'converge-canonical': return runConvergeCanonical(engine, rest);
     case undefined:
     case '--help':
     case '-h':

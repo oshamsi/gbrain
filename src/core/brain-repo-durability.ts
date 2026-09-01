@@ -452,6 +452,30 @@ export function commitWriteThroughFile(repoPath: string, absPath: string, slug: 
 
 // ── Push-state query (D14) ───────────────────────────────────────────────────
 
+export function commitWriteThroughFiles(repoPath: string, absPaths: string[], message: string): string | null {
+  try {
+    const rels: string[] = [];
+    for (const absPath of absPaths) {
+      const rel = relative(repoPath, absPath);
+      if (!rel || rel.startsWith('..') || isAbsolute(rel)) continue;
+      rels.push(rel);
+    }
+    const unique = [...new Set(rels)];
+    if (unique.length === 0) return null;
+    const gitOpts = { stdio: 'ignore', timeout: 60_000, env: { ...process.env, ...GIT_ENV } } as const;
+    execFileSync('git', ['-C', repoPath, 'add', '--', ...unique], gitOpts);
+    execFileSync('git', ['-C', repoPath, 'commit', '--only', '--no-gpg-sign', '-m', message, '--', ...unique], gitOpts);
+    const sha = execFileSync('git', ['-C', repoPath, 'rev-parse', 'HEAD'], {
+      encoding: 'utf8',
+      timeout: 15_000,
+      env: { ...process.env, ...GIT_ENV },
+    }).trim();
+    return sha || null;
+  } catch {
+    return null;
+  }
+}
+
 export type PushLogStatus = 'ok' | 'needs_attention' | 'unknown';
 
 export interface PushLogOutcome {
