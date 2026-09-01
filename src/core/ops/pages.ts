@@ -13,7 +13,7 @@ import { PageWriteConflictError } from '../page-cas.ts';
 import type { Page, PageType } from '../types.ts';
 import { DuplicatePageIdentityError, importFromContent, type ImportResult } from '../import-file.ts';
 import { parseMarkdown, serializePageToMarkdown } from '../markdown.ts';
-import { writePageThrough, type WriteThroughResult } from '../write-through.ts';
+import { writePageThrough, verifyOrRepairPageFile, type WriteThroughResult } from '../write-through.ts';
 import { extractPageLinks, isAutoLinkEnabled, isAutoTimelineEnabled, isGlobalBasenameEnabled, parseTimelineEntries, makeResolver, type UnresolvedFrontmatterRef } from '../link-extraction.ts';
 // #3190: pack-aware link typing on the put_page auto-link path.
 import { loadActivePackForLocalEngine } from '../schema-pack/best-effort.ts';
@@ -657,12 +657,28 @@ const put_page: Operation = {
     // 'dry_run') that never come out of writePageThrough itself — widen the
     // field rather than losing the commit/pushed/lastPushStatus typing.
     let writeThrough: (Omit<WriteThroughResult, 'skipped'> & { skipped?: WriteThroughResult['skipped'] | 'subagent_sandbox' | 'dry_run' | 'unchanged' }) | undefined;
+    let fileRepaired = false;
+    let fileStatus: 'healthy' | 'repaired' | 'repair_failed' | 'not_projected' | undefined;
     const isSandboxSubagent = ctx.viaSubagent === true
       && !(Array.isArray(ctx.allowedSlugPrefixes) && ctx.allowedSlugPrefixes.length > 0);
     const unchangedNoOp = result.status === 'skipped' && result.skip_reason === 'unchanged';
-    if (unchangedNoOp) {
-      // Identical CAS/content: do not restamp ingested_at on the canonical file.
-      writeThrough = { written: false, skipped: 'unchanged' };
+    if (unchangedNoOp && isSandboxSubagent) {
+      writeThrough = { written: false, skipped: 'subagent_sandbox' };
+      fileStatus = 'not_projected';
+    } else if (unchangedNoOp) {
+      const sourceId = ctx.sourceId ?? 'default';
+      const storeHash = (
+        currentPage?.content_hash
+        ?? (await ctx.engine.getPage(result.slug, { sourceId }))?.content_hash
+        ?? ''
+      );
+      const projection = await verifyOrRepairPageFile(ctx.engine, result.slug, storeHash, {
+        sourceId,
+        logger: ctx.logger,
+      });
+      writeThrough = projection;
+      fileRepaired = projection.file_repaired;
+      fileStatus = projection.file_status;
     } else if (!ctx.dryRun && result.status !== 'error' && !isSandboxSubagent) {
       const sourceId = ctx.sourceId ?? 'default';
       const provenanceVia = ctx.remote === false ? 'put_page' : 'mcp:put_page';
@@ -923,7 +939,12 @@ const put_page: Operation = {
       ...(writerLint ? { writer_lint: writerLint } : {}),
       ...(factsQueued ? { facts_backstop: factsQueued } : {}),
       ...(chronicleQueued ? { chronicle_backstop: chronicleQueued } : {}),
-      ...(unchangedNoOp ? { changed: false, no_op: true } : {}),
+      ...(unchangedNoOp ? {
+        changed: false,
+        no_op: true,
+        file_repaired: fileRepaired,
+        ...(fileStatus ? { file_status: fileStatus } : {}),
+      } : {}),
       ...(partial ? { partial: true } : {}),
       ...(writeThrough ? { write_through: writeThrough } : {}),
     };

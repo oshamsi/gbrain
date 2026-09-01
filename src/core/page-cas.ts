@@ -61,3 +61,28 @@ export const PAGE_CAS_UPDATE_SQL = `
     frontmatter, content_hash, created_at, updated_at, effective_date,
     effective_date_source, import_filename, source_kind, source_uri,
     ingested_via, ingested_at`;
+
+/**
+ * Atomic compare-only fence for identical-content CAS.
+ *
+ * Confirms the live row still carries `expectedContentHash` without writing
+ * page fields or bumping `updated_at`. Zero RETURNING rows means the row
+ * moved, vanished, or was tombstoned — callers must fall through to the
+ * normal CAS write, which then conflicts.
+ */
+export const PAGE_CAS_COMPARE_SQL = `
+  UPDATE pages
+     SET slug = slug
+   WHERE source_id = $1 AND slug = $2 AND content_hash = $3
+     AND deleted_at IS NULL
+  RETURNING id`;
+
+export async function pageHashStillMatches(
+  engine: { executeRaw<T = Record<string, unknown>>(sql: string, params?: unknown[]): Promise<T[]> },
+  slug: string,
+  sourceId: string,
+  expectedContentHash: string,
+): Promise<boolean> {
+  const rows = await engine.executeRaw(PAGE_CAS_COMPARE_SQL, [sourceId, slug, expectedContentHash]);
+  return rows.length > 0;
+}

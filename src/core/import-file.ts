@@ -2,7 +2,7 @@ import { readFileSync, statSync, lstatSync } from 'fs';
 import { basename, extname } from 'path';
 import { createHash } from 'crypto';
 import type { BrainEngine, FileSpec } from './engine.ts';
-import { assertExpectedPageHash } from './page-cas.ts';
+import { assertExpectedPageHash, pageHashStillMatches } from './page-cas.ts';
 import { verifyPageReadable } from './page-write-verify.ts';
 import { parseMarkdown } from './markdown.ts';
 import { classifyStoredType } from './schema-pack/type-usage.ts';
@@ -218,6 +218,126 @@ export class DuplicatePageIdentityError extends Error {
       `${ownerSlug}. External page identities must remain unique within a source.`,
     );
     this.name = 'DuplicatePageIdentityError';
+  }
+}
+
+async function enforceExternalIdentityUniqueness(
+  engine: BrainEngine,
+  slug: string,
+  sourceId: string | undefined,
+  hash: string,
+  parsed: { frontmatter: Record<string, unknown> },
+  parsedPage: ParsedPage,
+  opts: { expectedContentHash?: string; forceRechunk?: boolean; sourcePath?: string },
+): Promise<ImportResult | null> {
+  const fmId = (parsed.frontmatter as Record<string, unknown> | undefined)?.id;
+  const fmIdStr = typeof fmId === 'string' && fmId.length > 0 ? fmId : null;
+  if ((opts.expectedContentHash !== undefined || !opts.forceRechunk) && engine.findDuplicatePage) {
+    let dup: { slug: string; id: number } | null = null;
+    try {
+      dup = await engine.findDuplicatePage(sourceId ?? 'default', {
+        hash,
+        frontmatterId: fmIdStr,
+        excludeSlug: slug,
+      });
+    } catch (err) {
+      throw new Error(
+        `[import] dedup pre-check failed for ${opts.sourcePath ?? slug}: ` +
+        `${(err as Error).message}. Re-run import after DB recovery.`
+      );
+    }
+    if (dup && dup.slug !== slug) {
+      const dupPage = await engine.getPage(dup.slug, { sourceId: sourceId ?? 'default' });
+      const dupFmId = (dupPage?.frontmatter as Record<string, unknown> | undefined)?.id;
+      const dupFmIdStr = typeof dupFmId === 'string' && dupFmId.length > 0 ? dupFmId : null;
+      const sameExternalId = fmIdStr !== null && dupFmIdStr === fmIdStr;
+      if (sameExternalId) {
+        if (opts.expectedContentHash !== undefined) {
+          throw new DuplicatePageIdentityError(slug, dup.slug, fmIdStr);
+        }
+        process.stderr.write(
+          `[import] skipping ${opts.sourcePath ?? slug}: identical to ${dup.slug} ` +
+          `(frontmatter.id=${fmIdStr}) in source ${sourceId ?? 'default'}. ` +
+          `Pass --force-rechunk to override.\n`
+        );
+        return { slug: dup.slug, status: 'skipped', chunks: 0, parsedPage };
+      }
+      process.stderr.write(
+        `[import] WARNING: ${opts.sourcePath ?? slug} shares content_hash with ${dup.slug} ` +
+        `(${hash.slice(0, 8)}) but has different frontmatter.id. Indexing both.\n`
+      );
+    }
+  }
+  return null;
+}
+
+async function reconcileUnchangedProjections(
+  engine: BrainEngine,
+  slug: string,
+  sourceId: string | undefined,
+  parsed: { compiled_truth: string; timeline?: string; tags: string[]; frontmatter: Record<string, unknown> },
+  hash: string,
+  opts: { source_kind?: string | null; source_uri?: string | null; ingested_via?: string | null },
+): Promise<void> {
+  const txOpts = { sourceId: sourceId ?? 'default' };
+  for (const tag of parsed.tags) {
+    try {
+      await engine.addTag(slug, tag, txOpts);
+    } catch { /* add-only repair is fail-soft on a semantic no-op */ }
+  }
+  if (opts.source_kind || opts.source_uri || opts.ingested_via) {
+    try {
+      await engine.executeRaw(
+        `UPDATE pages SET
+           source_kind = COALESCE(pages.source_kind, $1),
+           source_uri = COALESCE(pages.source_uri, $2),
+           ingested_via = COALESCE(pages.ingested_via, $3),
+           ingested_at = COALESCE(pages.ingested_at, $4::timestamptz)
+         WHERE source_id = $5 AND slug = $6 AND content_hash = $7 AND deleted_at IS NULL`,
+        [
+          opts.source_kind ?? null,
+          opts.source_uri ?? null,
+          opts.ingested_via ?? null,
+          new Date().toISOString(),
+          sourceId ?? 'default',
+          slug,
+          hash,
+        ],
+      );
+    } catch { /* provenance COALESCE repair is fail-soft */ }
+  }
+  const codeRefs = extractCodeRefs(parsed.compiled_truth + '\n' + (parsed.timeline || ''));
+  const linkOpts = sourceId
+    ? { fromSourceId: sourceId, toSourceId: sourceId, originSourceId: sourceId }
+    : undefined;
+  for (const ref of codeRefs) {
+    const codeSlug = slugifyCodePath(ref.path);
+    try {
+      await engine.addLink(
+        slug, codeSlug,
+        ref.line ? `cited at ${ref.path}:${ref.line}` : ref.path,
+        'documents', 'markdown', slug, 'compiled_truth',
+        linkOpts,
+      );
+    } catch { /* code page not yet imported */ }
+    try {
+      await engine.addLink(
+        codeSlug, slug,
+        ref.path, 'documented_by', 'markdown', slug, 'compiled_truth',
+        linkOpts,
+      );
+    } catch { /* same reason */ }
+  }
+  try {
+    const aliasNorms = normalizeAliasList((parsed.frontmatter as Record<string, unknown>).aliases);
+    await engine.setPageAliases(slug, sourceId ?? 'default', aliasNorms);
+  } catch (e) {
+    if (!isUndefinedTableError(e)) {
+      warnOncePerProcess(
+        'setPageAliases:failed',
+        `[import] page_aliases projection failed (non-fatal): ${e instanceof Error ? e.message : String(e)}`,
+      );
+    }
   }
 }
 
@@ -696,19 +816,41 @@ export async function importFromContent(
     tags: parsed.tags,
   };
 
-  // Identical semantic hash: skip the store write even when CAS supplied
-  // expectedContentHash. Tracker/MCP updates always pass a hash, so the
-  // previous `expectedContentHash === undefined` guard let no-op CAS
-  // rewrites bump updated_at and restamp the canonical file.
+  // External identity uniqueness must run even when the semantic hash is
+  // unchanged — CAS retries previously skipped this check.
+  const duplicateIdentity = await enforceExternalIdentityUniqueness(
+    engine, slug, sourceId, hash, parsed, parsedPage, opts,
+  );
+  if (duplicateIdentity) return duplicateIdentity;
+
+  // Identical semantic hash: skip the store rewrite (no updated_at bump)
+  // after an atomic compare-only fence when CAS supplied a hash. If the
+  // row moved, fall through to the normal CAS write/conflict.
   if (existing?.content_hash === hash && !opts.forceRechunk) {
-    return {
+    const skipResult = {
       slug,
-      status: 'skipped',
+      status: 'skipped' as const,
       chunks: 0,
       parsedPage,
-      skip_reason: 'unchanged',
+      skip_reason: 'unchanged' as const,
       ...(typeWarning ? { type_warning: typeWarning } : {}),
     };
+    if (opts.expectedContentHash !== undefined) {
+      if (typeof engine.executeRaw === 'function') {
+        const stillMatches = await pageHashStillMatches(
+          engine, slug, sourceId ?? 'default', opts.expectedContentHash,
+        );
+        if (stillMatches) {
+          await reconcileUnchangedProjections(engine, slug, sourceId, parsed, hash, opts);
+          return skipResult;
+        }
+        // Row moved after the snapshot: fall through to the normal CAS write.
+      }
+      // No compare-only primitive: do not return no_op; fall through.
+    } else {
+      await reconcileUnchangedProjections(engine, slug, sourceId, parsed, hash, opts);
+      return skipResult;
+    }
   }
 
   // #3694 one-time reconcile: a row written by the PRE-fix putPage formula
@@ -736,76 +878,7 @@ export async function importFromContent(
     }
   }
 
-  // v0.41.13 (#1309) — identity-based cross-slug dedup pre-check.
-  //
-  // Catches the overlapping-ingest-roots bug class: when a user runs
-  // `gbrain import /vault/Subdir/` then later `gbrain import /vault/`,
-  // the same file is ingested under two different slugs (e.g.
-  // `vault/subdir/note` and `vault/note`). The slug-only check above
-  // misses it because the slugs differ; this check identifies the true
-  // duplicate by content_hash OR external frontmatter.id (granola UUID,
-  // ULID, etc.).
-  //
-  // Posture (codex review):
-  //   - SKIP only when frontmatter.id matches (true external duplicate).
-  //   - WARN-ALWAYS when content_hash matches but identity differs (two
-  //     intentional pages that happen to share text — templates, daily
-  //     logs). User decides whether to investigate.
-  //   - FAIL CLOSED on lookup error: a DB throw means we cannot verify
-  //     uniqueness, so throw rather than silently allow a duplicate.
-  //
-  // Soft-deleted rows are excluded at the engine layer (`deleted_at IS NULL`)
-  // so a tombstoned page doesn't block a legitimate re-import.
-  // Test doubles that don't implement `findDuplicatePage` fall through
-  // via the `?.` shape — no failure mode for fake engines.
-  const fmId = (parsed.frontmatter as Record<string, unknown> | undefined)?.id;
-  const fmIdStr = typeof fmId === 'string' && fmId.length > 0 ? fmId : null;
-  // A CAS edit must stay on its named slug, but it must not bypass external
-  // identity uniqueness. In CAS mode we still inspect another live owner and
-  // reject a conflicting frontmatter.id instead of redirecting/skipping the
-  // requested update. forceRechunk retains its historical bypass only for
-  // non-CAS bulk maintenance.
-  if ((opts.expectedContentHash !== undefined || !opts.forceRechunk) && engine.findDuplicatePage) {
-    let dup: { slug: string; id: number } | null = null;
-    try {
-      dup = await engine.findDuplicatePage(sourceId ?? 'default', {
-        hash,
-        frontmatterId: fmIdStr,
-        excludeSlug: slug,
-      });
-    } catch (err) {
-      throw new Error(
-        `[import] dedup pre-check failed for ${opts.sourcePath ?? slug}: ` +
-        `${(err as Error).message}. Re-run import after DB recovery.`
-      );
-    }
-    if (dup && dup.slug !== slug) {
-      // Look up the duplicate page so we can compare frontmatter.id.
-      const dupPage = await engine.getPage(dup.slug, { sourceId: sourceId ?? 'default' });
-      const dupFmId = (dupPage?.frontmatter as Record<string, unknown> | undefined)?.id;
-      const dupFmIdStr = typeof dupFmId === 'string' && dupFmId.length > 0 ? dupFmId : null;
-      const sameExternalId = fmIdStr !== null && dupFmIdStr === fmIdStr;
-      if (sameExternalId) {
-        if (opts.expectedContentHash !== undefined) {
-          throw new DuplicatePageIdentityError(slug, dup.slug, fmIdStr);
-        }
-        // True duplicate (same external ID). Skip + log to stderr.
-        process.stderr.write(
-          `[import] skipping ${opts.sourcePath ?? slug}: identical to ${dup.slug} ` +
-          `(frontmatter.id=${fmIdStr}) in source ${sourceId ?? 'default'}. ` +
-          `Pass --force-rechunk to override.\n`
-        );
-        return { slug: dup.slug, status: 'skipped', chunks: 0, parsedPage };
-      }
-      // Same content_hash, different (or missing) frontmatter.id.
-      // Surface a warning but proceed with the insert — they may be
-      // legitimate independent pages that happen to share text.
-      process.stderr.write(
-        `[import] WARNING: ${opts.sourcePath ?? slug} shares content_hash with ${dup.slug} ` +
-        `(${hash.slice(0, 8)}) but has different frontmatter.id. Indexing both.\n`
-      );
-    }
-  }
+  // External identity uniqueness ran before the unchanged return above.
 
   // Chunk compiled_truth and timeline.
   // v0.41 content-sanity soft-block: if the gate marked this page as

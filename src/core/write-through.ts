@@ -21,11 +21,12 @@
  * only does "row exists + repo is a real dir → render + atomic write".
  */
 
-import { existsSync, statSync, mkdirSync, writeFileSync, renameSync, unlinkSync, readdirSync } from 'fs';
+import { existsSync, statSync, mkdirSync, writeFileSync, renameSync, unlinkSync, readdirSync, readFileSync } from 'fs';
 import { basename, dirname, isAbsolute, join, relative, resolve } from 'path';
 import { randomBytes } from 'crypto';
 import type { BrainEngine } from './engine.ts';
-import { serializePageToMarkdown, resolvePageFilePath, resolveSourceLocalFilePath } from './markdown.ts';
+import { serializePageToMarkdown, resolvePageFilePath, resolveSourceLocalFilePath, parseMarkdown } from './markdown.ts';
+import { contentHash } from './utils.ts';
 import { isWriteTargetContained, msysToNativePath } from './path-confine.ts';
 import {
   isDurabilityHardened, commitWriteThroughFile, currentBranch, getLastPushOutcome,
@@ -417,4 +418,85 @@ export async function writePageThrough(
     opts.logger?.warn(`[write-through] failed for ${slug}: ${msg}`);
     return { written: false, error: msg };
   }
+}
+
+export type FileProjectionStatus = 'healthy' | 'repaired' | 'repair_failed' | 'not_projected';
+
+export interface FileProjectionResult extends WriteThroughResult {
+  file_status: FileProjectionStatus;
+  file_repaired: boolean;
+}
+
+/**
+ * Semantic no-op file fence: compare the resolved canonical file's parsed
+ * hash to the store. Rewrite from the DB row only when the file is missing
+ * or divergent. Healthy files are not restamped (no ingested_at bump).
+ */
+export async function verifyOrRepairPageFile(
+  engine: BrainEngine,
+  slug: string,
+  storeHash: string,
+  opts: WritePageThroughOpts = {},
+): Promise<FileProjectionResult> {
+  const sourceId = opts.sourceId ?? 'default';
+  if (await isWriteThroughDisabled(engine)) {
+    return { written: false, skipped: 'disabled_by_config', file_status: 'not_projected', file_repaired: false };
+  }
+  const target = await resolvePageWriteTarget(engine, slug, sourceId);
+  if (!target.ok) {
+    return { written: false, skipped: target.skipped, file_status: 'not_projected', file_repaired: false };
+  }
+  const { filePath } = target;
+  let needsRepair = !existsSync(filePath);
+  if (!needsRepair) {
+    try {
+      const raw = readFileSync(filePath, 'utf8');
+      const parsed = parseMarkdown(raw, `${slug}.md`, { validate: true });
+      if (parsed.errors?.some((error) => error.code === 'YAML_PARSE')) {
+        needsRepair = true;
+      } else {
+        const page = await engine.getPage(slug, { sourceId });
+        if (parsed.typeExplicit !== true && page?.type) {
+          parsed.type = page.type;
+        }
+        parsed.tags.sort();
+        // Write-through stamps ingested_via/source_kind onto the file only.
+        // They are not part of the store semantic hash, so strip them before
+        // comparing — otherwise every healthy restamped file looks divergent.
+        const fm = { ...parsed.frontmatter };
+        delete fm.ingested_via;
+        delete fm.source_kind;
+        const diskHash = contentHash({
+          title: parsed.title,
+          type: parsed.type,
+          compiled_truth: parsed.compiled_truth,
+          timeline: parsed.timeline,
+          frontmatter: fm,
+          tags: parsed.tags,
+        });
+        needsRepair = diskHash !== storeHash;
+      }
+    } catch {
+      needsRepair = true;
+    }
+  }
+  if (!needsRepair) {
+    return {
+      written: false,
+      skipped: 'unchanged',
+      path: filePath,
+      file_status: 'healthy',
+      file_repaired: false,
+    };
+  }
+  // Project the stored row. Do not pass provenance overrides — repair is
+  // not a new ingest and must not restamp ingested_at on a rewrite.
+  const result = await writePageThrough(engine, slug, {
+    sourceId,
+    logger: opts.logger,
+  });
+  if (result.written === true) {
+    return { ...result, file_status: 'repaired', file_repaired: true };
+  }
+  return { ...result, file_status: 'repair_failed', file_repaired: false };
 }

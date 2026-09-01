@@ -122,7 +122,7 @@ describe('putPage engine compare-and-swap', () => {
     expect(tombstone?.deleted_at).not.toBeNull();
   });
 
-  test('CAS imports cannot bypass the atomic write on same-hash or legacy-refresh paths', async () => {
+  test('CAS same-hash fences with compare-only (no version snapshot); legacy-refresh CAS still writes', async () => {
     const content = '---\ntype: note\ntitle: CAS page\n---\n\nbase';
     const first = await importFromContent(engine, 'notes/same-hash', content, { noEmbed: true });
     const snapshot = await engine.getPage('notes/same-hash');
@@ -178,6 +178,22 @@ describe('putPage engine compare-and-swap', () => {
     expect((await engine.getPage('notes/hash-only-decoy'))?.compiled_truth).toBe('unrelated decoy');
     expect(await engine.getVersions('notes/target')).toHaveLength(0);
     expect(await engine.getChunks('notes/target')).toHaveLength(0);
+  });
+
+  test('same-hash CAS still rejects a colliding live external identity', async () => {
+    const content = '---\ntype: note\ntitle: CAS page\nid: shared-on-retry\n---\n\nbase';
+    const first = await importFromContent(engine, 'notes/same-hash-id', content, { noEmbed: true });
+    expect(first.status).toBe('imported');
+    await engine.putPage('notes/later-owner', {
+      ...pageBody('other page'), frontmatter: { id: 'shared-on-retry' },
+    });
+    const snapshot = await engine.getPage('notes/same-hash-id');
+    await expect(importFromContent(engine, 'notes/same-hash-id', content, {
+      noEmbed: true,
+      expectedContentHash: snapshot!.content_hash!,
+    })).rejects.toBeInstanceOf(DuplicatePageIdentityError);
+    expect((await engine.getPage('notes/same-hash-id'))?.compiled_truth).toBe('base');
+    expect((await engine.getPage('notes/later-owner'))?.compiled_truth).toBe('other page');
   });
 
   test('CAS read-back treats a different row id as integrity failure, not supersession', async () => {
@@ -405,6 +421,40 @@ describe('put_page operation write lock and ops/tasks guard', () => {
     expect(error.code).toBe('duplicate_identity');
     expect(error.message).not.toContain('private/existing-owner');
     expect((await engine.getPage('notes/new-owner'))?.compiled_truth).toBe('target base');
+  });
+
+  test('atomic operation CAS closes the preflight-to-transaction race for unchanged incoming content', async () => {
+    const slug = 'meetings/toctou-unchanged';
+    const seeded = await engine.putPage(slug, pageBody('base'));
+    const originalGetPage = engine.getPage.bind(engine);
+    let reads = 0;
+    engine.getPage = (async (requested: string, opts?: Parameters<typeof engine.getPage>[1]) => {
+      if (requested !== slug) return originalGetPage(requested, opts);
+      reads += 1;
+      const snapshot = await originalGetPage(requested, opts);
+      if (reads === 2) {
+        await engine.putPage(slug, pageBody('rival won'), {
+          expectedContentHash: snapshot!.content_hash!,
+        });
+      }
+      return snapshot;
+    }) as typeof engine.getPage;
+
+    let error: OperationError;
+    try {
+      error = await expectOperationError({
+        slug,
+        expected_content_hash: seeded.content_hash,
+        content: '---\ntype: note\ntitle: CAS page\n---\n\nbase',
+      });
+    } finally {
+      engine.getPage = originalGetPage;
+    }
+
+    expect(error.code).toBe('write_conflict');
+    expect((await engine.getPage(slug))?.compiled_truth).toBe('rival won');
+    expect(await engine.getVersions(slug)).toHaveLength(0);
+    expect(await engine.getChunks(slug)).toHaveLength(0);
   });
 
   test('atomic operation CAS closes the preflight-to-transaction race without side effects', async () => {

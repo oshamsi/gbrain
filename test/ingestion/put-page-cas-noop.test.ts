@@ -103,11 +103,15 @@ describe('put_page identical CAS is a store/file no-op', () => {
       status?: string;
       changed?: boolean;
       no_op?: boolean;
+      file_repaired?: boolean;
+      file_status?: string;
       partial?: boolean;
       write_through?: { written?: boolean; skipped?: string };
     };
     expect(noop.no_op).toBe(true);
     expect(noop.changed).toBe(false);
+    expect(noop.file_repaired).toBe(false);
+    expect(noop.file_status).toBe('healthy');
     expect(noop.partial).toBeUndefined();
     expect(noop.write_through?.written).toBe(false);
     expect(noop.write_through?.skipped).toBe('unchanged');
@@ -149,5 +153,87 @@ describe('put_page identical CAS is a store/file no-op', () => {
     expect(page2!.updated_at.getTime()).toBeGreaterThan(updated1);
     expect(fs.statSync(filePath).mtimeMs).toBeGreaterThan(mtime1);
     expect(fs.readFileSync(filePath, 'utf8')).toContain('- [ ] checkbox-1');
+  });
+
+  test('same-content CAS repairs a missing canonical file without bumping updated_at', async () => {
+    const ctx = makeCtx();
+    const created = await putPage.handler(ctx, { slug: 'scratch/cas-repair-missing', content: BODY }) as {
+      write_through?: { path?: string };
+    };
+    const filePath = created.write_through!.path!;
+    const page1 = await engine.getPage('scratch/cas-repair-missing');
+    const hash1 = page1!.content_hash!;
+    const updated1 = page1!.updated_at.getTime();
+    fs.unlinkSync(filePath);
+    expect(fs.existsSync(filePath)).toBe(false);
+
+    const repaired = await putPage.handler(ctx, {
+      slug: 'scratch/cas-repair-missing',
+      content: BODY,
+      expected_content_hash: hash1,
+    }) as {
+      no_op?: boolean;
+      file_repaired?: boolean;
+      file_status?: string;
+      partial?: boolean;
+      write_through?: { written?: boolean; path?: string };
+    };
+    expect(repaired.no_op).toBe(true);
+    expect(repaired.file_repaired).toBe(true);
+    expect(repaired.file_status).toBe('repaired');
+    expect(repaired.partial).toBeUndefined();
+    expect(repaired.write_through?.written).toBe(true);
+    expect(fs.existsSync(filePath)).toBe(true);
+    expect(fs.readFileSync(filePath, 'utf8')).toContain('- [x] checkbox-1');
+    const page2 = await engine.getPage('scratch/cas-repair-missing');
+    expect(page2?.content_hash).toBe(hash1);
+    expect(page2!.updated_at.getTime()).toBe(updated1);
+  });
+
+  test('same-content CAS repairs a divergent canonical file without restamping a healthy retry', async () => {
+    const ctx = makeCtx();
+    const created = await putPage.handler(ctx, { slug: 'scratch/cas-repair-stale', content: BODY }) as {
+      write_through?: { path?: string };
+    };
+    const filePath = created.write_through!.path!;
+    const page1 = await engine.getPage('scratch/cas-repair-stale');
+    const hash1 = page1!.content_hash!;
+    const updated1 = page1!.updated_at.getTime();
+    fs.writeFileSync(filePath, BODY_FLIPPED);
+
+    const repaired = await putPage.handler(ctx, {
+      slug: 'scratch/cas-repair-stale',
+      content: BODY,
+      expected_content_hash: hash1,
+    }) as {
+      no_op?: boolean;
+      file_repaired?: boolean;
+      file_status?: string;
+      write_through?: { written?: boolean };
+    };
+    expect(repaired.no_op).toBe(true);
+    expect(repaired.file_repaired).toBe(true);
+    expect(repaired.file_status).toBe('repaired');
+    expect(repaired.write_through?.written).toBe(true);
+    expect(fs.readFileSync(filePath, 'utf8')).toContain('- [x] checkbox-1');
+    expect(fs.readFileSync(filePath, 'utf8')).not.toContain('- [ ] checkbox-1');
+    expect((await engine.getPage('scratch/cas-repair-stale'))!.updated_at.getTime()).toBe(updated1);
+
+    await Bun.sleep(50);
+    const healthy = await putPage.handler(ctx, {
+      slug: 'scratch/cas-repair-stale',
+      content: BODY,
+      expected_content_hash: hash1,
+    }) as {
+      file_repaired?: boolean;
+      file_status?: string;
+      write_through?: { written?: boolean; skipped?: string };
+    };
+    const mtimeAfterRepair = fs.statSync(filePath).mtimeMs;
+    expect(healthy.file_repaired).toBe(false);
+    expect(healthy.file_status).toBe('healthy');
+    expect(healthy.write_through?.written).toBe(false);
+    expect(healthy.write_through?.skipped).toBe('unchanged');
+    expect(fs.statSync(filePath).mtimeMs).toBe(mtimeAfterRepair);
   });
 });
