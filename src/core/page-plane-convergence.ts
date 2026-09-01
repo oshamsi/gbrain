@@ -397,7 +397,7 @@ export async function runCanonicalPlaneConvergence(
       }
     }
 
-    if (mutate) writeJournal(repo, sourceId, head);
+    if (mutate && !readJournal(repo, sourceId)) writeJournal(repo, sourceId, head);
 
     const verifiedPaths: string[] = [];
 
