@@ -27,6 +27,9 @@ import { BrainWriter } from '../src/core/output/writer.ts';
 import type { ResolverContext } from '../src/core/resolvers/interface.ts';
 import { partitionSyncFailures } from '../src/core/sync-failure-ledger.ts';
 import { runImport } from '../src/commands/import.ts';
+import { rejectFailedImportJob } from '../src/commands/jobs.ts';
+import { runQuarantine } from '../src/commands/quarantine.ts';
+import { isQuarantined } from '../src/core/quarantine.ts';
 import { addTakeToPage } from '../src/core/takes-write.ts';
 import { writeTimelineEntryThrough } from '../src/core/timeline-write-through.ts';
 import { __testing as patternsTesting } from '../src/core/cycle/patterns.ts';
@@ -227,6 +230,97 @@ describe('canonical writer closure', () => {
     expect(ran.errors).toBeGreaterThan(0);
     expect(partitionSyncFailures(ran.failures).sentinels.length).toBeGreaterThan(0);
     expect(partitionSyncFailures(ran.failures).fileFailures).toHaveLength(0);
+    expect(() => rejectFailedImportJob(ran)).toThrow(/import job failed/);
+    expect(() => rejectFailedImportJob({
+      errors: 0,
+      failures: [],
+    })).not.toThrow();
+  });
+
+  async function captureQuarantine(fn: () => Promise<void>): Promise<{
+    out: string;
+    exitCode: number | undefined;
+  }> {
+    const origLog = console.log;
+    const origErr = console.error;
+    const origExit = process.exitCode;
+    const lines: string[] = [];
+    console.log = (...args: unknown[]) => { lines.push(args.map(String).join(' ')); };
+    console.error = (...args: unknown[]) => { lines.push(args.map(String).join(' ')); };
+    process.exitCode = 0;
+    try {
+      await fn();
+      return { out: lines.join('\n'), exitCode: process.exitCode };
+    } finally {
+      console.log = origLog;
+      console.error = origErr;
+      process.exitCode = origExit;
+    }
+  }
+
+  test('quarantine clear retry repairs store-new/file-old via the production command', async () => {
+    const slug = 'inbox/clear-retry';
+    const file = path.join(repo, `${slug}.md`);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    const junk = '---\ntitle: Clear Retry\n---\n\nCloudflare Ray ID: abc. junk\n';
+    const clean = '---\ntitle: Clear Retry\n---\n\nplain clean prose.\n';
+    await importFromContent(engine, slug, junk, {
+      noEmbed: true, sourceId: 'default', sourcePath: `${slug}.md`,
+    });
+    await writePageThrough(engine, slug, { sourceId: 'default' });
+    expect(isQuarantined((await engine.getPage(slug, { sourceId: 'default' }))!.frontmatter))
+      .toBe(true);
+    const markedFile = fs.readFileSync(file, 'utf8');
+    expect(markedFile).toContain('quarantine:');
+
+    await importFromContent(engine, slug, clean, {
+      noEmbed: true, sourceId: 'default', sourcePath: `${slug}.md`,
+    });
+    await persistCanonicalProjectionFromRow(engine, 'default', slug);
+    expect(isQuarantined((await engine.getPage(slug, { sourceId: 'default' }))!.frontmatter))
+      .toBe(false);
+    expect(fs.readFileSync(file, 'utf8')).toBe(markedFile);
+
+    const ran = await captureQuarantine(() => runQuarantine(engine, ['clear', slug, '--json']));
+    expect(ran.exitCode).toBe(0);
+    const stored = await loadCanonicalProjection(engine, 'default', slug);
+    expect(stored).not.toBeNull();
+    expect(sha256Utf8(fs.readFileSync(file, 'utf8'))).toBe(stored!.sha256);
+    expect(fs.readFileSync(file, 'utf8')).not.toContain('quarantine:');
+  });
+
+  test('quarantine scan retry repairs store-new/file-old via the production command', async () => {
+    const slug = 'inbox/scan-retry';
+    const file = path.join(repo, `${slug}.md`);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    const junk = '---\ntitle: Scan Retry\n---\n\nCloudflare Ray ID: zzz. This junk predates the gate.\n';
+    await importFromContent(engine, slug, junk, {
+      noEmbed: true, sourceId: 'default', sourcePath: `${slug}.md`,
+    });
+    await persistCanonicalProjectionFromRow(engine, 'default', slug);
+    await writePageThrough(engine, slug, { sourceId: 'default' });
+    const stored = await loadCanonicalProjection(engine, 'default', slug);
+    expect(stored).not.toBeNull();
+    expect(isQuarantined((await engine.getPage(slug, { sourceId: 'default' }))!.frontmatter))
+      .toBe(true);
+    fs.writeFileSync(file, '---\ntitle: Scan Retry\n---\n\nSTALE FILE\n');
+    expect(sha256Utf8(fs.readFileSync(file, 'utf8'))).not.toBe(stored!.sha256);
+
+    const ran = await captureQuarantine(
+      () => runQuarantine(engine, ['scan', '--apply', '--no-embed', '--json']),
+    );
+    expect(ran.exitCode).toBe(0);
+    const jsonStart = ran.out.indexOf('{');
+    const jsonEnd = ran.out.lastIndexOf('}');
+    const payload = JSON.parse(ran.out.slice(jsonStart, jsonEnd + 1)) as {
+      partial?: boolean; write_failures?: unknown[];
+    };
+    expect(payload.partial).toBe(false);
+    expect(payload.write_failures ?? []).toEqual([]);
+    const after = await loadCanonicalProjection(engine, 'default', slug);
+    expect(after).not.toBeNull();
+    expect(sha256Utf8(fs.readFileSync(file, 'utf8'))).toBe(after!.sha256);
+    expect(fs.readFileSync(file, 'utf8')).toContain('quarantine:');
   });
 
   test('Takes without sourceId never mirrors to a same-slug named-source page', async () => {

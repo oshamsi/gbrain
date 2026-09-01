@@ -2071,6 +2071,21 @@ export async function runJobs(engineOrNull: BrainEngine | null, args: string[]):
  *
  * Per the v0.11.1 plan (Codex architecture #5 — tension 3).
  */
+/** Fail the async import job on a partial or hard canonical-file failure. */
+export function rejectFailedImportJob(result: {
+  errors: number;
+  failures: Array<{ path: string; error: string; hard?: boolean }>;
+}): void {
+  if (result.errors > 0 || result.failures.some((failure) => failure.hard === true)) {
+    const hard = result.failures.filter((failure) => failure.hard);
+    throw new Error(
+      hard.length > 0
+        ? `import job failed: ${hard.map((failure) => `${failure.path}: ${failure.error}`).join('; ')}`
+        : `import job failed: errors=${result.errors}`,
+    );
+  }
+}
+
 export async function registerBuiltinHandlers(
   worker: MinionWorker,
   engine: BrainEngine,
@@ -2391,7 +2406,8 @@ export async function registerBuiltinHandlers(
     const importArgs: string[] = [];
     if (job.data.dir) importArgs.push(String(job.data.dir));
     if (job.data.noEmbed) importArgs.push('--no-embed');
-    await runImport(engine, importArgs);
+    const ran = await runImport(engine, importArgs);
+    rejectFailedImportJob(ran);
     return { imported: true };
   });
 

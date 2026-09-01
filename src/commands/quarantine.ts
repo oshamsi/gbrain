@@ -15,7 +15,7 @@ import { isQuarantined, getContentFlag, QUARANTINE_KEY, CONTENT_FLAG_KEY } from 
 import { serializePageToMarkdown, serializeMarkdown } from '../core/markdown.ts';
 import { importFromContent } from '../core/import-file.ts';
 import type { ImportResult } from '../core/import-file.ts';
-import { writePageThrough } from '../core/write-through.ts';
+import { writePageThrough, verifyOrRepairPageFile } from '../core/write-through.ts';
 import type { WriteThroughResult } from '../core/write-through.ts';
 import {
   isWriteThroughDisabled,
@@ -353,7 +353,28 @@ async function runScan(engine: BrainEngine, args: string[]): Promise<void> {
     // Skip pages already marked (idempotent re-runs) — quarantined OR flagged,
     // so --apply doesn't re-chunk/re-embed already-flagged pages every run.
     const pfm = page.frontmatter as Record<string, unknown> | null;
-    if (isQuarantined(pfm) || getContentFlag(pfm)) continue;
+    if (isQuarantined(pfm) || getContentFlag(pfm)) {
+      // Store-new/file-old retry: the marker may already be in the row while
+      // the canonical file is still stale. Verify/repair before treating the
+      // page as a successful no-op.
+      if (apply) {
+        const canonical = await mutateQuarantinePage(
+          engine,
+          ref.slug,
+          ref.source_id,
+          noEmbed,
+          () => ({ noChange: 'page is already marked' }),
+        );
+        if (!canonical.ok) {
+          writeFailures.push({
+            slug: ref.slug,
+            source_id: ref.source_id,
+            error: canonical.error,
+          });
+        }
+      }
+      continue;
+    }
 
     if (!apply) {
       // Dry-run: assess read-only (re-import would mutate). Same thresholds as --apply.
@@ -441,6 +462,28 @@ export const __testing = {
   mutateQuarantinePage,
 };
 
+async function requiredCanonicalFileFailure(
+  engine: BrainEngine,
+  slug: string,
+  sourceId: string,
+): Promise<string | null> {
+  const projection = await loadCanonicalProjection(engine, sourceId, slug);
+  const outcome = await verifyOrRepairPageFile(
+    engine,
+    slug,
+    projection?.semanticContentHash ?? '',
+    { sourceId },
+  );
+  if (outcome.file_status === 'healthy' || outcome.file_status === 'repaired') return null;
+  if (
+    outcome.file_status === 'not_projected'
+    || outcome.skipped === 'disabled_by_config'
+    || outcome.skipped === 'no_repo_configured'
+    || outcome.skipped === 'source_repo_belongs_to_other_source'
+  ) return null;
+  return outcome.error ?? outcome.skipped ?? 'canonical file repair failed';
+}
+
 function requiredWriteFailure(
   result: ImportResult,
   outcome?: WriteThroughResult,
@@ -519,6 +562,8 @@ async function mutateQuarantinePage(
       const freshTags = await engine.getTags(slug, { sourceId });
       const prepared = prepare(freshPage, freshTags);
       if ('noChange' in prepared) {
+        const fileFailure = await requiredCanonicalFileFailure(engine, slug, sourceId);
+        if (fileFailure) return { ok: false, error: fileFailure };
         return { ok: true, noChange: true, message: prepared.noChange };
       }
       const markdown = prepared.markdown;
