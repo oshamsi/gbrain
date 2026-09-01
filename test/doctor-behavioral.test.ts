@@ -152,6 +152,7 @@ describe('buildChecks — orchestrator against PGLite', () => {
       'reranker_health',
       'embedding_width_consistency',
       'autopilot_lock_scope',
+      'store_file_parity',
     ];
     // NOTE: sync_failures and slug_fallback_audit are deliberately NOT in
     // the load-bearing set — they're only pushed when the corresponding

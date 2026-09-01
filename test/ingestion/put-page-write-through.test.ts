@@ -83,6 +83,8 @@ function makeCtx(overrides: Partial<OperationContext> = {}): OperationContext {
 }
 
 const putPage = operations.find((o) => o.name === 'put_page')!;
+const getPage = operations.find((o) => o.name === 'get_page')!;
+const fetchPage = operations.find((o) => o.name === 'fetch')!;
 
 describe('put_page write-through — happy path', () => {
   test('writes the markdown file to disk at brainDir/<slug>.md', async () => {
@@ -123,6 +125,60 @@ describe('put_page write-through — happy path', () => {
     // YAML quotes strings containing `:` so the literal frontmatter line
     // is `ingested_via: 'mcp:put_page'`. Match the value substring.
     expect(onDisk).toMatch(/ingested_via:\s*['"]?mcp:put_page['"]?/);
+  });
+
+  test('local unstamped put_page leaves stored/file/trusted get_page byte-equal', async () => {
+    const { loadCanonicalProjection } = await import('../../src/core/page-canonical.ts');
+    const ctx = makeCtx({ remote: false });
+    const slug = 'inbox/plane-eq-local';
+    await putPage.handler(ctx, { slug, content: '---\ntitle: Plane\n---\n\nunstamped local' });
+    const stored = await loadCanonicalProjection(engine, 'default', slug);
+    expect(stored).not.toBeNull();
+    const file = fs.readFileSync(path.join(brainDir, `${slug}.md`));
+    const trusted = await getPage.handler(makeCtx({ remote: false }), { slug, include_content: true }) as {
+      content?: string;
+      content_redacted?: boolean;
+      canonical_content?: unknown;
+      source_kind?: string | null;
+      ingested_via?: string | null;
+      ingested_at?: Date | null;
+      frontmatter?: Record<string, unknown>;
+    };
+    expect(trusted.content).toBe(stored!.content);
+    expect(file.toString('utf8')).toBe(stored!.content);
+    expect(trusted.content_redacted).toBeUndefined();
+    expect(trusted.canonical_content).toBeUndefined();
+    expect(trusted.source_kind).toBe('put_page');
+    expect(trusted.ingested_via).toBe('put_page');
+    expect(trusted.frontmatter?.source_kind).toBe('put_page');
+    expect(trusted.frontmatter?.ingested_via).toBe('put_page');
+  });
+
+  test('remote get_page/fetch are redacted and never leak stored canonical fields', async () => {
+    const slug = 'inbox/plane-eq-remote';
+    await putPage.handler(makeCtx({ remote: false }), {
+      slug,
+      content: '---\ntitle: Private\n---\n\nsecret body',
+    });
+    const remoteGet = await getPage.handler(makeCtx({ remote: true }), { slug, include_content: true }) as {
+      content?: string;
+      content_redacted?: boolean;
+      canonical_content?: unknown;
+      canonical_sha256?: unknown;
+    };
+    expect(remoteGet.content_redacted).toBe(true);
+    expect(remoteGet.canonical_content).toBeUndefined();
+    expect(remoteGet.canonical_sha256).toBeUndefined();
+    const fetched = await fetchPage.handler(makeCtx({ remote: true }), { id: slug }) as {
+      id: string;
+      text: string;
+      metadata: Record<string, unknown>;
+      canonical_content?: unknown;
+    };
+    expect(fetched.id).toBe(slug);
+    expect(fetched.metadata.content_redacted).toBe(true);
+    expect(fetched.canonical_content).toBeUndefined();
+    expect(Object.keys(fetched).sort()).toEqual(['id', 'metadata', 'text', 'title', 'url'].sort());
   });
 });
 
