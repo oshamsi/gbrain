@@ -106,6 +106,32 @@ export interface ParseResult {
 export const TAKES_FENCE_BEGIN = '<!--- gbrain:takes:begin -->';
 export const TAKES_FENCE_END   = '<!--- gbrain:takes:end -->';
 
+export function takesRedactedPlaceholder(canonicalBody: string): string {
+  const digest = createHash('sha256').update(canonicalBody, 'utf8').digest('hex');
+  return `<!--- gbrain:takes:redacted:${digest} -->`;
+}
+
+/** Remote-response projection only. Never pass its output to storage/hashing. */
+export function redactTakesFenceForRemote(body: string): string {
+  if (typeof body !== 'string') return body;
+  const placeholder = takesRedactedPlaceholder(body);
+  const begins = countLiteral(body, TAKES_FENCE_BEGIN);
+  const ends = countLiteral(body, TAKES_FENCE_END);
+  if (begins === 0 && ends === 0) return body;
+  const beginIdx = body.indexOf(TAKES_FENCE_BEGIN);
+  const endIdx = beginIdx === -1
+    ? -1
+    : body.indexOf(TAKES_FENCE_END, beginIdx + TAKES_FENCE_BEGIN.length);
+  if (begins !== 1 || ends !== 1 || beginIdx === -1 || endIdx === -1) {
+    // Any malformed topology makes the entire body potentially private. A
+    // lone/reversed END marker must not preserve arbitrary bytes before it.
+    return placeholder;
+  }
+  return body.slice(0, beginIdx)
+    + placeholder
+    + body.slice(endIdx + TAKES_FENCE_END.length);
+}
+
 /**
  * Holder grammar (v0.32 — EXP-4). The contract documented on ParsedTake.holder
  * lifted to a runtime check.
@@ -214,11 +240,13 @@ function parseStringCell(raw: string): string | undefined {
 // facts-fence and any future fence-based category. Behavior here is
 // byte-identical to the v0.28-shipped inline versions; the takes-fence
 // test suite is the regression gate.
+import { createHash } from 'node:crypto';
 import {
   parseRowCells,
   isSeparatorRow,
   stripStrikethrough,
   escapeFenceCell as safeFenceCell,
+  countLiteral,
 } from './fence-shared.ts';
 
 function parseSinceCell(raw: string): { since?: string; until?: string } {

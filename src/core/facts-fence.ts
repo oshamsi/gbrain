@@ -46,6 +46,7 @@ import {
   stripStrikethrough,
   parseStringCell,
   escapeFenceCell,
+  countLiteral,
 } from './fence-shared.ts';
 
 // HTML-comment fence markers — verbatim per spec. Same shape as the takes
@@ -466,4 +467,17 @@ export function stripFactsFence(body: string, opts: StripFactsFenceOpts = {}): s
   const kept = facts.filter(f => keep.has(f.visibility));
   const replacement = renderFactsTable(kept);
   return body.slice(0, beginIdx) + replacement + body.slice(endIdx + FACTS_FENCE_END.length);
+}
+
+export function redactFactsFenceForRemote(body: string): string {
+  if (typeof body !== 'string') return body;
+  const begins = countLiteral(body, FACTS_FENCE_BEGIN);
+  const ends = countLiteral(body, FACTS_FENCE_END);
+  if (begins === 0 && ends === 0) return body;
+  const beginIdx = body.indexOf(FACTS_FENCE_BEGIN);
+  const endIdx = body.indexOf(FACTS_FENCE_END);
+  if (begins !== 1 || ends !== 1 || beginIdx === -1 || endIdx < beginIdx) {
+    return ''; // response-only fail closed: expose no bytes of malformed body
+  }
+  return stripFactsFence(body, { keepVisibility: ['world'] });
 }

@@ -21,8 +21,19 @@ import {
   sha256Utf8,
 } from '../src/core/page-canonical.ts';
 import { runCanonicalPlaneConvergence } from '../src/core/page-plane-convergence.ts';
-import { renderFactsTable } from '../src/core/facts-fence.ts';
-import { renderTakesFence } from '../src/core/takes-fence.ts';
+import {
+  FACTS_FENCE_BEGIN,
+  FACTS_FENCE_END,
+  redactFactsFenceForRemote,
+  renderFactsTable,
+} from '../src/core/facts-fence.ts';
+import {
+  TAKES_FENCE_BEGIN,
+  TAKES_FENCE_END,
+  redactTakesFenceForRemote,
+  renderTakesFence,
+  takesRedactedPlaceholder,
+} from '../src/core/takes-fence.ts';
 import { registerSelfWrite, _resetSelfWriteGuardForTest } from '../src/core/self-write-guard.ts';
 import { createFileWatcherSource } from '../src/core/ingestion/sources/file-watcher.ts';
 import { IngestionTestHarness } from '../src/core/ingestion/test-harness.ts';
@@ -85,6 +96,7 @@ function makeCtx(overrides: Partial<OperationContext> = {}): OperationContext {
 const putPage = operations.find((o) => o.name === 'put_page')!;
 const getPage = operations.find((o) => o.name === 'get_page')!;
 const addTag = operations.find((o) => o.name === 'add_tag')!;
+const fetchPage = operations.find((op) => op.name === 'fetch')!;
 
 describe('canonical-plane adversarial matrix', () => {
   test('remote get/put round-trip restores private Facts and Takes', async () => {
@@ -115,7 +127,33 @@ describe('canonical-plane adversarial matrix', () => {
     expect(remote.content).toContain('Public founding year');
     expect(remote.content).not.toContain('Private salary band');
     expect(remote.content).not.toContain('Will ship this quarter');
-    await putPage.handler(makeCtx({ remote: true }), { slug, content: remote.content });
+    const beforeRoundTrip = (await loadCanonicalProjection(
+      engine, 'default', slug,
+    ))!.content;
+    // The production fixture has a marker-only Takes fence: no heading survives
+    // for a reinsertion heuristic. The response must retain exactly one slot.
+    expect(beforeRoundTrip).toContain(TAKES_FENCE_BEGIN);
+    expect(beforeRoundTrip).not.toContain('## Takes');
+    expect(remote.content).not.toContain(TAKES_FENCE_BEGIN);
+    const canonicalPage = await engine.getPage(slug, { sourceId: 'default' });
+    const takesSlot = takesRedactedPlaceholder(canonicalPage!.compiled_truth);
+    expect(remote.content.split(takesSlot)).toHaveLength(2);
+
+    const fetched = await fetchPage.handler(makeCtx({ remote: true }), {
+      id: slug,
+    }) as { text: string };
+    expect(fetched.text.split(takesSlot)).toHaveLength(2);
+    expect(fetched.text).not.toContain(TAKES_FENCE_BEGIN);
+
+    await putPage.handler(makeCtx({ remote: true }), {
+      slug, content: remote.content,
+    });
+    const afterRoundTrip = (await loadCanonicalProjection(
+      engine, 'default', slug,
+    ))!.content;
+    expect(afterRoundTrip).toBe(beforeRoundTrip);
+    expect(fs.readFileSync(path.join(repo, `${slug}.md`), 'utf8'))
+      .toBe(beforeRoundTrip);
     const trusted = await getPage.handler(makeCtx({ remote: false }), { slug, include_content: true }) as {
       content: string;
     };
@@ -124,6 +162,129 @@ describe('canonical-plane adversarial matrix', () => {
     const stored = await loadCanonicalProjection(engine, 'default', slug);
     expect(stored?.content).toContain('Private salary band');
     expect(fs.readFileSync(path.join(repo, `${slug}.md`), 'utf8')).toBe(stored!.content);
+
+    const visibleAgain = await getPage.handler(makeCtx({ remote: true }), {
+      slug, include_content: true,
+    }) as { content: string };
+    const beforeAttack = (await loadCanonicalProjection(engine, 'default', slug))!.content;
+
+    const collidingFacts = renderFactsTable([{
+      rowNum: 2,
+      claim: 'Attacker replacement',
+      kind: 'fact',
+      confidence: 1,
+      visibility: 'world',
+      notability: 'high',
+      active: true,
+    }]);
+    const collisionBody = visibleAgain.content.replace(
+      /<!--- gbrain:facts:begin -->[\s\S]*?<!--- gbrain:facts:end -->/,
+      collidingFacts,
+    );
+    await expect(
+      putPage.handler(makeCtx({ remote: true }), { slug, content: collisionBody }),
+    ).rejects.toMatchObject({ code: 'write_conflict' });
+
+    const attackerTakes = renderTakesFence([{
+      rowNum: 99,
+      claim: 'Attacker take',
+      kind: 'bet',
+      holder: 'brain',
+      weight: 1,
+      active: true,
+    }]);
+    await expect(
+      putPage.handler(makeCtx({ remote: true }), {
+        slug,
+        content: `${visibleAgain.content}\n\n## Takes\n\n${attackerTakes}\n`,
+      }),
+    ).rejects.toMatchObject({ code: 'write_conflict' });
+
+    // Missing/duplicated server placeholder and every malformed real fence fail
+    // before any write. These pin the fail-closed parser path, not only attacks
+    // that happen to contain a well-formed fence.
+    for (const malformed of [
+      visibleAgain.content.replace(takesSlot, ''),
+      visibleAgain.content.replace(
+        takesSlot,
+        `${takesSlot}${takesSlot}`,
+      ),
+      `${visibleAgain.content}\n${FACTS_FENCE_BEGIN}\n| broken |\n`,
+      visibleAgain.content.replace(
+        takesSlot,
+        `${TAKES_FENCE_BEGIN}\n| broken |\n`,
+      ),
+    ]) {
+      await expect(
+        putPage.handler(makeCtx({ remote: true }), { slug, content: malformed }),
+      ).rejects.toMatchObject({ code: 'write_conflict' });
+    }
+
+    expect((await loadCanonicalProjection(engine, 'default', slug))!.content).toBe(beforeAttack);
+    expect(fs.readFileSync(path.join(repo, `${slug}.md`), 'utf8')).toBe(beforeAttack);
+
+    const privateCreate = `---\ntitle: Private Create\n---\n\n${renderFactsTable([{
+      rowNum: 1, claim: 'secret create', kind: 'fact', confidence: 1,
+      visibility: 'private', notability: 'high', active: true,
+    }])}\n`;
+    const takesCreate = `---\ntitle: Takes Create\n---\n\n${attackerTakes}\n`;
+    for (const [newSlug, content] of [
+      ['inbox/remote-private-create', privateCreate],
+      ['inbox/remote-takes-create', takesCreate],
+    ] as const) {
+      await expect(putPage.handler(makeCtx({ remote: true }), {
+        slug: newSlug, content,
+      })).rejects.toMatchObject({ code: 'write_conflict' });
+      expect(await engine.getPage(newSlug, { sourceId: 'default' })).toBeNull();
+    }
+  });
+
+  test('remote fence redactors fail closed on multiple and malformed blocks', () => {
+    const takeA = {
+      rowNum: 1, claim: 'SECRET-A', kind: 'take', holder: 'brain',
+      weight: 1, active: true,
+    } as const;
+    const worldFact = {
+      rowNum: 1, claim: 'PUBLIC', kind: 'fact', confidence: 1,
+      visibility: 'world', notability: 'medium', active: true,
+    } as const;
+    const privateFact = {
+      rowNum: 2, claim: 'PRIVATE-SECOND-BLOCK', kind: 'fact', confidence: 1,
+      visibility: 'private', notability: 'high', active: true,
+    } as const;
+    const oldLiteral = takesRedactedPlaceholder('some other canonical body');
+    const twoTakes = `VISIBLE\n${renderTakesFence([{ ...takeA, claim: 'SECRET-A' }])}\n`
+      + `${renderTakesFence([{ ...takeA, rowNum: 2, claim: 'SECRET-B' }])}\n`;
+    const takesRedacted = redactTakesFenceForRemote(twoTakes);
+    expect(takesRedacted).not.toContain('SECRET-A');
+    expect(takesRedacted).not.toContain('SECRET-B');
+
+    const placeholderCollisionBody = `VISIBLE ${oldLiteral}\n${renderTakesFence([takeA])}\n`;
+    const currentSlot = takesRedactedPlaceholder(placeholderCollisionBody);
+    const collisionRedacted = redactTakesFenceForRemote(placeholderCollisionBody);
+    expect(collisionRedacted).toContain(oldLiteral);
+    expect(collisionRedacted.split(currentSlot)).toHaveLength(2);
+
+    const twoFacts = `${renderFactsTable([worldFact])}\n${renderFactsTable([privateFact])}`;
+    const factsRedacted = redactFactsFenceForRemote(twoFacts);
+    expect(factsRedacted).not.toContain(privateFact.claim);
+
+    for (const malformedTakes of [
+      `TAKES-PREFIX-SECRET\n${TAKES_FENCE_END}`,
+      `${TAKES_FENCE_END}\nTAKES-MIDDLE-SECRET\n${TAKES_FENCE_BEGIN}`,
+    ]) {
+      const redacted = redactTakesFenceForRemote(malformedTakes);
+      expect(redacted).not.toContain('SECRET');
+      expect(redacted).toBe(takesRedactedPlaceholder(malformedTakes));
+    }
+    for (const malformedFacts of [
+      `FACTS-PREFIX-SECRET\n${FACTS_FENCE_END}`,
+      `${FACTS_FENCE_END}\nFACTS-MIDDLE-SECRET\n${FACTS_FENCE_BEGIN}`,
+    ]) {
+      const redacted = redactFactsFenceForRemote(malformedFacts);
+      expect(redacted).not.toContain('SECRET');
+      expect(redacted).toBe('');
+    }
   });
 
   test('--yes rewrites, one literal-path commit, then idempotent zero-change', async () => {

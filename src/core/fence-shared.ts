@@ -96,3 +96,14 @@ export function parseStringCell(raw: string): string | undefined {
 export function escapeFenceCell(s: string): string {
   return s.replace(/\|/g, '\\|');
 }
+
+export function countLiteral(haystack: string, needle: string): number {
+  let count = 0;
+  let cursor = 0;
+  for (;;) {
+    const found = haystack.indexOf(needle, cursor);
+    if (found === -1) return count;
+    count += 1;
+    cursor = found + needle.length;
+  }
+}

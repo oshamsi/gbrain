@@ -11,7 +11,12 @@ import type { BrainEngine } from '../engine.ts';
 import { clampSearchLimit } from '../engine.ts';
 import { PageWriteConflictError } from '../page-cas.ts';
 import type { Page, PageType } from '../types.ts';
-import { DuplicatePageIdentityError, importFromContent, type ImportResult } from '../import-file.ts';
+import {
+  DuplicatePageIdentityError,
+  RemoteHiddenFenceConflictError,
+  importFromContent,
+  type ImportResult,
+} from '../import-file.ts';
 import { parseMarkdown } from '../markdown.ts';
 import { writePageThrough, verifyOrRepairPageFile, type WriteThroughResult } from '../write-through.ts';
 import {
@@ -25,9 +30,9 @@ import { extractPageLinks, isAutoLinkEnabled, isAutoTimelineEnabled, isGlobalBas
 // #3190: pack-aware link typing on the put_page auto-link path.
 import { loadActivePackForLocalEngine } from '../schema-pack/best-effort.ts';
 import { isFactsBackstopEligible } from '../facts/eligibility.ts';
-import { stripTakesFence } from '../takes-fence.ts';
+import { redactTakesFenceForRemote } from '../takes-fence.ts';
 import type { WriterLintPayload } from '../output/post-write.ts';
-import { stripFactsFence } from '../facts-fence.ts';
+import { redactFactsFenceForRemote } from '../facts-fence.ts';
 import { getContentFlag } from '../quarantine.ts';
 import { bumpLastRetrievedAt } from '../last-retrieved.ts';
 import { isValidSourceId, ALL_SOURCES } from '../source-id.ts';
@@ -283,9 +288,8 @@ const get_page: Operation = {
     const visibleBody = isUntrustedReader
       ? {
           ...page,
-          compiled_truth: stripFactsFence(
-            stripTakesFence(page.compiled_truth),
-            { keepVisibility: ['world'] },
+          compiled_truth: redactFactsFenceForRemote(
+            redactTakesFenceForRemote(page.compiled_truth),
           ),
         }
       : page;
@@ -387,9 +391,8 @@ const fetch_page: Operation = {
     const visibleBody = isUntrustedReader
       ? {
           ...page,
-          compiled_truth: stripFactsFence(
-            stripTakesFence(page.compiled_truth),
-            { keepVisibility: ['world'] },
+          compiled_truth: redactFactsFenceForRemote(
+            redactTakesFenceForRemote(page.compiled_truth),
           ),
         }
       : page;
@@ -643,6 +646,14 @@ const put_page: Operation = {
       });
     } catch (error) {
       if (error instanceof PageWriteConflictError) throw pageWriteConflict(slug);
+      if (error instanceof RemoteHiddenFenceConflictError) {
+        ctx.logger.warn(`[put_page] rejected remote hidden-fence conflict on '${slug}' (${error.fence})`);
+        throw new OperationError(
+          'write_conflict',
+          'put_page: this edit conflicts with server-redacted page state; nothing was written.',
+          `Re-read '${slug}', reapply only the visible edit, preserve visible Fact row numbers and the exact Takes redaction slot, and never add a real Takes fence.`,
+        );
+      }
       if (error instanceof DuplicatePageIdentityError) {
         ctx.logger.warn(
           `[put_page] refusing duplicate external identity on '${slug}' (existing owner hidden from client)`,

@@ -50,7 +50,13 @@ import { computeCorpusGeneration, loadSourceRow } from './contextual-retrieval-s
 import { DEFAULT_SYNOPSIS_MODEL } from './page-summary.ts';
 import { runGuardrails } from './guardrails.ts';
 import { FACTS_FENCE_BEGIN, FACTS_FENCE_END, parseFactsFence, renderFactsTable } from './facts-fence.ts';
-import { TAKES_FENCE_BEGIN, TAKES_FENCE_END, parseTakesFence } from './takes-fence.ts';
+import {
+  TAKES_FENCE_BEGIN,
+  TAKES_FENCE_END,
+  parseTakesFence,
+  takesRedactedPlaceholder,
+} from './takes-fence.ts';
+import { countLiteral } from './fence-shared.ts';
 import { scanFencedBlocks, MAX_FENCES_PER_PAGE } from './fence-scan.ts';
 import {
   loadCanonicalProjection,
@@ -133,17 +139,44 @@ function extractFactsFenceBlock(body: string): string | null {
   return body.slice(beginIdx, endIdx + FACTS_FENCE_END.length);
 }
 
-function replaceOrAppendFactsFence(body: string, fenceBlock: string): string {
-  const beginIdx = body.indexOf(FACTS_FENCE_BEGIN);
+function replaceOrInsertFactsFence(
+  body: string,
+  beginMarker: string,
+  endMarker: string,
+  fenceBlock: string,
+): string {
+  const beginIdx = body.indexOf(beginMarker);
   if (beginIdx !== -1) {
-    const endIdx = body.indexOf(FACTS_FENCE_END, beginIdx + FACTS_FENCE_BEGIN.length);
+    const endIdx = body.indexOf(endMarker, beginIdx + beginMarker.length);
     if (endIdx !== -1) {
-      return body.slice(0, beginIdx) + fenceBlock + body.slice(endIdx + FACTS_FENCE_END.length);
+      return body.slice(0, beginIdx)
+        + fenceBlock
+        + body.slice(endIdx + endMarker.length);
     }
+  }
+
+  // Remote serialization is canonical LF, but accept a legacy CRLF response.
+  const lfNeedle = '## Facts\n\n';
+  const crlfNeedle = '## Facts\r\n\r\n';
+  const lfIdx = body.lastIndexOf(lfNeedle);
+  const crlfIdx = body.lastIndexOf(crlfNeedle);
+  const needle = crlfIdx > lfIdx ? crlfNeedle : lfNeedle;
+  const headingIdx = Math.max(lfIdx, crlfIdx);
+  if (headingIdx !== -1) {
+    const insertAt = headingIdx + needle.length;
+    // strip*Fence left the original post-fence newline in place. Do not add
+    // another byte here: this reconstructs the benign canonical input exactly.
+    return body.slice(0, insertAt) + fenceBlock + body.slice(insertAt);
   }
 
   const sep = body.endsWith('\n') ? '\n' : '\n\n';
   return `${body}${sep}## Facts\n\n${fenceBlock}\n`;
+}
+
+function replaceOrAppendFactsFence(body: string, fenceBlock: string): string {
+  return replaceOrInsertFactsFence(
+    body, FACTS_FENCE_BEGIN, FACTS_FENCE_END, fenceBlock,
+  );
 }
 
 function extractTakesFenceBlock(body: string): string | null {
@@ -154,58 +187,113 @@ function extractTakesFenceBlock(body: string): string | null {
   return body.slice(beginIdx, endIdx + TAKES_FENCE_END.length);
 }
 
-function replaceOrAppendTakesFence(body: string, fenceBlock: string): string {
-  const beginIdx = body.indexOf(TAKES_FENCE_BEGIN);
-  if (beginIdx !== -1) {
-    const endIdx = body.indexOf(TAKES_FENCE_END, beginIdx + TAKES_FENCE_BEGIN.length);
-    if (endIdx !== -1) {
-      return body.slice(0, beginIdx) + fenceBlock + body.slice(endIdx + TAKES_FENCE_END.length);
-    }
+export class RemoteHiddenFenceConflictError extends Error {
+  constructor(public readonly fence: 'facts' | 'takes') {
+    // Never include a row number, claim, holder, or count: that is a privacy oracle.
+    super('remote edit conflicts with server-redacted fence state');
+    this.name = 'RemoteHiddenFenceConflictError';
   }
-  const sep = body.endsWith('\n') ? '\n' : '\n\n';
-  return `${body}${sep}## Takes\n\n${fenceBlock}\n`;
 }
 
-/**
- * Remote get_page strips Takes and private Facts. Putting that redacted
- * content back must restore hidden rows so redaction stays response-only.
- * Merge missing private Facts by rowNum/claim; restore the Takes block
- * when the incoming body has no Takes fence.
- */
+function assertZeroOrOneBalancedFence(
+  body: string,
+  begin: string,
+  end: string,
+  kind: 'facts' | 'takes',
+): boolean {
+  const begins = countLiteral(body, begin);
+  const ends = countLiteral(body, end);
+  if (begins === 0 && ends === 0) return false;
+  const beginIdx = body.indexOf(begin);
+  const endIdx = body.indexOf(end);
+  if (begins !== 1 || ends !== 1 || beginIdx === -1 || endIdx < beginIdx) {
+    throw new RemoteHiddenFenceConflictError(kind);
+  }
+  return true;
+}
+
+/** Restore response-redacted state before hashing or writing a remote edit. */
 function restoreRemoteHiddenFences(incomingBody: string, existingBody: string): string {
   let body = incomingBody;
-  const incomingFacts = parseFactsFence(body);
+
+  const existingHasFacts = assertZeroOrOneBalancedFence(
+    existingBody, FACTS_FENCE_BEGIN, FACTS_FENCE_END, 'facts',
+  );
+  const incomingHasFacts = assertZeroOrOneBalancedFence(
+    incomingBody, FACTS_FENCE_BEGIN, FACTS_FENCE_END, 'facts',
+  );
+
+  const existingFactsBlock = extractFactsFenceBlock(existingBody);
   const existingFacts = parseFactsFence(existingBody);
-  if (incomingFacts.warnings.length === 0 && existingFacts.warnings.length === 0) {
-    if (incomingFacts.facts.length === 0 && existingFacts.facts.length > 0) {
-      const existingFenceBlock = extractFactsFenceBlock(existingBody);
-      if (existingFenceBlock) body = replaceOrAppendFactsFence(body, existingFenceBlock);
-    } else {
-      const incomingRowNums = new Set(incomingFacts.facts.map((f) => f.rowNum));
-      const incomingExact = new Set(incomingFacts.facts.map((f) => `${f.rowNum}\0${f.claim}`));
-      const missingPrivate = existingFacts.facts.filter((f) =>
-        f.visibility === 'private'
-        && !incomingExact.has(`${f.rowNum}\0${f.claim}`)
-        && !incomingRowNums.has(f.rowNum),
-      );
-      if (missingPrivate.length > 0) {
-        const merged = [...incomingFacts.facts, ...missingPrivate].sort((a, b) => a.rowNum - b.rowNum);
-        body = replaceOrAppendFactsFence(body, renderFactsTable(merged));
-      }
-    }
+  const incomingFactsBlock = extractFactsFenceBlock(body);
+  const incomingFacts = parseFactsFence(body);
+
+  if (
+    existingFacts.warnings.length > 0
+    || (existingHasFacts && !existingFactsBlock)
+  ) {
+    throw new RemoteHiddenFenceConflictError('facts');
+  }
+  if (
+    incomingFacts.warnings.length > 0
+    || (incomingHasFacts && !incomingFactsBlock)
+  ) {
+    throw new RemoteHiddenFenceConflictError('facts');
+  }
+  if (incomingFacts.facts.some((fact) => fact.visibility !== 'world')) {
+    throw new RemoteHiddenFenceConflictError('facts');
   }
 
-  const incomingTakes = parseTakesFence(body);
+  const hiddenFacts = existingFacts.facts.filter((fact) => fact.visibility === 'private');
+  const hiddenRowNums = new Set(hiddenFacts.map((fact) => fact.rowNum));
+  if (incomingFacts.facts.some((fact) => hiddenRowNums.has(fact.rowNum))) {
+    throw new RemoteHiddenFenceConflictError('facts');
+  }
+  if (hiddenFacts.length > 0) {
+    if (!incomingFactsBlock) {
+      throw new RemoteHiddenFenceConflictError('facts');
+    }
+    const merged = [...incomingFacts.facts, ...hiddenFacts]
+      .sort((a, b) => a.rowNum - b.rowNum);
+    body = replaceOrAppendFactsFence(body, renderFactsTable(merged));
+  }
+
+  // A real Takes fence is never accepted from a remote caller. Exactly one
+  // server-issued response placeholder is required iff the canonical page had
+  // a Takes fence. That both authenticates the redacted slot structurally and
+  // preserves its original byte position without relying on a heading.
+  const existingHasTakes = assertZeroOrOneBalancedFence(
+    existingBody, TAKES_FENCE_BEGIN, TAKES_FENCE_END, 'takes',
+  );
+  const incomingHasTakes = assertZeroOrOneBalancedFence(
+    incomingBody, TAKES_FENCE_BEGIN, TAKES_FENCE_END, 'takes',
+  );
+  const incomingTakesBlock = extractTakesFenceBlock(incomingBody);
+  const incomingTakes = parseTakesFence(incomingBody);
+  if (
+    incomingTakesBlock
+    || incomingTakes.warnings.length > 0
+    || incomingHasTakes
+  ) {
+    throw new RemoteHiddenFenceConflictError('takes');
+  }
+
+  const existingTakesBlock = extractTakesFenceBlock(existingBody);
   const existingTakes = parseTakesFence(existingBody);
   if (
-    incomingTakes.takes.length === 0
-    && incomingTakes.warnings.length === 0
-    && existingTakes.takes.length > 0
-    && existingTakes.warnings.length === 0
+    existingTakes.warnings.length > 0
+    || (existingHasTakes && !existingTakesBlock)
   ) {
-    const existingTakesBlock = extractTakesFenceBlock(existingBody);
-    if (existingTakesBlock) body = replaceOrAppendTakesFence(body, existingTakesBlock);
+    throw new RemoteHiddenFenceConflictError('takes');
   }
+
+  const expectedPlaceholder = takesRedactedPlaceholder(existingBody);
+  const placeholderCount = countLiteral(incomingBody, expectedPlaceholder);
+  if (existingTakesBlock) {
+    if (placeholderCount !== 1) throw new RemoteHiddenFenceConflictError('takes');
+    body = body.replace(expectedPlaceholder, existingTakesBlock);
+  }
+
   return body;
 }
 
@@ -906,8 +994,11 @@ export async function importFromContent(
   // Remote get_page strips Takes and private Facts. Restoring them here
   // keeps redaction response-only across get/edit/put, including when the
   // incoming body still has world Facts (so the fence is not empty).
-  if (opts.remote === true && existing?.compiled_truth) {
-    parsed.compiled_truth = restoreRemoteHiddenFences(parsed.compiled_truth, existing.compiled_truth);
+  if (opts.remote === true) {
+    parsed.compiled_truth = restoreRemoteHiddenFences(
+      parsed.compiled_truth,
+      existing?.compiled_truth ?? '',
+    );
   }
 
   // #1035: absence of an explicit frontmatter `type:` on an EXISTING page
