@@ -16,6 +16,7 @@ import {
   effectiveDbOnlyDirs,
   loadStorageConfig,
 } from './storage-config.ts';
+import { generationKey } from './page-canonical.ts';
 
 export type StoreFileParityReason =
   | 'stale_projection'
@@ -24,7 +25,9 @@ export type StoreFileParityReason =
   | 'missing_file'
   | 'unreadable_file'
   | 'unmeasured'
-  | 'not_projected';
+  | 'not_projected'
+  | 'repo_not_found'
+  | 'path_escapes_source_root';
 
 export type StoreFileParitySample = {
   source_id: string;
@@ -113,8 +116,6 @@ export async function computeStoreFileParity(
     );
     sources = sources.map((s) => ({ ...s, archived: null }));
   }
-  if (opts.sourceId) sources = sources.filter((s) => s.id === opts.sourceId);
-
   const sourceById = new Map(sources.map((s) => [s.id, s]));
   const otherLocalPaths = (selfId: string): Set<string> => {
     const set = new Set<string>();
@@ -144,12 +145,14 @@ export async function computeStoreFileParity(
               canonical_input_generation, canonical_basis_generation,
               canonical_sha256, canonical_size_bytes
          FROM pages
-        WHERE deleted_at IS NULL AND source_id = $1`
+        WHERE deleted_at IS NULL AND source_id = $1
+        ORDER BY source_id, slug`
     : `SELECT source_id, slug, page_kind, source_path, source_uri,
               canonical_input_generation, canonical_basis_generation,
               canonical_sha256, canonical_size_bytes
          FROM pages
-        WHERE deleted_at IS NULL`;
+        WHERE deleted_at IS NULL
+        ORDER BY source_id, slug`;
   const pages = await engine.executeRaw<{
     source_id: string;
     slug: string;
@@ -172,8 +175,9 @@ export async function computeStoreFileParity(
 
   const mark = (source_id: string, slug: string, reason: StoreFileParityReason): void => {
     const key = `${source_id}\0${slug}`;
-    if (reason !== 'not_projected') divergentKeys.add(key);
-    if (samples.length < 64) samples.push({ source_id, slug, reason });
+    if (reason === 'not_projected') return;
+    divergentKeys.add(key);
+    samples.push({ source_id, slug, reason });
   };
 
   for (const page of pages) {
@@ -197,14 +201,23 @@ export async function computeStoreFileParity(
       otherSourceLocalPaths: otherLocalPaths(page.source_id),
     });
     if (!target.ok) {
-      notProjected++;
-      mark(page.source_id, page.slug, 'not_projected');
+      if (target.skipped === 'no_repo_configured' || target.skipped === 'source_repo_belongs_to_other_source') {
+        notProjected++;
+        continue;
+      }
+      eligible++;
+      unread++;
+      mark(
+        page.source_id,
+        page.slug,
+        target.skipped === 'path_escapes_source_root' ? 'path_escapes_source_root' : 'repo_not_found',
+      );
       continue;
     }
 
     eligible++;
-    const inputGen = page.canonical_input_generation == null ? null : Number(page.canonical_input_generation);
-    const basisGen = page.canonical_basis_generation == null ? null : Number(page.canonical_basis_generation);
+    const inputGen = generationKey(page.canonical_input_generation);
+    const basisGen = generationKey(page.canonical_basis_generation);
     if (page.canonical_sha256 == null || page.canonical_size_bytes == null || basisGen == null) {
       unmeasured++;
       mark(page.source_id, page.slug, 'unmeasured');
@@ -267,10 +280,8 @@ export async function computeStoreFileParity(
     }
   }
 
-  samples.sort((a, b) => a.slug.localeCompare(b.slug) || a.source_id.localeCompare(b.source_id));
-  const sample = samples
-    .filter((s) => s.reason !== 'not_projected')
-    .slice(0, 5);
+  samples.sort((a, b) => a.slug.localeCompare(b.slug) || a.source_id.localeCompare(b.source_id) || a.reason.localeCompare(b.reason));
+  const sample = samples.slice(0, 5);
 
   return {
     eligible_pages: eligible,

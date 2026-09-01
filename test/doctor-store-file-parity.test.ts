@@ -107,4 +107,60 @@ describe('computeStoreFileParity', () => {
     expect(report.stale_projections).toBeGreaterThan(0);
     expect(report.divergent_pages).toBeGreaterThan(0);
   });
+
+  test('configured-but-missing repo is divergent, not not_projected', async () => {
+    await importFromContent(engine, 'inbox/lost', '---\ntitle: Lost\n---\n\nbody\n', { noEmbed: true, sourceId: 'default' });
+    await writePageThrough(engine, 'inbox/lost', { sourceId: 'default' });
+    await engine.executeRaw(
+      `UPDATE sources SET local_path = $1 WHERE id = 'default'`,
+      [path.join(tmpRoot, 'does-not-exist')],
+    );
+    const report = await computeStoreFileParity(engine, { sourceId: 'default' });
+    expect(report.not_projected_pages).toBe(0);
+    expect(report.divergent_pages).toBeGreaterThan(0);
+    expect(report.sample.some((s) => s.reason === 'repo_not_found')).toBe(true);
+  });
+
+  test('source-scoped leak guard still sees sibling local_path roots', async () => {
+    const sibling = path.join(tmpRoot, 'sibling');
+    fs.mkdirSync(sibling, { recursive: true });
+    await engine.executeRaw(
+      `INSERT INTO sources (id, name, local_path) VALUES ('beta', 'beta', $1)
+       ON CONFLICT (id) DO UPDATE SET local_path = EXCLUDED.local_path`,
+      [sibling],
+    );
+    await engine.setConfig('sync.repo_path', sibling);
+    await importFromContent(engine, 'inbox/leak', '---\ntitle: Leak\n---\n\nbody\n', { noEmbed: true, sourceId: 'default' });
+    const scoped = await computeStoreFileParity(engine, { sourceId: 'default' });
+    const unscoped = await computeStoreFileParity(engine);
+    expect(scoped.not_projected_pages).toBeGreaterThan(0);
+    expect(scoped.divergent_pages).toBe(0);
+    expect(unscoped.not_projected_pages).toBeGreaterThan(0);
+  });
+
+  test('sample is divergent-only and lexicographically stable', async () => {
+    for (const slug of ['inbox/z-last', 'inbox/a-first', 'inbox/m-mid']) {
+      await importFromContent(engine, slug, `---\ntitle: ${slug}\n---\n\nbody\n`, { noEmbed: true, sourceId: 'default' });
+      await writePageThrough(engine, slug, { sourceId: 'default' });
+      fs.unlinkSync(path.join(brainDir, `${slug}.md`));
+    }
+    const report = await computeStoreFileParity(engine, { sourceId: 'default' });
+    expect(report.sample.every((s) => s.reason !== 'not_projected')).toBe(true);
+    expect(report.sample[0]?.slug).toBe('inbox/a-first');
+  });
+
+  test('BIGINT generations above MAX_SAFE_INTEGER compare losslessly', async () => {
+    await importFromContent(engine, 'inbox/big', '---\ntitle: Big\n---\n\nbody\n', { noEmbed: true, sourceId: 'default' });
+    await writePageThrough(engine, 'inbox/big', { sourceId: 'default' });
+    await engine.executeRaw(
+      `UPDATE pages
+          SET canonical_input_generation = 9007199254740993,
+              canonical_basis_generation = 9007199254740992
+        WHERE slug = $1 AND source_id = $2`,
+      ['inbox/big', 'default'],
+    );
+    const report = await computeStoreFileParity(engine, { sourceId: 'default' });
+    expect(report.stale_projections).toBeGreaterThan(0);
+    expect(report.divergent_pages).toBeGreaterThan(0);
+  });
 });
