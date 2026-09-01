@@ -92,6 +92,14 @@ export const PAGE_CAS_COMPARE_SQL = `
      SET slug = slug
    WHERE source_id = $1 AND slug = $2 AND content_hash = $3
      AND deleted_at IS NULL
+     AND (
+       $4::boolean IS NOT TRUE
+       OR (
+         pages.source_kind IS NOT DISTINCT FROM $5
+         AND pages.ingested_via IS NOT DISTINCT FROM $6
+         AND pages.ingested_at IS NOT DISTINCT FROM $7::timestamptz
+       )
+     )
   RETURNING id`;
 
 export async function pageHashStillMatches(
@@ -99,7 +107,25 @@ export async function pageHashStillMatches(
   slug: string,
   sourceId: string,
   expectedContentHash: string,
+  expectedProvenance?: {
+    source_kind: string | null;
+    ingested_via: string | null;
+    ingested_at: Date | string | null;
+  } | null,
 ): Promise<boolean> {
-  const rows = await engine.executeRaw(PAGE_CAS_COMPARE_SQL, [sourceId, slug, expectedContentHash]);
+  const fence = expectedProvenance != null;
+  const at = expectedProvenance?.ingested_at;
+  const atIso = at == null || at === ''
+    ? null
+    : (at instanceof Date ? at.toISOString() : String(at));
+  const rows = await engine.executeRaw(PAGE_CAS_COMPARE_SQL, [
+    sourceId,
+    slug,
+    expectedContentHash,
+    fence,
+    expectedProvenance?.source_kind ?? null,
+    expectedProvenance?.ingested_via ?? null,
+    atIso,
+  ]);
   return rows.length > 0;
 }

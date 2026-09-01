@@ -61,6 +61,7 @@ import {
   resolveSetOnceProvenance,
   sha256Utf8,
   stripReservedProvenanceKeys,
+  type ProvenanceTuple,
 } from './page-canonical.ts';
 import { atomicWriteFileSync } from './atomic-write.ts';
 import { registerSelfWrite } from './self-write-guard.ts';
@@ -347,44 +348,103 @@ async function enforceExternalIdentityUniqueness(
   return null;
 }
 
+function storedProvenanceString(value: unknown): string | null {
+  if (typeof value !== 'string') return null;
+  const trimmed = value.trim();
+  return trimmed ? trimmed : null;
+}
+
 async function reconcileUnchangedProjections(
   engine: BrainEngine,
   slug: string,
   sourceId: string | undefined,
   parsed: { compiled_truth: string; timeline?: string; tags: string[]; frontmatter: Record<string, unknown> },
   hash: string,
-  opts: { source_kind?: string | null; source_uri?: string | null; ingested_via?: string | null },
+  resolvedProvenance: ProvenanceTuple,
+  opts: { source_uri?: string | null },
 ): Promise<void> {
   const txOpts = { sourceId: sourceId ?? 'default' };
+  const sid = sourceId ?? 'default';
   for (const tag of parsed.tags) {
     try {
       await engine.addTag(slug, tag, txOpts);
     } catch { /* add-only repair is fail-soft on a semantic no-op */ }
   }
-  if (opts.source_kind || opts.source_uri || opts.ingested_via) {
-    try {
-      await engine.executeRaw(
-        `UPDATE pages SET
-           source_kind = COALESCE(pages.source_kind, $1),
-           source_uri = COALESCE(pages.source_uri, $2),
-           ingested_via = COALESCE(pages.ingested_via, $3),
-           ingested_at = COALESCE(pages.ingested_at, $4::timestamptz)
-         WHERE source_id = $5 AND slug = $6 AND content_hash = $7 AND deleted_at IS NULL`,
-        [
-          opts.source_kind ?? null,
-          opts.source_uri ?? null,
-          opts.ingested_via ?? null,
-          new Date().toISOString(),
-          sourceId ?? 'default',
-          slug,
-          hash,
-        ],
-      );
-    } catch { /* provenance COALESCE repair is fail-soft */ }
-  }
   try {
-    const existingProj = await loadCanonicalProjection(engine, sourceId ?? 'default', slug);
-    if (!existingProj) await persistCanonicalProjectionFromRow(engine, sourceId ?? 'default', slug);
+    const snap = await engine.executeRaw<{
+      frontmatter: Record<string, unknown> | string | null;
+      source_kind: string | null;
+      ingested_via: string | null;
+      ingested_at: Date | string | null;
+      content_hash: string | null;
+      canonical_input_generation: string | number | null;
+      updated_at: Date | string | null;
+    }>(
+      `SELECT frontmatter, source_kind, ingested_via, ingested_at, content_hash,
+              canonical_input_generation, updated_at
+         FROM pages
+        WHERE source_id = $1 AND slug = $2 AND deleted_at IS NULL
+        LIMIT 1`,
+      [sid, slug],
+    );
+    const row = Array.isArray(snap) ? snap[0] : undefined;
+    if (row) {
+      const effective: ProvenanceTuple = {
+        source_kind: row.source_kind ?? resolvedProvenance.source_kind,
+        ingested_via: row.ingested_via ?? resolvedProvenance.ingested_via,
+        ingested_at: row.ingested_at == null || row.ingested_at === ''
+          ? resolvedProvenance.ingested_at
+          : (row.ingested_at instanceof Date ? row.ingested_at : new Date(String(row.ingested_at))),
+      };
+      const fm = typeof row.frontmatter === 'string'
+        ? JSON.parse(row.frontmatter) as Record<string, unknown>
+        : { ...(row.frontmatter ?? {}) };
+      const beforeKind = storedProvenanceString(fm.source_kind);
+      const beforeVia = storedProvenanceString(fm.ingested_via);
+      const beforeAt = storedProvenanceString(fm.ingested_at);
+      materializeProvenanceFrontmatter(fm, effective);
+      const colsNeed = (row.source_kind == null && effective.source_kind != null)
+        || (row.ingested_via == null && effective.ingested_via != null)
+        || ((row.ingested_at == null || row.ingested_at === '') && effective.ingested_at != null);
+      const fmNeed = storedProvenanceString(fm.source_kind) !== beforeKind
+        || storedProvenanceString(fm.ingested_via) !== beforeVia
+        || storedProvenanceString(fm.ingested_at) !== beforeAt;
+      if (colsNeed || fmNeed) {
+        const updatedAt = row.updated_at instanceof Date
+          ? row.updated_at.toISOString()
+          : (row.updated_at ?? null);
+        await engine.executeRaw(
+          `UPDATE pages SET
+             source_kind = COALESCE(pages.source_kind, $1),
+             source_uri = COALESCE(pages.source_uri, $2),
+             ingested_via = COALESCE(pages.ingested_via, $3),
+             ingested_at = COALESCE(pages.ingested_at, $4::timestamptz),
+             frontmatter = $5::jsonb
+           WHERE source_id = $6 AND slug = $7 AND deleted_at IS NULL
+             AND content_hash IS NOT DISTINCT FROM $8
+             AND canonical_input_generation IS NOT DISTINCT FROM $9::bigint
+             AND updated_at IS NOT DISTINCT FROM $10::timestamptz`,
+          [
+            effective.source_kind,
+            opts.source_uri ?? null,
+            effective.ingested_via,
+            effective.ingested_at ? effective.ingested_at.toISOString() : null,
+            JSON.stringify(fm),
+            sid,
+            slug,
+            row.content_hash,
+            row.canonical_input_generation,
+            updatedAt,
+          ],
+        );
+      }
+    }
+  } catch { /* provenance COALESCE repair is fail-soft */ }
+  try {
+    const existingProj = await loadCanonicalProjection(engine, sid, slug);
+    if (!existingProj || !projectionIsFresh(existingProj)) {
+      await persistCanonicalProjectionFromRow(engine, sid, slug);
+    }
   } catch { /* projection backfill on a semantic no-op is fail-soft */ }
   const codeRefs = extractCodeRefs(parsed.compiled_truth + '\n' + (parsed.timeline || ''));
   const linkOpts = sourceId
@@ -882,7 +942,12 @@ export async function importFromContent(
     { source_kind: opts.source_kind, ingested_via: opts.ingested_via },
     provenanceNow,
     {
-      legacyAdoption: isTrustedSync ? 'source-file' : false,
+      // Ordinary local writes adopt already-persisted legacy frontmatter
+      // before any candidate/default. Remote callers cannot. Trusted sync
+      // may adopt the source-file stamp.
+      legacyAdoption: opts.remote === true
+        ? false
+        : (isTrustedSync ? 'source-file' : 'existing-frontmatter'),
       sourceFrontmatter: isTrustedSync ? sourceFileProvenance : null,
       inventTimestamp: true,
     },
@@ -941,16 +1006,27 @@ export async function importFromContent(
       if (typeof engine.executeRaw === 'function') {
         const stillMatches = await pageHashStillMatches(
           engine, slug, sourceId ?? 'default', opts.expectedContentHash,
+          existing
+            ? {
+                source_kind: existing.source_kind ?? null,
+                ingested_via: existing.ingested_via ?? null,
+                ingested_at: existing.ingested_at ?? null,
+              }
+            : null,
         );
         if (stillMatches) {
-          await reconcileUnchangedProjections(engine, slug, sourceId, parsed, hash, opts);
+          await reconcileUnchangedProjections(engine, slug, sourceId, parsed, hash, resolvedProvenance, {
+            source_uri: opts.source_uri ?? null,
+          });
           return skipResult;
         }
         // Row moved after the snapshot: fall through to the normal CAS write.
       }
       // No compare-only primitive: do not return no_op; fall through.
     } else {
-      await reconcileUnchangedProjections(engine, slug, sourceId, parsed, hash, opts);
+      await reconcileUnchangedProjections(engine, slug, sourceId, parsed, hash, resolvedProvenance, {
+        source_uri: opts.source_uri ?? null,
+      });
       return skipResult;
     }
   }
