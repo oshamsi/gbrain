@@ -49,17 +49,21 @@ import { decorateEmbeddingDimError } from './embedding-dim-check.ts';
 import { computeCorpusGeneration, loadSourceRow } from './contextual-retrieval-service.ts';
 import { DEFAULT_SYNOPSIS_MODEL } from './page-summary.ts';
 import { runGuardrails } from './guardrails.ts';
-import { FACTS_FENCE_BEGIN, FACTS_FENCE_END, parseFactsFence } from './facts-fence.ts';
+import { FACTS_FENCE_BEGIN, FACTS_FENCE_END, parseFactsFence, renderFactsTable } from './facts-fence.ts';
+import { TAKES_FENCE_BEGIN, TAKES_FENCE_END, parseTakesFence } from './takes-fence.ts';
 import { scanFencedBlocks, MAX_FENCES_PER_PAGE } from './fence-scan.ts';
 import {
   loadCanonicalProjection,
   materializeProvenanceFrontmatter,
   persistCanonicalProjectionFromRow,
+  projectionIsFresh,
   provenanceTuplesEqual,
   resolveSetOnceProvenance,
+  sha256Utf8,
   stripReservedProvenanceKeys,
 } from './page-canonical.ts';
 import { atomicWriteFileSync } from './atomic-write.ts';
+import { registerSelfWrite } from './self-write-guard.ts';
 
 /**
  * v0.20.0 Cathedral II Layer 8 D2 — markdown fence extraction helper.
@@ -139,6 +143,69 @@ function replaceOrAppendFactsFence(body: string, fenceBlock: string): string {
 
   const sep = body.endsWith('\n') ? '\n' : '\n\n';
   return `${body}${sep}## Facts\n\n${fenceBlock}\n`;
+}
+
+function extractTakesFenceBlock(body: string): string | null {
+  const beginIdx = body.indexOf(TAKES_FENCE_BEGIN);
+  if (beginIdx === -1) return null;
+  const endIdx = body.indexOf(TAKES_FENCE_END, beginIdx + TAKES_FENCE_BEGIN.length);
+  if (endIdx === -1) return null;
+  return body.slice(beginIdx, endIdx + TAKES_FENCE_END.length);
+}
+
+function replaceOrAppendTakesFence(body: string, fenceBlock: string): string {
+  const beginIdx = body.indexOf(TAKES_FENCE_BEGIN);
+  if (beginIdx !== -1) {
+    const endIdx = body.indexOf(TAKES_FENCE_END, beginIdx + TAKES_FENCE_BEGIN.length);
+    if (endIdx !== -1) {
+      return body.slice(0, beginIdx) + fenceBlock + body.slice(endIdx + TAKES_FENCE_END.length);
+    }
+  }
+  const sep = body.endsWith('\n') ? '\n' : '\n\n';
+  return `${body}${sep}## Takes\n\n${fenceBlock}\n`;
+}
+
+/**
+ * Remote get_page strips Takes and private Facts. Putting that redacted
+ * content back must restore hidden rows so redaction stays response-only.
+ * Merge missing private Facts by rowNum/claim; restore the Takes block
+ * when the incoming body has no Takes fence.
+ */
+function restoreRemoteHiddenFences(incomingBody: string, existingBody: string): string {
+  let body = incomingBody;
+  const incomingFacts = parseFactsFence(body);
+  const existingFacts = parseFactsFence(existingBody);
+  if (incomingFacts.warnings.length === 0 && existingFacts.warnings.length === 0) {
+    if (incomingFacts.facts.length === 0 && existingFacts.facts.length > 0) {
+      const existingFenceBlock = extractFactsFenceBlock(existingBody);
+      if (existingFenceBlock) body = replaceOrAppendFactsFence(body, existingFenceBlock);
+    } else {
+      const incomingRowNums = new Set(incomingFacts.facts.map((f) => f.rowNum));
+      const incomingExact = new Set(incomingFacts.facts.map((f) => `${f.rowNum}\0${f.claim}`));
+      const missingPrivate = existingFacts.facts.filter((f) =>
+        f.visibility === 'private'
+        && !incomingExact.has(`${f.rowNum}\0${f.claim}`)
+        && !incomingRowNums.has(f.rowNum),
+      );
+      if (missingPrivate.length > 0) {
+        const merged = [...incomingFacts.facts, ...missingPrivate].sort((a, b) => a.rowNum - b.rowNum);
+        body = replaceOrAppendFactsFence(body, renderFactsTable(merged));
+      }
+    }
+  }
+
+  const incomingTakes = parseTakesFence(body);
+  const existingTakes = parseTakesFence(existingBody);
+  if (
+    incomingTakes.takes.length === 0
+    && incomingTakes.warnings.length === 0
+    && existingTakes.takes.length > 0
+    && existingTakes.warnings.length === 0
+  ) {
+    const existingTakesBlock = extractTakesFenceBlock(existingBody);
+    if (existingTakesBlock) body = replaceOrAppendTakesFence(body, existingTakesBlock);
+  }
+  return body;
 }
 
 /**
@@ -391,6 +458,13 @@ export interface ImportResult {
    * distinct type per run.
    */
   type_warning?: { kind: 'alias_of' | 'undeclared'; type: string; canonical?: string; directory?: string };
+  /**
+   * True when the structured import landed but the canonical file rewrite
+   * failed or the stored projection is not byte-fresh. Sync must not
+   * checkpoint these as completed successes.
+   */
+  partial?: boolean;
+  file_status?: 'healthy' | 'repaired' | 'repair_failed' | 'not_projected';
 }
 
 const MAX_FILE_SIZE = 5_000_000; // 5MB
@@ -769,24 +843,11 @@ export async function importFromContent(
   const existing = await engine.getPage(slug, { sourceId: sourceId ?? 'default' });
   assertExpectedPageHash(existing, slug, sourceId ?? 'default', opts.expectedContentHash);
 
-  // #2044: remote get_page intentionally strips private facts rows. A
-  // documented get_page -> edit -> put_page round-trip can therefore arrive
-  // with an empty/missing Facts fence even though the existing page still has
-  // canonical fence rows. Preserve the old fence in that narrow case so the
-  // system-of-record markdown is not truncated by the privacy boundary.
+  // Remote get_page strips Takes and private Facts. Restoring them here
+  // keeps redaction response-only across get/edit/put, including when the
+  // incoming body still has world Facts (so the fence is not empty).
   if (opts.remote === true && existing?.compiled_truth) {
-    const incomingFacts = parseFactsFence(parsed.compiled_truth);
-    const existingFacts = parseFactsFence(existing.compiled_truth);
-    const existingFenceBlock = extractFactsFenceBlock(existing.compiled_truth);
-    if (
-      incomingFacts.facts.length === 0 &&
-      incomingFacts.warnings.length === 0 &&
-      existingFacts.warnings.length === 0 &&
-      existingFacts.facts.length > 0 &&
-      existingFenceBlock
-    ) {
-      parsed.compiled_truth = replaceOrAppendFactsFence(parsed.compiled_truth, existingFenceBlock);
-    }
+    parsed.compiled_truth = restoreRemoteHiddenFences(parsed.compiled_truth, existing.compiled_truth);
   }
 
   // #1035: absence of an explicit frontmatter `type:` on an EXISTING page
@@ -1108,7 +1169,7 @@ export async function importFromContent(
         },
       } : {}),
     });
-    if (!provenanceTuplesEqual(resolvedProvenance, committedPage)) {
+    if (committedPage != null && !provenanceTuplesEqual(resolvedProvenance, committedPage)) {
       throw new PageWriteConflictError(slug, txOpts.sourceId, opts.expectedContentHash ?? (existing?.content_hash ?? ''));
     }
 
@@ -1464,15 +1525,35 @@ export async function importFromFile(
   // File→store authority: if the stored canonical projection differs from the
   // source file, rewrite that same file under the importer. Sync's Git/anchor
   // flow owns commit handling — do not call per-page write-through commit.
+  // A rewrite failure is partial, never ordinary success.
   if (result.status !== 'error' && result.skip_reason !== 'malformed_path') {
+    const sourceId = opts.sourceId ?? 'default';
     try {
-      const sourceId = opts.sourceId ?? 'default';
-      const stored = (await loadCanonicalProjection(engine, sourceId, result.slug))?.content
-        ?? (await persistCanonicalProjectionFromRow(engine, sourceId, result.slug)).content;
-      if (content !== stored) atomicWriteFileSync(filePath, stored);
-    } catch {
-      // Rewrite is best-effort relative to the durable DB projection; doctor
-      // reports remaining file divergence. Do not fail the import.
+      let stored = await loadCanonicalProjection(engine, sourceId, result.slug);
+      if (!stored || !projectionIsFresh(stored)) {
+        stored = await persistCanonicalProjectionFromRow(engine, sourceId, result.slug);
+      }
+      if (!projectionIsFresh(stored)) {
+        return {
+          ...result,
+          partial: true,
+          file_status: 'repair_failed',
+          error: result.error ?? 'stale_projection',
+        };
+      }
+      if (content !== stored.content) {
+        atomicWriteFileSync(filePath, stored.content);
+        registerSelfWrite(filePath, { sha256: stored.sha256 || sha256Utf8(stored.content) });
+        return { ...result, file_status: 'repaired' };
+      }
+      return { ...result, file_status: 'healthy' };
+    } catch (e) {
+      return {
+        ...result,
+        partial: true,
+        file_status: 'repair_failed',
+        error: result.error ?? (e instanceof Error ? e.message : String(e)),
+      };
     }
   }
   return result;

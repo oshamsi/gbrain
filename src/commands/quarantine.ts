@@ -225,6 +225,7 @@ async function runClear(engine: BrainEngine, args: string[]): Promise<void> {
   const prevNoSanity = process.env.GBRAIN_NO_SANITY;
   if (force) process.env.GBRAIN_NO_SANITY = '1';
   let result;
+  let wt: Awaited<ReturnType<typeof writePageThrough>> | undefined;
   try {
     result = await importFromContent(engine, slug, markdown, {
       sourceId: page.source_id,
@@ -232,7 +233,7 @@ async function runClear(engine: BrainEngine, args: string[]): Promise<void> {
       forceRechunk: true,
     });
     if (result.status !== 'error') {
-      await writePageThrough(engine, slug, { sourceId: page.source_id });
+      wt = await writePageThrough(engine, slug, { sourceId: page.source_id });
     }
   } finally {
     if (force) {
@@ -242,14 +243,35 @@ async function runClear(engine: BrainEngine, args: string[]): Promise<void> {
   }
 
   const reQuarantined = result.quarantined === true;
+  const fileFailed = Boolean(
+    wt
+    && wt.written !== true
+    && wt.skipped !== 'disabled_by_config'
+    && wt.skipped !== 'no_repo_configured',
+  );
   if (json) {
-    console.log(JSON.stringify({ slug, cleared: !reQuarantined, re_quarantined: reQuarantined, flagged: result.flagged ?? false, forced: force }, null, 2));
+    console.log(JSON.stringify({
+      slug,
+      cleared: !reQuarantined && !fileFailed,
+      re_quarantined: reQuarantined,
+      flagged: result.flagged ?? false,
+      forced: force,
+      ...(fileFailed ? { partial: true, write_through: wt } : {}),
+    }, null, 2));
+    if (fileFailed && !reQuarantined) process.exit(1);
     return;
   }
   if (reQuarantined) {
     console.error(
       `Page "${slug}" is STILL detected as junk — it remained quarantined. ` +
       `Edit the source file to fix it, or re-run with --force to clear it anyway.`,
+    );
+    process.exit(1);
+  }
+  if (fileFailed) {
+    console.error(
+      `Cleared "${slug}" in the store but the canonical file write failed` +
+      ` (${wt?.error ?? wt?.skipped ?? 'unknown'}). Not reporting success.`,
     );
     process.exit(1);
   }
@@ -333,7 +355,17 @@ async function runScan(engine: BrainEngine, args: string[]): Promise<void> {
       forceRechunk: true,
     });
     if (result.status !== 'error') {
-      await writePageThrough(engine, ref.slug, { sourceId: ref.source_id });
+      const wt = await writePageThrough(engine, ref.slug, { sourceId: ref.source_id });
+      if (
+        wt.written !== true
+        && wt.skipped !== 'disabled_by_config'
+        && wt.skipped !== 'no_repo_configured'
+      ) {
+        console.error(
+          `quarantine scan: store updated for ${ref.slug} but canonical file write failed` +
+          ` (${wt.error ?? wt.skipped ?? 'unknown'})`,
+        );
+      }
     }
     if (result.quarantined) {
       quarantined++;

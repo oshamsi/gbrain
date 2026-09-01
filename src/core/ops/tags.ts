@@ -27,9 +27,13 @@ async function mutateTagAndProject(
       sourceId,
       logger: ctx.logger,
     });
+    const repoLoss = projection.skipped === 'repo_not_found'
+      || projection.skipped === 'path_escapes_source_root'
+      || projection.file_status === 'repair_failed'
+      || projection.error === 'stale_projection';
     const notProjected = projection.file_status === 'not_projected';
     const healthy = projection.file_status === 'healthy' || projection.skipped === 'unchanged';
-    const partial = !notProjected && !healthy && projection.file_status === 'repair_failed';
+    const partial = repoLoss || (!notProjected && !healthy && projection.file_status === 'repair_failed');
     return {
       status: partial ? 'partial' : 'ok',
       write_through: projection,

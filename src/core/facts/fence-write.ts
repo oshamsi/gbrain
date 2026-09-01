@@ -35,7 +35,7 @@
  */
 
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, readFileSync, writeFileSync, renameSync, appendFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync, renameSync, appendFileSync, unlinkSync } from 'node:fs';
 import { dirname, isAbsolute, relative } from 'node:path';
 
 import type { BrainEngine, NewFact, FactVisibility } from '../engine.ts';
@@ -43,7 +43,8 @@ import { inferTypeFromPack } from '../markdown.ts';
 import { loadActivePackBestEffort } from '../schema-pack/best-effort.ts';
 import { withPageLock } from '../page-lock.ts';
 import { gbrainPath } from '../config.ts';
-import { isWriteThroughDisabled, resolvePageWriteTarget } from '../write-through.ts';
+import { isWriteThroughDisabled, resolvePageWriteTarget, writePageThrough } from '../write-through.ts';
+import { applyCanonicalMarkdownToStore } from '../page-canonical.ts';
 import { isDurabilityHardened, commitWriteThroughFile } from '../brain-repo-durability.ts';
 import { upsertFactRow, parseFactsFence } from '../facts-fence.ts';
 import { extractFactsFromFenceText } from './extract-from-fence.ts';
@@ -424,9 +425,26 @@ export async function writeFactsToFence(
         return { inserted: 0, ids: [], fenceWriteFailed: true };
       }
 
-      // 5. Rename .tmp → file. POSIX atomic; the canonical file is
-      //    either the old content or the new content, never partial.
-      renameSync(tmpPath, filePath);
+      // 5. Store the mutated markdown as the canonical projection, then
+      //    write/verify those bytes. Independent rename is not a complete
+      //    canonical mutation when the page row already exists.
+      const page = await engine.getPage(target.slug, { sourceId: target.sourceId });
+      if (page) {
+        try { unlinkSync(tmpPath); } catch { /* tmp is only a parse-validate artifact */ }
+        await applyCanonicalMarkdownToStore(engine, target.sourceId, target.slug, tmpBody);
+        const wt = await writePageThrough(engine, target.slug, { sourceId: target.sourceId });
+        if (!wt.written && wt.skipped !== 'disabled_by_config' && wt.skipped !== 'no_repo_configured') {
+          recordWriteFailure(
+            target.slug,
+            target.sourceId,
+            [wt.error ?? wt.skipped ?? 'canonical write-through failed'],
+            filePath,
+          );
+          return { inserted: 0, ids: [], fenceWriteFailed: true };
+        }
+      } else {
+        renameSync(tmpPath, filePath);
+      }
 
       // 6. Stamp the DB. extractFactsFromFenceText handles the
       //    validFrom/validUntil date derivation + the strikethrough
@@ -457,7 +475,7 @@ export async function writeFactsToFence(
         // eslint-disable-next-line no-console
         console.warn(`[facts.supersession] ${w}`);
       }
-      if (durabilityEnabled) {
+      if (durabilityEnabled && !page) {
         await commitFactFenceFile(
           writeRoot,
           filePath,

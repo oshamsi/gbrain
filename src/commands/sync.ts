@@ -2147,7 +2147,12 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
             ? importImageFile(eng, filePath, path, { noEmbed, sourceId: opts.sourceId })
             : importFile(eng, filePath, path, { noEmbed, sourceId: opts.sourceId, activePack: syncActivePack }));
         noteTypeWarning(result.type_warning);
-        if (result.status === 'imported') {
+        if (result.partial) {
+          failedFiles.push({
+            path,
+            error: result.error ?? 'canonical file rewrite failed',
+          });
+        } else if (result.status === 'imported') {
           chunksCreated += result.chunks;
           pagesAffected.push(result.slug);
           deletedSlugs.delete(result.slug); // #1284: deleted-then-re-added in the same run → embeddable again

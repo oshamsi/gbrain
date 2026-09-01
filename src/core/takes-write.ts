@@ -37,8 +37,8 @@
  * limitation — see ops/takes.ts.)
  */
 
-import { readFileSync, existsSync, mkdirSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { readFileSync, existsSync } from 'node:fs';
+import { join } from 'node:path';
 import type { BrainEngine, TakeBatchInput, TakeKind } from './engine.ts';
 import {
   parseTakesFence,
@@ -52,9 +52,9 @@ import {
 } from './takes-fence.ts';
 import { withPageLock } from './page-lock.ts';
 import { resolvePageFilePath, resolveSourceLocalFilePath } from './markdown.ts';
-import { sanitizeRecordedSourcePath, recordedPathFromFileUri } from './write-through.ts';
+import { sanitizeRecordedSourcePath, recordedPathFromFileUri, writePageThrough } from './write-through.ts';
 import { isWriteTargetContained, msysToNativePath } from './path-confine.ts';
-import { atomicWriteFileSync } from './atomic-write.ts';
+import { applyCanonicalMarkdownToStore } from './page-canonical.ts';
 
 export type TakesWriteErrorCode =
   | 'page_not_found'      // slug has no pages row (scoped)
@@ -306,12 +306,16 @@ function readPageBody(path: string): string {
 }
 
 /**
- * P1-2: contain the target within the source's working tree before any
- * mkdir/write (a pre-existing hostile row or a symlinked intermediate dir must
- * not escape), then atomic temp+rename so a reader never observes a torn file
- * and a crash mid-write leaves only a tmp sibling.
+ * Persist the mutated markdown as the stored canonical projection, then
+ * write/verify those exact bytes. File-first independent writes are no
+ * longer a complete canonical mutation.
  */
-function writePageBody(path: string, body: string, writeRoot: string): void {
+async function commitTakesMarkdown(
+  target: TakesWriteTarget,
+  markdown: string,
+  writeRoot: string,
+  path: string,
+): Promise<string> {
   if (!isWriteTargetContained(path, writeRoot)) {
     throw new TakesWriteError(
       'mirror_unavailable',
@@ -319,8 +323,15 @@ function writePageBody(path: string, body: string, writeRoot: string): void {
       'path_escapes_source_root',
     );
   }
-  mkdirSync(dirname(path), { recursive: true });
-  atomicWriteFileSync(path, body);
+  const sourceId = target.sourceId ?? 'default';
+  await applyCanonicalMarkdownToStore(target.engine, sourceId, target.slug, markdown);
+  const wt = await writePageThrough(target.engine, target.slug, { sourceId });
+  if (wt.written && wt.path) return wt.path;
+  throw new TakesWriteError(
+    'mirror_unavailable',
+    wt.error ?? `takes canonical write-through failed (${wt.skipped ?? 'unknown'})`,
+    wt.skipped ?? 'canonical_write_failed',
+  );
 }
 
 /**
@@ -432,7 +443,7 @@ export async function addTakeToPage(
       sinceDate: input.sinceDate,
       active: true,
     });
-    writePageBody(path, nextBody, writeRoot);
+    const writtenPath = await commitTakesMarkdown(target, nextBody, writeRoot, path);
     let mirrorWarning: string | undefined;
     try {
       await target.engine.addTakesBatch([{
@@ -447,7 +458,7 @@ export async function addTakeToPage(
       // (a throw would make the caller retry and duplicate the durable md row).
       mirrorWarning = mirrorErrorMessage(err);
     }
-    return { rowNum, mirror: { written: true, path, ...(mirrorWarning ? { mirror_warning: mirrorWarning } : {}) } };
+    return { rowNum, mirror: { written: true, path: writtenPath, ...(mirrorWarning ? { mirror_warning: mirrorWarning } : {}) } };
   });
 }
 
@@ -492,7 +503,7 @@ export async function updateTakeOnPage(
       sinceDate: fields.sinceDate ?? targetRow.sinceDate,
     };
     const allRows = parsed.takes.map(t => (t.rowNum === rowNum ? updated : t));
-    writePageBody(path, replaceFence(body, allRows), writeRoot);
+    const writtenPath = await commitTakesMarkdown(target, replaceFence(body, allRows), writeRoot, path);
     // Mirror md→DB with the reconcile primitive (upsert on (page_id,row_num));
     // base columns only, resolution columns preserved by the DO UPDATE list.
     let mirrorWarning: string | undefined;
@@ -501,7 +512,7 @@ export async function updateTakeOnPage(
     } catch (err) {
       mirrorWarning = mirrorErrorMessage(err); // P1-4/F4: md written; DB mirror deferred to reconcile.
     }
-    return { rowNum, mirror: { written: true, path, ...(mirrorWarning ? { mirror_warning: mirrorWarning } : {}) } };
+    return { rowNum, mirror: { written: true, path: writtenPath, ...(mirrorWarning ? { mirror_warning: mirrorWarning } : {}) } };
   });
 }
 
@@ -554,7 +565,7 @@ export async function supersedeTakeOnPage(
       sinceDate: input.sinceDate,
       source: input.source,
     });
-    writePageBody(path, nextBody, writeRoot);
+    const writtenPath = await commitTakesMarkdown(target, nextBody, writeRoot, path);
     // Mirror BOTH affected rows exactly as the fence now states them:
     // old → inactive + superseded_by pointer, new → active append.
     const after = parseTakesFence(nextBody).takes;
@@ -569,7 +580,7 @@ export async function supersedeTakeOnPage(
     } catch (err) {
       mirrorWarning = mirrorErrorMessage(err); // P1-4/F4: md written; DB mirror deferred to reconcile.
     }
-    return { oldRow: rowNum, newRow: newRowNum, mirror: { written: true, path, ...(mirrorWarning ? { mirror_warning: mirrorWarning } : {}) } };
+    return { oldRow: rowNum, newRow: newRowNum, mirror: { written: true, path: writtenPath, ...(mirrorWarning ? { mirror_warning: mirrorWarning } : {}) } };
   });
 }
 
@@ -624,7 +635,7 @@ export async function resolveTakeOnPage(
       resolvedBy: input.resolvedBy,
     };
     const allRows = parsed.takes.map(t => (t.rowNum === rowNum ? updated : t));
-    writePageBody(path, replaceFence(body, allRows), writeRoot);
+    const writtenPath = await commitTakesMarkdown(target, replaceFence(body, allRows), writeRoot, path);
     // Resolution fields aren't in TakeBatchInput — mirror via resolveTake.
     // A drifted DB missing the row is self-healed md→DB (upsert the base row,
     // then resolve): the markdown is the truth being propagated.
@@ -657,6 +668,6 @@ export async function resolveTakeOnPage(
         mirrorWarning = mirrorErrorMessage(err);
       }
     }
-    return { rowNum, quality: input.quality, mirror: { written: true, path, ...(mirrorWarning ? { mirror_warning: mirrorWarning } : {}) } };
+    return { rowNum, quality: input.quality, mirror: { written: true, path: writtenPath, ...(mirrorWarning ? { mirror_warning: mirrorWarning } : {}) } };
   });
 }

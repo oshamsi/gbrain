@@ -44,23 +44,19 @@
  * eventual-consistency contract as the facts fence lane.
  */
 
-import { existsSync, readFileSync, writeFileSync, renameSync, unlinkSync, readdirSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { basename, dirname } from 'node:path';
-import { randomBytes } from 'node:crypto';
 import type { BrainEngine } from './engine.ts';
-import { sanitizeForJsonb } from './batch-rows.ts';
 import {
   isWriteThroughDisabled,
   resolvePageWriteTarget,
+  writePageThrough,
   type WriteThroughLogger,
   type WriteThroughResult,
 } from './write-through.ts';
+import { applyCanonicalMarkdownToStore } from './page-canonical.ts';
 import { withPageLock } from './page-lock.ts';
 import { findTimelineSplitIndex } from './markdown.ts';
-import {
-  isDurabilityHardened, commitWriteThroughFile, currentBranch, getLastPushOutcome,
-  type PushLogOutcome,
-} from './brain-repo-durability.ts';
 import { extractTimelineFromContent } from './timeline-extract.ts';
 
 /** Raw op params for one manual timeline entry (date pre-validated by caller). */
@@ -385,30 +381,16 @@ export async function writeTimelineEntryThrough(
           return { handled: false, skipped: 'splice_not_roundtrippable' };
         }
 
-        // Atomic write: unique temp sibling + rename (writePageThrough's
-        // convention). Clean the temp up on failure — never leak a stray.
-        const tmpPath = `${filePath}.tmp.${process.pid}.${randomBytes(4).toString('hex')}`;
-        try {
-          writeFileSync(tmpPath, afterText, 'utf8');
-          renameSync(tmpPath, filePath);
-        } catch (writeErr) {
-          try {
-            if (existsSync(tmpPath)) unlinkSync(tmpPath);
-          } catch {
-            // best-effort cleanup; surface the original write error below
-          }
-          throw writeErr;
+        // Persist the spliced markdown (file is the merge point for
+        // file-only extras) as the stored projection, then write/verify
+        // those exact bytes. Independent rename + timeline-only UPDATE
+        // left the projection stale.
+        await applyCanonicalMarkdownToStore(engine, sourceId, slug, afterText);
+        const file = await writePageThrough(engine, slug, { sourceId, logger: opts.logger });
+        if (!file.written) {
+          return { handled: false, file, error: file.error ?? file.skipped };
         }
         onDisk = rendered.canonical;
-
-        const newTimeline = sanitizeForJsonb(
-          spliceTimelineBlock(page.timeline ?? '', entry.date, rendered.block),
-        );
-        await engine.executeRaw(
-          `UPDATE pages SET timeline = $1, updated_at = now()
-            WHERE slug = $2 AND source_id = $3 AND deleted_at IS NULL`,
-          [newTimeline, slug, sourceId],
-        );
 
         // Store the tuple the FS extractor recovers from the bullet just
         // spliced in, so every later sync/rebuild re-extraction
@@ -421,27 +403,6 @@ export async function writeTimelineEntryThrough(
           detail: entry.detail || '',
         }, { sourceId, skipExistenceCheck: true });
 
-        // #2426 mirror (writePageThrough): on a durability-hardened repo,
-        // commit the artifact so it reaches git. Best-effort — a commit
-        // failure never fails the write.
-        let committed = false;
-        let pushed: 'pending' | undefined;
-        let lastPushStatus: PushLogOutcome | undefined;
-        try {
-          if (isDurabilityHardened(writeRoot)) {
-            committed = commitWriteThroughFile(writeRoot, filePath, slug);
-            if (committed) {
-              pushed = 'pending';
-              lastPushStatus = getLastPushOutcome(currentBranch(writeRoot));
-            }
-          }
-        } catch { /* best-effort */ }
-
-        const file: WriteThroughResult = {
-          written: true,
-          path: filePath,
-          ...(committed ? { committed, pushed, lastPushStatus } : {}),
-        };
         return { handled: true, file, entry: rendered.canonical };
       },
       { timeoutMs: 5_000 },

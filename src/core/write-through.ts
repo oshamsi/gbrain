@@ -30,8 +30,10 @@ import { isWriteTargetContained, msysToNativePath } from './path-confine.ts';
 import {
   loadCanonicalProjection,
   persistCanonicalProjectionFromRow,
+  projectionIsFresh,
   sha256Utf8,
 } from './page-canonical.ts';
+import { registerSelfWrite } from './self-write-guard.ts';
 import {
   isDurabilityHardened, commitWriteThroughFile, currentBranch, getLastPushOutcome,
   type PushLogOutcome,
@@ -354,12 +356,16 @@ export async function writePageThrough(
     }
 
     let projection = await loadCanonicalProjection(engine, sourceId, slug);
-    if (!projection) {
+    if (!projection || !projectionIsFresh(projection)) {
+      const built = await persistCanonicalProjectionFromRow(engine, sourceId, slug);
       projection = {
-        ...(await persistCanonicalProjectionFromRow(engine, sourceId, slug)),
-        inputGeneration: null,
-        basisGeneration: null,
+        ...built,
+        inputGeneration: built.inputGeneration,
+        basisGeneration: built.basisGeneration,
       };
+      if (!projectionIsFresh(projection)) {
+        return { written: false, error: 'stale_projection' };
+      }
     }
     const md = projection.content;
 
@@ -434,6 +440,7 @@ export async function writePageThrough(
       }
     } catch { /* best-effort */ }
 
+    registerSelfWrite(filePath, { sha256: projection.sha256 });
     return {
       written: true,
       path: filePath,
@@ -469,16 +476,29 @@ export async function verifyOrRepairPageFile(
   }
   const target = await resolvePageWriteTarget(engine, slug, sourceId);
   if (!target.ok) {
-    return { written: false, skipped: target.skipped, file_status: 'not_projected', file_repaired: false };
+    const configuredBroken = target.skipped === 'repo_not_found' || target.skipped === 'path_escapes_source_root';
+    return {
+      written: false,
+      skipped: target.skipped,
+      file_status: configuredBroken ? 'repair_failed' : 'not_projected',
+      file_repaired: false,
+    };
   }
   const { filePath } = target;
   let projection = await loadCanonicalProjection(engine, sourceId, slug);
-  if (!projection) {
+  if (!projection || !projectionIsFresh(projection)) {
     try {
       const built = await persistCanonicalProjectionFromRow(engine, sourceId, slug);
-      projection = { ...built, inputGeneration: null, basisGeneration: null };
+      projection = {
+        ...built,
+        inputGeneration: built.inputGeneration,
+        basisGeneration: built.basisGeneration,
+      };
     } catch {
       return { written: false, error: 'canonical_projection_missing', file_status: 'repair_failed', file_repaired: false };
+    }
+    if (!projectionIsFresh(projection)) {
+      return { written: false, error: 'stale_projection', file_status: 'repair_failed', file_repaired: false };
     }
   }
   let needsRepair = !existsSync(filePath);

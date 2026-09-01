@@ -17,6 +17,8 @@ import { writePageThrough, verifyOrRepairPageFile, type WriteThroughResult } fro
 import {
   buildCanonicalPageProjection,
   loadCanonicalProjection,
+  persistCanonicalProjectionFromRow,
+  projectionIsFresh,
   serializeRedactedPageForRead,
 } from '../page-canonical.ts';
 import { extractPageLinks, isAutoLinkEnabled, isAutoTimelineEnabled, isGlobalBasenameEnabled, parseTimelineEntries, makeResolver, type UnresolvedFrontmatterRef } from '../link-extraction.ts';
@@ -299,14 +301,26 @@ const get_page: Operation = {
     let content: string | undefined;
     let contentRedacted = false;
     let canonicalProjectionMissing = false;
+    let canonicalProjectionStale = false;
     if (includeContent) {
       if (isUntrustedReader) {
         content = serializeRedactedPageForRead(visibleBody as Page, tags);
         contentRedacted = true;
       } else {
-        const projection = await loadCanonicalProjection(ctx.engine, page.source_id, page.slug);
-        if (projection) {
+        let projection = await loadCanonicalProjection(ctx.engine, page.source_id, page.slug);
+        if (projection && !projectionIsFresh(projection)) {
+          try {
+            const built = await persistCanonicalProjectionFromRow(ctx.engine, page.source_id, page.slug);
+            projection = { ...built, inputGeneration: built.inputGeneration, basisGeneration: built.basisGeneration };
+          } catch {
+            projection = null;
+          }
+        }
+        if (projection && projectionIsFresh(projection)) {
           content = projection.content;
+        } else if (projection) {
+          content = buildCanonicalPageProjection(page, tags).content;
+          canonicalProjectionStale = true;
         } else {
           content = buildCanonicalPageProjection(page, tags).content;
           canonicalProjectionMissing = true;
@@ -319,6 +333,7 @@ const get_page: Operation = {
       ...(includeContent ? { content } : {}),
       ...(contentRedacted ? { content_redacted: true } : {}),
       ...(canonicalProjectionMissing ? { canonical_projection_missing: true } : {}),
+      ...(canonicalProjectionStale ? { canonical_projection_stale: true } : {}),
       ...(resolved_slug ? { resolved_slug } : {}),
       ...(content_flag ? { content_flag } : {}),
     };
@@ -389,9 +404,20 @@ const fetch_page: Operation = {
       text = serializeRedactedPageForRead(visibleBody as Page, tags);
       metadata.content_redacted = true;
     } else {
-      const projection = await loadCanonicalProjection(ctx.engine, page.source_id, page.slug);
-      if (projection) {
+      let projection = await loadCanonicalProjection(ctx.engine, page.source_id, page.slug);
+      if (projection && !projectionIsFresh(projection)) {
+        try {
+          const built = await persistCanonicalProjectionFromRow(ctx.engine, page.source_id, page.slug);
+          projection = { ...built, inputGeneration: built.inputGeneration, basisGeneration: built.basisGeneration };
+        } catch {
+          projection = null;
+        }
+      }
+      if (projection && projectionIsFresh(projection)) {
         text = projection.content;
+      } else if (projection) {
+        text = buildCanonicalPageProjection(page, tags).content;
+        metadata.canonical_projection_stale = true;
       } else {
         text = buildCanonicalPageProjection(page, tags).content;
         metadata.canonical_projection_missing = true;

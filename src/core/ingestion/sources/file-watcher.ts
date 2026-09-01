@@ -50,6 +50,8 @@ import {
   type IngestionSourceContext,
 } from '../types.ts';
 import { pruneDir } from '../../sync.ts';
+import { consumeSelfWrite } from '../../self-write-guard.ts';
+import { sha256Utf8 } from '../../page-canonical.ts';
 
 export interface FileWatcherSourceOpts {
   /** Source instance id. Defaults to 'file-watcher'. Use distinct ids when
@@ -130,6 +132,8 @@ export function createFileWatcherSource(opts: FileWatcherSourceOpts): IngestionS
     // silent skips — chokidar will fire 'unlink' separately.
     readFile(absPath, 'utf8').then(
       (content) => {
+        const digest = sha256Utf8(content);
+        if (consumeSelfWrite(absPath, digest)) return;
         const nowIso = new Date().toISOString();
         const ev: IngestionEvent = {
           source_id: id,

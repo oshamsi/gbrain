@@ -21,6 +21,8 @@ import type { BrainEngine } from '../engine.ts';
 import type { PageType, TimelineInput } from '../types.ts';
 import type { ResolverContext } from '../resolvers/interface.ts';
 import { SlugRegistry } from './slug-registry.ts';
+import { persistCanonicalProjectionFromRow } from '../page-canonical.ts';
+import { writePageThrough } from '../write-through.ts';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -160,6 +162,13 @@ class WriteTxImpl implements WriteTx {
     return { sourceId: this.sourceId ?? 'default' };
   }
 
+  /** Refresh the stored projection and write/verify canonical file bytes. */
+  private async projectAndWrite(slug: string): Promise<void> {
+    const sourceId = this.scope().sourceId;
+    await persistCanonicalProjectionFromRow(this.engine, sourceId, slug);
+    await writePageThrough(this.engine, slug, { sourceId });
+  }
+
   async createEntity(input: EntityInput): Promise<string> {
     if (!input.desiredSlug || !input.displayName || !input.type) {
       throw new WriteError('invalid_input', 'createEntity requires desiredSlug, displayName, and type');
@@ -210,6 +219,7 @@ class WriteTxImpl implements WriteTx {
       timeline: input.timeline ?? '',
       frontmatter: input.frontmatter ?? {},
     }, this.scope());
+    await this.projectAndWrite(slug);
     this.touchedSlugs.add(slug);
     return slug;
   }
@@ -229,6 +239,7 @@ class WriteTxImpl implements WriteTx {
       timeline: existing.timeline,
       frontmatter: existing.frontmatter,
     }, this.scope());
+    await this.projectAndWrite(slug);
     this.touchedSlugs.add(slug);
   }
 
@@ -243,6 +254,7 @@ class WriteTxImpl implements WriteTx {
       timeline: existing.timeline,
       frontmatter: nextFm,
     }, this.scope());
+    await this.projectAndWrite(slug);
     this.touchedSlugs.add(slug);
   }
 

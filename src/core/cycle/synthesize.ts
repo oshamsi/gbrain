@@ -41,7 +41,7 @@
  */
 
 import type Anthropic from '@anthropic-ai/sdk';
-import { writeFileSync, mkdirSync } from 'node:fs';
+
 import { randomUUID } from 'node:crypto';
 import { chat as gatewayChat, validateModelId, type ChatResult } from '../ai/gateway.ts';
 import { AIConfigError } from '../ai/errors.ts';
@@ -68,6 +68,8 @@ export { loadAllowedSlugPrefixes };
 import { discoverTranscripts, DEFAULT_EXCLUDE_PATTERNS, type DiscoveredTranscript } from './transcript-discovery.ts';
 import { serializeMarkdown, serializePageToMarkdown } from '../markdown.ts';
 import type { Page, PageType } from '../types.ts';
+import { writePageThrough } from '../write-through.ts';
+import { persistCanonicalProjectionFromRow } from '../page-canonical.ts';
 import { validateSourceId } from '../utils.ts';
 import { safeSplitIndex } from '../text-safe.ts';
 import { PAGE_SLUG_SEG } from '../cjk.ts';
@@ -2613,23 +2615,13 @@ async function reverseWriteRefs(
     const page = await engine.getPage(slug, { sourceId: source_id });
     if (!page) continue;
     try {
-      const { loadCanonicalProjection, persistCanonicalProjectionFromRow } = await import('../page-canonical.ts');
-      let projection = await loadCanonicalProjection(engine, source_id, slug);
-      if (!projection) {
-        const built = await persistCanonicalProjectionFromRow(engine, source_id, slug);
-        projection = { ...built, inputGeneration: null, basisGeneration: null };
+      const wt = await writePageThrough(engine, slug, { sourceId: source_id });
+      if (wt.written) count++;
+      else {
+        process.stderr.write(
+          `[dream] reverse-write ${slug}@${source_id} skipped: ${wt.error ?? wt.skipped ?? 'unknown'}\n`,
+        );
       }
-      const md = projection.content;
-      // v0.32.8 F6: foreign-source pages land at brainDir/.sources/<id>/<slug>.md
-      // so same-slug-different-source pages don't collide. Pages belonging to
-      // the cycle's own source (#1586: brainDir IS that source's checkout —
-      // legacy 'default' when unscoped) stay at brainDir/<slug>.md.
-      const filePath = source_id === nativeSourceId
-        ? join(brainDir, `${slug}.md`)
-        : join(brainDir, '.sources', source_id, `${slug}.md`);
-      mkdirSync(dirname(filePath), { recursive: true });
-      writeFileSync(filePath, md, 'utf8');
-      count++;
     } catch (e) {
       // Per-slug failures are non-fatal — phase continues.
       const msg = e instanceof Error ? e.message : String(e);
@@ -2640,20 +2632,13 @@ async function reverseWriteRefs(
 }
 
 /**
- * Render a Page to markdown, stamping the dream-output identity marker into
- * frontmatter. This stamp is the explicit identity surface checked by
- * `isDreamOutput` in transcript-discovery.ts. Stamping at render time covers
- * every reverse-write path (subagent reflections + originals + summary) with
- * one funnel; the prior content-pattern guard could miss real output because
- * `serializeMarkdown` does not embed the page slug in the body.
+ * Preview/export helper for dream-stamped markdown. Canonical page files
+ * must NOT be written from this renderer — persist the stamp on the row
+ * (stampDreamProvenance) and consume the stored projection via
+ * writePageThrough. Override-capable rendering is for named noncanonical
+ * artifacts only.
  */
 export function renderPageToMarkdown(page: Page, tags: string[]): string {
-  // v0.38 DRY: the dream-output identity stamp (dream_generated +
-  // dream_cycle_date) is the ONLY thing that differs from the v0.38
-  // put_page write-through renderer. Both call the shared
-  // serializePageToMarkdown helper in markdown.ts; this wrapper passes
-  // the dream-specific overrides. Future markdown-shape changes happen
-  // in one place.
   return serializePageToMarkdown(page, tags, {
     frontmatterOverrides: {
       dream_generated: true,
@@ -2727,11 +2712,14 @@ async function writeSummaryPage(
     frontmatter: parsed.frontmatter,
   }, { sourceId });
 
-  // Also write to disk (orchestrator dual-write).
   try {
-    const filePath = join(brainDir, `${summarySlug}.md`);
-    mkdirSync(dirname(filePath), { recursive: true });
-    writeFileSync(filePath, fullMarkdown, 'utf8');
+    await persistCanonicalProjectionFromRow(engine, sourceId, summarySlug);
+    const wt = await writePageThrough(engine, summarySlug, { sourceId });
+    if (!wt.written && wt.skipped !== 'disabled_by_config' && wt.skipped !== 'no_repo_configured') {
+      process.stderr.write(
+        `[dream] summary file-write failed: ${wt.error ?? wt.skipped ?? 'unknown'}\n`,
+      );
+    }
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     process.stderr.write(`[dream] summary file-write failed: ${msg}\n`);

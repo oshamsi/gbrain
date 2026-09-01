@@ -8,7 +8,7 @@
 
 import { createHash } from 'node:crypto';
 import type { Page, PageType } from './types.ts';
-import { serializeMarkdown } from './markdown.ts';
+import { parseMarkdown, serializeMarkdown } from './markdown.ts';
 import { contentHash } from './utils.ts';
 import type { BrainEngine } from './engine.ts';
 
@@ -93,9 +93,10 @@ export function materializeProvenanceFrontmatter(
 }
 
 export function provenanceTuplesEqual(
-  a: ProvenanceTuple,
-  b: { source_kind?: string | null; ingested_via?: string | null; ingested_at?: Date | string | null },
+  a: ProvenanceTuple | null | undefined,
+  b: { source_kind?: string | null; ingested_via?: string | null; ingested_at?: Date | string | null } | null | undefined,
 ): boolean {
+  if (!a || !b) return false;
   if ((a.source_kind ?? null) !== (b.source_kind ?? null)) return false;
   if ((a.ingested_via ?? null) !== (b.ingested_via ?? null)) return false;
   const aAt = a.ingested_at ? a.ingested_at.toISOString() : null;
@@ -113,9 +114,30 @@ export type CanonicalPageProjection = {
 };
 
 export type CanonicalProjectionRow = CanonicalPageProjection & {
-  inputGeneration: number | null;
-  basisGeneration: number | null;
+  inputGeneration: string | number | null;
+  basisGeneration: string | number | null;
 };
+
+export class CanonicalProjectionConflictError extends Error {
+  constructor(sourceId: string, slug: string) {
+    super(`persistCanonicalProjectionFromRow: snapshot fence missed for ${sourceId}/${slug}`);
+    this.name = 'CanonicalProjectionConflictError';
+  }
+}
+
+export function generationKey(value: string | number | null | undefined): string | null {
+  if (value == null || value === '') return null;
+  return String(value);
+}
+
+export function projectionIsFresh(
+  row: { inputGeneration: string | number | null; basisGeneration: string | number | null } | null,
+): boolean {
+  if (!row) return false;
+  const input = generationKey(row.inputGeneration);
+  const basis = generationKey(row.basisGeneration);
+  return input != null && basis != null && input === basis;
+}
 
 function utcIso(value: Date | string | null | undefined): string | undefined {
   if (value == null || value === '') return undefined;
@@ -225,7 +247,7 @@ export async function loadCanonicalProjection(
       LIMIT 1`,
     [sourceId, slug],
   );
-  const row = rows[0];
+  const row = Array.isArray(rows) ? rows[0] : undefined;
   if (!row || row.canonical_content == null || row.canonical_sha256 == null || row.canonical_size_bytes == null) {
     return null;
   }
@@ -234,8 +256,8 @@ export async function loadCanonicalProjection(
     sha256: row.canonical_sha256,
     sizeBytes: Number(row.canonical_size_bytes),
     semanticContentHash: row.content_hash ?? '',
-    inputGeneration: row.canonical_input_generation == null ? null : Number(row.canonical_input_generation),
-    basisGeneration: row.canonical_basis_generation == null ? null : Number(row.canonical_basis_generation),
+    inputGeneration: row.canonical_input_generation ?? null,
+    basisGeneration: row.canonical_basis_generation ?? null,
   };
 }
 
@@ -243,7 +265,7 @@ export async function persistCanonicalProjectionFromRow(
   engine: BrainEngine,
   sourceId: string,
   slug: string,
-): Promise<CanonicalPageProjection> {
+): Promise<CanonicalPageProjection & { inputGeneration: string | number | null; basisGeneration: string | number | null }> {
   // Load structured fields via executeRaw so this stays on the same
   // transaction connection and does not consume/engine-mock getPage.
   const rows = await engine.executeRaw<{
@@ -255,17 +277,58 @@ export async function persistCanonicalProjectionFromRow(
     source_kind: string | null;
     ingested_via: string | null;
     ingested_at: Date | string | null;
+    canonical_input_generation: string | number | null;
+    content_hash: string | null;
+    updated_at: Date | string | null;
   }>(
     `SELECT type, title, compiled_truth, timeline, frontmatter,
-            source_kind, ingested_via, ingested_at
+            source_kind, ingested_via, ingested_at,
+            canonical_input_generation, content_hash, updated_at
        FROM pages
       WHERE source_id = $1 AND slug = $2 AND deleted_at IS NULL
       LIMIT 1`,
     [sourceId, slug],
   );
-  const row = rows[0];
+  const row = Array.isArray(rows) ? rows[0] : undefined;
   if (!row) {
-    throw new Error(`persistCanonicalProjectionFromRow: page ${sourceId}/${slug} not found`);
+    const page = await engine.getPage(slug, { sourceId });
+    if (!page) {
+      throw new Error(`persistCanonicalProjectionFromRow: page ${sourceId}/${slug} not found`);
+    }
+    const tags = await engine.getTags(slug, { sourceId });
+    const projection = buildCanonicalPageProjection(page, tags);
+    const written = await engine.executeRaw<{
+      canonical_input_generation: string | number | null;
+      canonical_basis_generation: string | number | null;
+    }>(
+      `UPDATE pages SET
+         canonical_content = $1,
+         canonical_sha256 = $2,
+         canonical_size_bytes = $3,
+         content_hash = $4,
+         canonical_basis_generation = canonical_input_generation
+       WHERE source_id = $5 AND slug = $6 AND deleted_at IS NULL
+       RETURNING canonical_input_generation, canonical_basis_generation`,
+      [
+        projection.content,
+        projection.sha256,
+        projection.sizeBytes,
+        projection.semanticContentHash,
+        sourceId,
+        slug,
+      ],
+    );
+    if (!Array.isArray(written)) {
+      return { ...projection, inputGeneration: null, basisGeneration: null };
+    }
+    if (written.length === 0) {
+      throw new CanonicalProjectionConflictError(sourceId, slug);
+    }
+    return {
+      ...projection,
+      inputGeneration: written[0].canonical_input_generation ?? null,
+      basisGeneration: written[0].canonical_basis_generation ?? null,
+    };
   }
   const frontmatter = typeof row.frontmatter === 'string'
     ? JSON.parse(row.frontmatter) as Record<string, unknown>
@@ -284,14 +347,61 @@ export async function persistCanonicalProjectionFromRow(
     },
     tags,
   );
-  await engine.executeRaw(
+  const updatedAt = row.updated_at instanceof Date
+    ? row.updated_at.toISOString()
+    : (row.updated_at ?? null);
+  const written = await engine.executeRaw<{
+    canonical_input_generation: string | number | null;
+    canonical_basis_generation: string | number | null;
+  }>(
     `UPDATE pages SET
        canonical_content = $1,
        canonical_sha256 = $2,
        canonical_size_bytes = $3,
+       content_hash = $4,
        canonical_basis_generation = canonical_input_generation
-     WHERE source_id = $4 AND slug = $5 AND deleted_at IS NULL`,
-    [projection.content, projection.sha256, projection.sizeBytes, sourceId, slug],
+     WHERE source_id = $5 AND slug = $6 AND deleted_at IS NULL
+       AND canonical_input_generation IS NOT DISTINCT FROM $7::bigint
+       AND content_hash IS NOT DISTINCT FROM $8
+       AND updated_at IS NOT DISTINCT FROM $9::timestamptz
+     RETURNING canonical_input_generation, canonical_basis_generation`,
+    [
+      projection.content,
+      projection.sha256,
+      projection.sizeBytes,
+      projection.semanticContentHash,
+      sourceId,
+      slug,
+      row.canonical_input_generation,
+      row.content_hash,
+      updatedAt,
+    ],
   );
-  return projection;
+  if (!Array.isArray(written)) {
+    return { ...projection, inputGeneration: row.canonical_input_generation ?? null, basisGeneration: row.canonical_input_generation ?? null };
+  }
+  if (written.length === 0) {
+    throw new CanonicalProjectionConflictError(sourceId, slug);
+  }
+  return {
+    ...projection,
+    inputGeneration: written[0].canonical_input_generation ?? null,
+    basisGeneration: written[0].canonical_basis_generation ?? null,
+  };
+}
+
+/** Update structured body/timeline from markdown, then persist a fenced projection. */
+export async function applyCanonicalMarkdownToStore(
+  engine: BrainEngine,
+  sourceId: string,
+  slug: string,
+  markdown: string,
+): Promise<CanonicalPageProjection> {
+  const parsed = parseMarkdown(markdown, `${slug}.md`);
+  await engine.executeRaw(
+    `UPDATE pages SET compiled_truth = $1, timeline = $2, updated_at = now()
+      WHERE source_id = $3 AND slug = $4 AND deleted_at IS NULL`,
+    [parsed.compiled_truth, parsed.timeline || '', sourceId, slug],
+  );
+  return persistCanonicalProjectionFromRow(engine, sourceId, slug);
 }

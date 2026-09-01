@@ -18,8 +18,6 @@
  *     ON CONFLICT semantics in importFromContent).
  */
 
-import { join, dirname } from 'node:path';
-import { mkdirSync, writeFileSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import type { BrainEngine } from '../engine.ts';
 import type { PhaseResult, PhaseError } from '../cycle.ts';
@@ -27,9 +25,9 @@ import { DEFAULT_PRIVATE_QUEUE_LEASE_MS, MinionQueue } from '../minions/queue.ts
 import { isQueueQuotaExceededError } from '../minions/admission.ts';
 import { waitForCompletionRenewing, TimeoutError } from '../minions/wait-for-completion.ts';
 import type { MinionJobInput, MinionJobStatus, SubagentHandlerData } from '../minions/types.ts';
-import { serializeMarkdown } from '../markdown.ts';
 import { truncateUtf8 } from '../text-safe.ts';
-import type { Page, PageType } from '../types.ts';
+import type { PageType } from '../types.ts';
+import { writePageThrough } from '../write-through.ts';
 // #2415: allow-list + output-root resolution shared with the synthesize
 // phase — both phases must agree on the configured namespace.
 // runSubagentsInline is shared too: a job submitted via queue.add() sits in
@@ -565,40 +563,20 @@ async function reverseWriteRefs(
     validateSourceId(source_id);
     const page = await engine.getPage(slug, { sourceId: source_id });
     if (!page) continue;
-    const tags = await engine.getTags(slug, { sourceId: source_id });
     try {
-      const md = renderPageToMarkdown(page, tags);
-      // v0.32.8 F6: foreign-source pages land under brainDir/.sources/<id>/<slug>.md
-      // so same-slug-different-source pages don't collide on disk. Pages belonging
-      // to the cycle's own source (#1586: brainDir IS that source's checkout —
-      // legacy 'default' when unscoped) stay at brainDir/<slug>.md so single-source
-      // brains see no change. `.sources/` is a reserved prefix; walkBrainRepo skips dot-dirs.
-      const filePath = source_id === nativeSourceId
-        ? join(brainDir, `${slug}.md`)
-        : join(brainDir, '.sources', source_id, `${slug}.md`);
-      mkdirSync(dirname(filePath), { recursive: true });
-      writeFileSync(filePath, md, 'utf8');
-      count++;
+      const wt = await writePageThrough(engine, slug, { sourceId: source_id });
+      if (wt.written) count++;
+      else {
+        process.stderr.write(
+          `[dream] reverse-write ${slug}@${source_id} skipped: ${wt.error ?? wt.skipped ?? 'unknown'}\n`,
+        );
+      }
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       process.stderr.write(`[dream] reverse-write ${slug}@${source_id} failed: ${msg}\n`);
     }
   }
   return count;
-}
-
-function renderPageToMarkdown(page: Page, tags: string[]): string {
-  const frontmatter = (page.frontmatter ?? {}) as Record<string, unknown>;
-  return serializeMarkdown(
-    frontmatter,
-    page.compiled_truth ?? '',
-    page.timeline ?? '',
-    {
-      type: (page.type as string) ?? 'note',
-      title: page.title ?? '',
-      tags,
-    },
-  );
 }
 
 // ── Status helpers ───────────────────────────────────────────────────
