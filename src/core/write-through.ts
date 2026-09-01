@@ -93,7 +93,7 @@ export interface WriteThroughResult {
    *     differently-cased entry that the FS folds onto this page's file, so
    *     writing would silently clobber the OTHER slug's file (#2831) — refused.
    */
-  skipped?: 'disabled_by_config' | 'no_repo_configured' | 'repo_not_found' | 'source_repo_belongs_to_other_source' | 'page_not_found_after_write' | 'path_escapes_source_root' | 'case_insensitive_collision';
+  skipped?: 'disabled_by_config' | 'no_repo_configured' | 'repo_not_found' | 'source_repo_belongs_to_other_source' | 'page_not_found_after_write' | 'path_escapes_source_root' | 'case_insensitive_collision' | 'unchanged';
   /** Set when the render/write/rename itself threw (EACCES, ENOTDIR, disk full). */
   error?: string;
 }

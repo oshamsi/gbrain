@@ -12,6 +12,7 @@ import type {
   FactRow, FactInsertStatus,
   NewFact, FactListOpts, FactsHealth,
   SourceRow,
+  InsertFactsOptions,
 } from './engine.ts';
 // Engine-path imports stay static unless a call site carries an explicit
 // engine-dynamic-import-ok justification. The gateway is the only current

@@ -1411,12 +1411,18 @@ export async function importFromContent(
   // for single-source callers.
   const txOpts = { sourceId: sourceId ?? 'default' };
   const written = await engine.transaction(async (tx) => {
+    const existingCasHash = existing
+      ? (opts.expectedContentHash ?? existing.content_hash)
+      : undefined;
     if (existing) {
+      if (!existingCasHash) {
+        throw new PageWriteConflictError(slug, sourceId ?? 'default', '');
+      }
       await lockExpectedPageSnapshot(
         tx,
         slug,
         sourceId ?? 'default',
-        opts.expectedContentHash ?? existing.content_hash,
+        existingCasHash,
         provenanceFenceOf(existing),
       );
     }
@@ -1483,7 +1489,7 @@ export async function importFromContent(
     }, existing
       ? {
         sourceId: sourceId ?? 'default',
-        expectedContentHash: opts.expectedContentHash ?? existing.content_hash,
+        expectedContentHash: existingCasHash!,
         expectedProvenance: provenanceFenceOf(existing),
         ...(opts.allowEmptyOverwrite === true
           ? { allowEmptyOverwrite: true }

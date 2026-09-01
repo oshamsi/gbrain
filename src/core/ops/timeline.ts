@@ -110,7 +110,9 @@ const add_timeline_entry: Operation = {
       written: false,
       skipped: isSandboxSubagent
         ? 'subagent_sandbox'
-        : writeThrough!.skipped,
+        : writeThrough && writeThrough.kind === 'db_only'
+          ? writeThrough.skipped
+          : 'no_repo_configured',
     };
     if (!inserted) {
       return { status: 'skipped', reason: 'duplicate', write_through: writeThroughReport };

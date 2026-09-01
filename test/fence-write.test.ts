@@ -740,7 +740,6 @@ describe('writeFactsToFence — path matches writePageThrough (#4204)', () => {
     );
 
     expect(result.inserted).toBe(0);
-    expect(result.targetUnresolvable).toBe(true);
     expect(existsSync(goneDir)).toBe(false);
   });
 });

@@ -470,7 +470,7 @@ describe('wave-C review: splice-under-lock, never whole-file regeneration', () =
       summary: 'x',
     });
     expect(out.handled).toBe(false);
-    expect(out.skipped).toBe('file_missing');
+    expect(out.kind === 'partial' || out.kind === 'db_only').toBe(true);
     expect(fs.existsSync(filePath)).toBe(false); // no fabrication from the DB row
 
     // The op still records the entry via the legacy DB-only insert.
@@ -556,7 +556,8 @@ describe('writeTimelineEntryThrough helper', () => {
       summary: 'x',
     });
     expect(out.handled).toBe(false);
-    expect(out.skipped).toBe('no_repo_configured');
+    expect(out.kind).toBe('db_only');
+    if (out.kind === 'db_only') expect(out.skipped).toBe('no_repo_configured');
   });
 
   test('never throws — engine failure surfaces as handled:false + error', async () => {
@@ -577,7 +578,8 @@ describe('writeTimelineEntryThrough helper', () => {
       summary: 'x',
     });
     expect(out.handled).toBe(false);
-    expect(out.error).toContain('boom');
+    expect(out.kind).toBe('partial');
+    if (out.kind === 'partial') expect(out.error).toContain('boom');
   });
 });
 

@@ -1,6 +1,7 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, test } from 'bun:test';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
-import { PageWriteConflictError } from '../src/core/page-cas.ts';
+import { PageWriteConflictError, type PutPageOptions } from '../src/core/page-cas.ts';
+import type { Page } from '../src/core/types.ts';
 import { DuplicatePageIdentityError, importFromContent } from '../src/core/import-file.ts';
 import { contentHash, contentHashLegacy } from '../src/core/utils.ts';
 import { operations, OperationError, type OperationContext } from '../src/core/operations.ts';
@@ -13,10 +14,12 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 
-function engineCas(page: Pick<
-  Page,
-  'content_hash' | 'source_kind' | 'ingested_via' | 'ingested_at'
->): PutPageOptions {
+function engineCas(page: {
+  content_hash?: string | null;
+  source_kind?: string | null;
+  ingested_via?: string | null;
+  ingested_at?: Date | string | null;
+}): PutPageOptions {
   if (!page.content_hash) throw new Error('test fixture has no content_hash');
   return {
     expectedContentHash: page.content_hash,

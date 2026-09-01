@@ -34,6 +34,7 @@ import type {
   FactRow, FactInsertStatus,
   NewFact, FactListOpts, FactsHealth,
   SourceRow,
+  InsertFactsOptions,
 } from './engine.ts';
 import { MAX_SEARCH_LIMIT, clampSearchLimit } from './engine.ts';
 // Engine-path imports stay static unless a call site carries an explicit
@@ -1798,7 +1799,7 @@ export class PGLiteEngine implements BrainEngine {
            RETURNING id, source_id, slug, type, title, compiled_truth, timeline, frontmatter, content_hash, created_at, updated_at, effective_date, effective_date_source, import_filename, source_kind, source_uri, ingested_via, ingested_at`,
           [sourceId, slug, page.type, pageKind, page.title, page.compiled_truth, page.timeline || '', JSON.stringify(frontmatter), hash, effectiveDate, effectiveDateSource, importFilename, chunkerVersion, sourcePath, sourceKind, sourceUri, ingestedVia, ingestedAt],
         );
-      rows = result.rows;
+      rows = result.rows as Record<string, unknown>[];
     }
     if (rows.length === 0 && opts?.expectedContentHash !== undefined) throw new PageWriteConflictError(slug, sourceId, opts.expectedContentHash);
     // PGLite can return zero rows from INSERT ... RETURNING in no-op/trigger

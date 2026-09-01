@@ -86,10 +86,10 @@ describe('#1586: the patterns phase scopes its writes to the cycle source', () =
 
   test('reverse-write resolves the row the child actually wrote', async () => {
     const refs = await collectChildPutPageSlugs(engine as any, [2001], SOURCE_ID);
-    const count = await reverseWriteRefs(engine as any, brainDir, refs, SOURCE_ID);
+    const report = await reverseWriteRefs(engine as any, brainDir, refs, SOURCE_ID);
     // The lookup is keyed on the ref's source_id, so a ref carrying the cycle
     // source resolves the row the child wrote there.
-    expect(count).toBe(1);
+    expect(report.written).toBe(1);
   });
 
   test('the cycle source is native — its pages stay at brainDir/<slug>.md', async () => {

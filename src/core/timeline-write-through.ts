@@ -327,7 +327,7 @@ export async function writeTimelineEntryThrough(
       slug,
       async (): Promise<TimelineWriteThroughOutcome> => {
         const health = await verifyOrRepairPageFile(
-          engine, slug, page.content_hash, { sourceId, logger: opts.logger },
+          engine, slug, page.content_hash ?? '', { sourceId, logger: opts.logger },
         );
         if (health.file_status !== 'healthy' && health.file_status !== 'repaired') {
           return {
