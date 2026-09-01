@@ -1,6 +1,7 @@
 import { existsSync, readFileSync, writeFileSync, statSync, realpathSync } from 'fs';
 import { join, relative, resolve as pathResolve } from 'path';
 import type { BrainEngine } from '../core/engine.ts';
+import { OperationError } from '../core/ops/contract.ts';
 import { DELETE_BATCH_SIZE } from '../core/engine-constants.ts';
 import { importFile, importImageFile, isImageFilePath as isImageImportPath } from '../core/import-file.ts';
 import { collectSyncableFiles, shouldLogIngest } from './import.ts';
@@ -1613,7 +1614,7 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
   // path (per-batch try-catch fallback) can append unrecoverable delete
   // failures here too. Same canonical surface that gates `sync.last_commit`
   // advancement at the bottom of this function.
-  const failedFiles: Array<{ path: string; error: string; line?: number }> = [];
+  const failedFiles: Array<{ path: string; error: string; line?: number; hard?: boolean }> = [];
 
   // Alias-footgun visibility (schema.type_warnings, default on): aggregate
   // per-file type_warning results ONCE per distinct type per run — an
@@ -2151,6 +2152,7 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
           failedFiles.push({
             path,
             error: result.error ?? 'canonical file rewrite failed',
+            hard: true,
           });
         } else if (result.status === 'imported') {
           chunksCreated += result.chunks;
@@ -2182,7 +2184,9 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
       } catch (e: unknown) {
         const msg = e instanceof Error ? e.message : String(e);
         serr(`  Warning: skipped ${path}: ${msg}`);
-        failedFiles.push({ path, error: msg });
+        const hard = e instanceof OperationError
+          && (e.code === 'partial_write' || e.code === 'write_outcome_unknown');
+        failedFiles.push({ path, error: msg, ...(hard ? { hard: true } : {}) });
       } finally {
         permit.release();
       }
@@ -2432,11 +2436,20 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
         `current HEAD.`,
       );
     } else if (gate.sentinelBlocked) {
-      serr(
-        `\nSync blocked: a rename left a stale duplicate that could not be removed:\n` +
-        `${codeBreakdown}\n\n` +
-        `The next 'gbrain sync' retries the reconcile from the same diff.`,
-      );
+      if (failedFiles.some((f) => f.hard)) {
+        serr(
+          `\nSync blocked: canonical write outcome is unresolved:\n` +
+          `${codeBreakdown}\n\n` +
+          `A canonical file rewrite failed after the store commit. Re-run sync; ` +
+          `do not --skip-failed these paths.`,
+        );
+      } else {
+        serr(
+          `\nSync blocked: a rename left a stale duplicate that could not be removed:\n` +
+          `${codeBreakdown}\n\n` +
+          `The next 'gbrain sync' retries the reconcile from the same diff.`,
+        );
+      }
     } else {
       const fileFailCount = failedFiles.filter(f => isSkippablePath(f.path)).length;
       // #3875: code-aware copy. Provider-infra failures (embed timeout /
@@ -2872,7 +2885,11 @@ async function performFullSync(
   if (!fullGate.advanced) {
     const codeBreakdown = formatCodeBreakdown(result.failures);
     if (fullGate.sentinelBlocked) {
-      serr(`\nFull sync blocked: repository history changed during sync.\n${codeBreakdown}`);
+      if (result.failures.some((f) => f.hard)) {
+        serr(`\nFull sync blocked: canonical write outcome is unresolved.\n${codeBreakdown}`);
+      } else {
+        serr(`\nFull sync blocked: repository history changed during sync.\n${codeBreakdown}`);
+      }
     } else {
       const fileFailCount = result.failures.filter(f => isSkippablePath(f.path)).length;
       // #3875: code-aware copy — provider-infra failures must not be routed

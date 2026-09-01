@@ -90,7 +90,7 @@ describe('gbrain quarantine clear', () => {
     await withHome(async () => {
       await importFromContent(engine, 'notes/cleanp', `---\ntitle: C\ntype: note\n---\n\nplain clean prose.`, { noEmbed: true });
       const out = await capture(() => runQuarantine(engine, ['clear', 'notes/cleanp']));
-      expect(out).toContain('no quarantine or content_flag marker');
+      expect(out).toContain('is not quarantined');
     });
   });
 

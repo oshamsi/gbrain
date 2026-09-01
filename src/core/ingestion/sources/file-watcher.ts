@@ -49,9 +49,9 @@ import {
   type IngestionSource,
   type IngestionSourceContext,
 } from '../types.ts';
-import { pruneDir } from '../../sync.ts';
+import { pruneDir, slugifyPath } from '../../sync.ts';
 import { consumeSelfWrite } from '../../self-write-guard.ts';
-import { sha256Utf8 } from '../../page-canonical.ts';
+import { projectionIsFresh, sha256Utf8 } from '../../page-canonical.ts';
 
 export interface FileWatcherSourceOpts {
   /** Source instance id. Defaults to 'file-watcher'. Use distinct ids when
@@ -67,6 +67,8 @@ export interface FileWatcherSourceOpts {
   awaitStabilityMs?: number;
   /** Test seam: alternative chokidar factory. */
   _watchFactory?: (paths: string, opts: ChokidarOptions) => FSWatcher;
+  /** Canonical pages.source_id represented by brainDir. */
+  sourceId?: string;
 }
 
 const DEFAULT_INCLUDE_EXTENSIONS = ['.md', '.markdown'];
@@ -123,17 +125,54 @@ export function createFileWatcherSource(opts: FileWatcherSourceOpts): IngestionS
     return includeExtensions.some((ext) => name.endsWith(ext));
   }
 
-  function flushPending(absPath: string, ctx: IngestionSourceContext): void {
+  async function matchesStoredProjection(
+    ctx: IngestionSourceContext,
+    absPath: string,
+    digest: string,
+  ): Promise<boolean> {
+    const rel = relative(brainDirAbs, absPath).split(sep).join('/');
+    let rows: Array<{
+      canonical_sha256: string | null;
+      canonical_input_generation: string | number | null;
+      canonical_basis_generation: string | number | null;
+    }>;
+    try {
+      rows = await ctx.engine.executeRaw(
+        `SELECT canonical_sha256, canonical_input_generation, canonical_basis_generation
+           FROM pages
+          WHERE source_id = $1 AND deleted_at IS NULL
+            AND (source_path = $2 OR slug = $3)
+          ORDER BY CASE WHEN source_path = $2 THEN 0 ELSE 1 END
+          LIMIT 1`,
+        [opts.sourceId ?? 'default', rel, slugifyPath(rel)],
+      );
+    } catch {
+      // DB unavailability is not proof of a self-write. Emit the event normally.
+      return false;
+    }
+    const row = rows[0];
+    return Boolean(
+      row
+      && row.canonical_sha256 === digest
+      && projectionIsFresh({
+        inputGeneration: row.canonical_input_generation,
+        basisGeneration: row.canonical_basis_generation,
+      }),
+    );
+  }
+
+  async function flushPending(absPath: string, ctx: IngestionSourceContext): Promise<void> {
     const entry = pending.get(absPath);
     if (!entry) return;
     pending.delete(absPath);
-    // Read the file at flush time so we capture the post-debounce content.
-    // Read failures (file deleted between debounce-fire and read) become
-    // silent skips — chokidar will fire 'unlink' separately.
-    readFile(absPath, 'utf8').then(
-      (content) => {
-        const digest = sha256Utf8(content);
-        if (consumeSelfWrite(absPath, digest)) return;
+    try {
+      const content = await readFile(absPath, 'utf8');
+      const digest = sha256Utf8(content);
+      // Consume the process-local hint for bookkeeping, but never let it
+      // suppress by itself: the DB projection may have moved since registration.
+      // Cross-process and same-process suppression share one authoritative proof.
+      consumeSelfWrite(absPath, digest);
+      if (await matchesStoredProjection(ctx, absPath, digest)) return;
         const nowIso = new Date().toISOString();
         const ev: IngestionEvent = {
           source_id: id,
@@ -149,13 +188,9 @@ export function createFileWatcherSource(opts: FileWatcherSourceOpts): IngestionS
           },
         };
         ctx.emit(ev);
-      },
-      (err: unknown) => {
-        ctx.logger.warn(
-          `file-watcher: failed to read ${absPath}: ${err instanceof Error ? err.message : String(err)}`,
-        );
-      },
-    );
+    } catch (error) {
+      ctx.logger.warn(`file-watcher: failed to read ${absPath}: ${String(error)}`);
+    }
   }
 
   function scheduleFlush(absPath: string, eventName: 'add' | 'change', ctx: IngestionSourceContext): void {
@@ -163,7 +198,7 @@ export function createFileWatcherSource(opts: FileWatcherSourceOpts): IngestionS
     if (existing) {
       clearTimeout(existing.timer);
     }
-    const timer = setTimeout(() => flushPending(absPath, ctx), debounceMs);
+    const timer = setTimeout(() => { void flushPending(absPath, ctx); }, debounceMs);
     // Don't keep the process alive solely because of a pending flush.
     if (typeof (timer as { unref?: () => void }).unref === 'function') {
       (timer as { unref?: () => void }).unref!();

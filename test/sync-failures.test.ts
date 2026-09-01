@@ -209,7 +209,7 @@ describe('Bug 9 — sync.ts CLI flag wiring', () => {
   test('runImport returns RunImportResult and records via the ledger', async () => {
     const source = await Bun.file(new URL('../src/commands/import.ts', import.meta.url)).text();
     expect(source).toContain('RunImportResult');
-    expect(source).toContain('failures: Array<{ path: string; error: string }>');
+    expect(source).toContain('failures: Array<{ path: string; error: string; hard?: boolean }>');
     // issue #1939: import records source-scoped via recordFailures (sourceId, …).
     expect(source).toContain('recordFailures');
   });

@@ -3,6 +3,7 @@ import { execFileSync } from 'child_process';
 import { isAbsolute, join, relative, resolve, sep } from 'path';
 import { cpus, totalmem } from 'os';
 import type { BrainEngine } from '../core/engine.ts';
+import { OperationError } from '../core/ops/contract.ts';
 import { importFile, importImageFile, isImageFilePath } from '../core/import-file.ts';
 import { loadConfig, gbrainPath } from '../core/config.ts';
 import { createProgress } from '../core/progress.ts';
@@ -154,7 +155,7 @@ export interface RunImportResult {
   skipped: number;
   errors: number;
   chunksCreated: number;
-  failures: Array<{ path: string; error: string }>;
+  failures: Array<{ path: string; error: string; hard?: boolean }>;
   /** Files dropped by the malformed-filename gate (walker + per-file defense). */
   malformedSkipped?: number;
   /** Aggregated alias/undeclared explicit-type warnings (schema.type_warnings). */
@@ -452,7 +453,7 @@ export async function runImport(
   const importedSlugs: string[] = [];
   const errorCounts: Record<string, number> = {};
   const errorSamples: Record<string, string> = {};
-  const failures: Array<{ path: string; error: string }> = []; // Bug 9
+  const failures: Array<{ path: string; error: string; hard?: boolean }> = []; // Bug 9
   // Alias-footgun visibility: aggregate per-file type_warning results once
   // per distinct type per run (same surface `gbrain sync` carries).
   const typeWarningCounts = new Map<string, import('../core/schema-pack/type-usage.ts').TypeWarningCount>();
@@ -502,7 +503,15 @@ export async function runImport(
       if (_fileMs > 5000) {
         console.error(`[gbrain phase] import.process_file slow ${_fileMs}ms ${relativePath}`);
       }
-      if (result.status === 'imported') {
+      if (result.partial) {
+        errors++;
+        skipped++;
+        failures.push({
+          path: importRelPath,
+          error: result.error ?? 'canonical file rewrite failed',
+          hard: true,
+        });
+      } else if (result.status === 'imported') {
         imported++;
         chunksCreated += result.chunks;
         importedSlugs.push(result.slug);
@@ -540,7 +549,9 @@ export async function runImport(
       }
       errors++;
       skipped++;
-      failures.push({ path: importRelPath, error: msg });
+      const hard = e instanceof OperationError
+        && (e.code === 'partial_write' || e.code === 'write_outcome_unknown');
+      failures.push({ path: importRelPath, error: msg, ...(hard ? { hard: true } : {}) });
     }
     processed++;
     tickProgress();

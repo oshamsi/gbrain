@@ -26,6 +26,7 @@ import { parseFactsFence } from '../src/core/facts-fence.ts';
 import { BrainWriter } from '../src/core/output/writer.ts';
 import type { ResolverContext } from '../src/core/resolvers/interface.ts';
 import { partitionSyncFailures } from '../src/core/sync-failure-ledger.ts';
+import { runImport } from '../src/commands/import.ts';
 import { addTakeToPage } from '../src/core/takes-write.ts';
 import { writeTimelineEntryThrough } from '../src/core/timeline-write-through.ts';
 import { __testing as patternsTesting } from '../src/core/cycle/patterns.ts';
@@ -123,9 +124,9 @@ describe('canonical writer closure', () => {
       source_markdown_slug: 'inbox/fact-retry',
       fact: 'Pinned tuple',
       source: 'test',
-      kind: 'fact',
-      visibility: 'world',
-      notability: 'medium',
+      kind: 'fact' as const,
+      visibility: 'world' as const,
+      notability: 'medium' as const,
       confidence: 1,
       valid_from: new Date('2026-09-01T00:00:00.000Z'),
     };
@@ -207,9 +208,25 @@ describe('canonical writer closure', () => {
       file_status: 'repair_failed',
       error: 'EACCES injected',
     });
-    const failures = [{ path: 'inbox/sync-partial.md', error: result.error!, hard: true }];
-    expect(partitionSyncFailures(failures).sentinels).toHaveLength(1);
-    expect(partitionSyncFailures(failures).fileFailures).toHaveLength(0);
+
+    const inbox = path.join(repo, 'inbox-prod');
+    fs.mkdirSync(inbox, { recursive: true });
+    const prodFile = path.join(inbox, 'prod-partial.md');
+    fs.writeFileSync(prodFile, '---\ntitle: Prod Partial\n---\n\nBODY\n');
+    fs.chmodSync(prodFile, 0o444);
+    fs.chmodSync(inbox, 0o555);
+    let ran;
+    try {
+      ran = await runImport(engine, [inbox, '--no-embed'], { sourceId: 'default' });
+    } finally {
+      fs.chmodSync(inbox, 0o755);
+      try { fs.chmodSync(prodFile, 0o644); } catch { /* rewritten or gone */ }
+    }
+    expect(ran.failures.some((failure) => failure.hard === true)).toBe(true);
+    expect(ran.imported).toBe(0);
+    expect(ran.errors).toBeGreaterThan(0);
+    expect(partitionSyncFailures(ran.failures).sentinels.length).toBeGreaterThan(0);
+    expect(partitionSyncFailures(ran.failures).fileFailures).toHaveLength(0);
   });
 
   test('Takes without sourceId never mirrors to a same-slug named-source page', async () => {

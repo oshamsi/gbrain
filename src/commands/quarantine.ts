@@ -9,12 +9,27 @@
  * still searchable) marks fuzzy markup-heavy / oversize pages. See
  * src/core/quarantine.ts for the marker contract.
  */
+import { existsSync, readFileSync } from 'node:fs';
 import type { BrainEngine } from '../core/engine.ts';
 import { isQuarantined, getContentFlag, QUARANTINE_KEY, CONTENT_FLAG_KEY } from '../core/quarantine.ts';
 import { serializePageToMarkdown, serializeMarkdown } from '../core/markdown.ts';
 import { importFromContent } from '../core/import-file.ts';
+import type { ImportResult } from '../core/import-file.ts';
 import { writePageThrough } from '../core/write-through.ts';
+import type { WriteThroughResult } from '../core/write-through.ts';
+import {
+  isWriteThroughDisabled,
+  resolvePageWriteTarget,
+} from '../core/write-through.ts';
 import type { PageType } from '../core/types.ts';
+import {
+  generationKey,
+  loadCanonicalProjection,
+  persistCanonicalProjectionFromRow,
+  projectionIsFresh,
+  sha256Utf8,
+} from '../core/page-canonical.ts';
+import { withPutPageOperationLock } from '../core/ops/put-page-lock.ts';
 
 export interface QuarantineRow {
   slug: string;
@@ -201,40 +216,36 @@ async function runClear(engine: BrainEngine, args: string[]): Promise<void> {
     console.error(`No page found for slug "${slug}"${sourceIdFlag ? ` in source "${sourceIdFlag}"` : ''}.`);
     process.exit(2);
   }
-  const fm = { ...((page.frontmatter ?? {}) as Record<string, unknown>) };
-  if (!isQuarantined(fm) && !getContentFlag(fm)) {
-    console.log(`Page "${slug}" carries no quarantine or content_flag marker — nothing to clear.`);
-    return;
-  }
-  // Drop both markers, then re-import through the normal pipeline so the page
-  // re-chunks + re-embeds and becomes searchable again. The gate re-runs on
-  // import: if the page is STILL detected as junk it re-quarantines (reported
-  // below) unless --force bypasses the gate for this one import.
-  delete fm[QUARANTINE_KEY];
-  delete fm[CONTENT_FLAG_KEY];
-  const tags = await engine.getTags(slug, { sourceId: page.source_id });
-  // Serialize from the CLEANED frontmatter directly (NOT serializePageToMarkdown,
-  // which re-spreads page.frontmatter as the base and would re-introduce the
-  // markers we just deleted).
-  const markdown = serializeMarkdown(fm, page.compiled_truth ?? '', page.timeline ?? '', {
-    type: (page.type as PageType) ?? 'note',
-    title: page.title ?? '',
-    tags,
-  });
-
   const prevNoSanity = process.env.GBRAIN_NO_SANITY;
-  if (force) process.env.GBRAIN_NO_SANITY = '1';
-  let result;
-  let wt: Awaited<ReturnType<typeof writePageThrough>> | undefined;
+  let canonical!: QuarantineCanonicalOutcome;
   try {
-    result = await importFromContent(engine, slug, markdown, {
-      sourceId: page.source_id,
+    if (force) process.env.GBRAIN_NO_SANITY = '1';
+    canonical = await mutateQuarantinePage(
+      engine,
+      slug,
+      page.source_id,
       noEmbed,
-      forceRechunk: true,
-    });
-    if (result.status !== 'error') {
-      wt = await writePageThrough(engine, slug, { sourceId: page.source_id });
-    }
+      (freshPage, freshTags) => {
+        const fm = { ...((freshPage.frontmatter ?? {}) as Record<string, unknown>) };
+        if (!isQuarantined(fm) && !getContentFlag(fm)) {
+          return { noChange: `Page "${slug}" is not quarantined; nothing to clear.` };
+        }
+        delete fm[QUARANTINE_KEY];
+        delete fm[CONTENT_FLAG_KEY];
+        return {
+          markdown: serializeMarkdown(
+            fm,
+            freshPage.compiled_truth ?? '',
+            freshPage.timeline ?? '',
+            {
+              type: (freshPage.type as PageType) ?? 'note',
+              title: freshPage.title ?? '',
+              tags: [...freshTags],
+            },
+          ),
+        };
+      },
+    );
   } finally {
     if (force) {
       if (prevNoSanity === undefined) delete process.env.GBRAIN_NO_SANITY;
@@ -242,36 +253,56 @@ async function runClear(engine: BrainEngine, args: string[]): Promise<void> {
     }
   }
 
+  if (!canonical.ok) {
+    if (json) {
+      console.log(JSON.stringify({
+        schema_version: 1,
+        slug,
+        cleared: false,
+        partial: true,
+        error: canonical.error,
+        ...(canonical.writeThrough
+          ? { write_through: canonical.writeThrough }
+          : {}),
+      }, null, 2));
+    } else {
+      console.error(`Quarantine clear did not converge for "${slug}": ${canonical.error}`);
+    }
+    process.exitCode = 1;
+    return;
+  }
+  if (canonical.noChange) {
+    if (json) {
+      console.log(JSON.stringify({
+        schema_version: 1,
+        slug,
+        cleared: false,
+        no_op: true,
+        reason: canonical.message,
+      }, null, 2));
+    } else {
+      console.log(canonical.message);
+    }
+    return;
+  }
+  const result = canonical.result;
+  const wt = canonical.writeThrough;
+
   const reQuarantined = result.quarantined === true;
-  const fileFailed = Boolean(
-    wt
-    && wt.written !== true
-    && wt.skipped !== 'disabled_by_config'
-    && wt.skipped !== 'no_repo_configured',
-  );
   if (json) {
     console.log(JSON.stringify({
       slug,
-      cleared: !reQuarantined && !fileFailed,
+      cleared: !reQuarantined,
       re_quarantined: reQuarantined,
       flagged: result.flagged ?? false,
       forced: force,
-      ...(fileFailed ? { partial: true, write_through: wt } : {}),
     }, null, 2));
-    if (fileFailed && !reQuarantined) process.exit(1);
     return;
   }
   if (reQuarantined) {
     console.error(
       `Page "${slug}" is STILL detected as junk — it remained quarantined. ` +
       `Edit the source file to fix it, or re-run with --force to clear it anyway.`,
-    );
-    process.exit(1);
-  }
-  if (fileFailed) {
-    console.error(
-      `Cleared "${slug}" in the store but the canonical file write failed` +
-      ` (${wt?.error ?? wt?.skipped ?? 'unknown'}). Not reporting success.`,
     );
     process.exit(1);
   }
@@ -312,6 +343,7 @@ async function runScan(engine: BrainEngine, args: string[]): Promise<void> {
   let quarantined = 0;
   let flagged = 0;
   const touched: Array<{ slug: string; outcome: 'quarantine' | 'flag' }> = [];
+  const writeFailures: Array<{ slug: string; source_id: string; error: string }> = [];
 
   for (const ref of refs) {
     if (scanned >= limit) break;
@@ -346,27 +378,30 @@ async function runScan(engine: BrainEngine, args: string[]): Promise<void> {
       continue;
     }
 
-    // --apply: re-import so the gate sets markers + (for quarantine) drops chunks.
-    const tags = await engine.getTags(ref.slug, { sourceId: ref.source_id });
-    const markdown = serializePageToMarkdown(page, tags);
-    const result = await importFromContent(engine, ref.slug, markdown, {
-      sourceId: ref.source_id,
+    const canonical = await mutateQuarantinePage(
+      engine,
+      ref.slug,
+      ref.source_id,
       noEmbed,
-      forceRechunk: true,
-    });
-    if (result.status !== 'error') {
-      const wt = await writePageThrough(engine, ref.slug, { sourceId: ref.source_id });
-      if (
-        wt.written !== true
-        && wt.skipped !== 'disabled_by_config'
-        && wt.skipped !== 'no_repo_configured'
-      ) {
-        console.error(
-          `quarantine scan: store updated for ${ref.slug} but canonical file write failed` +
-          ` (${wt.error ?? wt.skipped ?? 'unknown'})`,
-        );
-      }
+      (freshPage, freshTags) => {
+        if (isQuarantined(freshPage.frontmatter) || getContentFlag(freshPage.frontmatter)) {
+          return { noChange: 'page became quarantined while scan was waiting for its lock' };
+        }
+        return {
+          markdown: serializePageToMarkdown(freshPage, [...freshTags]),
+        };
+      },
+    );
+    if (!canonical.ok) {
+      writeFailures.push({
+        slug: ref.slug,
+        source_id: ref.source_id,
+        error: canonical.error,
+      });
+      continue;
     }
+    if (canonical.noChange) continue;
+    const result = canonical.result;
     if (result.quarantined) {
       quarantined++;
       touched.push({ slug: ref.slug, outcome: 'quarantine' });
@@ -377,15 +412,211 @@ async function runScan(engine: BrainEngine, args: string[]): Promise<void> {
   }
 
   if (json) {
-    console.log(JSON.stringify({ schema_version: 1, applied: apply, scanned, quarantined, flagged, touched }, null, 2));
+    console.log(JSON.stringify({
+      schema_version: 1,
+      applied: apply,
+      scanned,
+      quarantined,
+      flagged,
+      touched,
+      partial: writeFailures.length > 0,
+      write_failures: writeFailures,
+    }, null, 2));
+    if (writeFailures.length > 0) process.exitCode = 1;
     return;
   }
   const verb = apply ? '' : '(dry-run) would ';
   console.log(`Scanned ${scanned} page(s): ${verb}quarantine ${quarantined}, ${verb}flag ${flagged}.`);
+  for (const failure of writeFailures) {
+    console.error(`  ${failure.source_id}/${failure.slug}: ${failure.error}`);
+  }
+  if (writeFailures.length > 0) process.exitCode = 1;
   if (!apply && (quarantined > 0 || flagged > 0)) {
     console.log('Re-run with --apply to set the markers.');
   }
 }
+
+export const __testing = {
+  requiredWriteFailure,
+  mutateQuarantinePage,
+};
+
+function requiredWriteFailure(
+  result: ImportResult,
+  outcome?: WriteThroughResult,
+): string | null {
+  if (result.status === 'error') return result.error ?? 'import failed';
+  if (result.partial) return result.error ?? 'partial import';
+  if (result.superseded_after_commit) return 'import was superseded after commit';
+  if (result.status === 'skipped' && result.error && result.error !== 'unchanged') {
+    return result.error;
+  }
+  if (
+    outcome
+    && !outcome.written
+    && outcome.skipped !== 'disabled_by_config'
+    && outcome.skipped !== 'no_repo_configured'
+    && outcome.skipped !== 'source_repo_belongs_to_other_source'
+  ) {
+    return outcome.error ?? outcome.skipped ?? 'canonical write failed';
+  }
+  return null;
+}
+
+type QuarantineCanonicalOutcome =
+  | { ok: true; noChange: true; message: string }
+  | {
+      ok: true;
+      noChange: false;
+      result: ImportResult;
+      writeThrough?: WriteThroughResult;
+    }
+  | {
+      ok: false;
+      error: string;
+      result?: ImportResult;
+      writeThrough?: WriteThroughResult;
+    };
+
+type QuarantinePreparation =
+  | { markdown: string }
+  | { noChange: string };
+
+type QuarantineTestHooks = {
+  afterImportBeforeReceiptCheck?: () => void | Promise<void>;
+};
+
+function projectionMatchesReceipt(
+  projection: Awaited<ReturnType<typeof loadCanonicalProjection>>,
+  receipt: NonNullable<ImportResult['canonical_receipt']>,
+): boolean {
+  return projection != null
+    && projectionIsFresh(projection)
+    && projection.sha256 === receipt.sha256
+    && projection.sizeBytes === receipt.sizeBytes
+    && projection.semanticContentHash === receipt.semanticContentHash
+    && generationKey(projection.inputGeneration)
+      === generationKey(receipt.inputGeneration)
+    && generationKey(projection.basisGeneration)
+      === generationKey(receipt.basisGeneration);
+}
+
+async function mutateQuarantinePage(
+  engine: BrainEngine,
+  slug: string,
+  sourceId: string,
+  noEmbed: boolean,
+  prepare: (
+    page: NonNullable<Awaited<ReturnType<BrainEngine['getPage']>>>,
+    tags: readonly string[],
+  ) => QuarantinePreparation,
+  testHooks: QuarantineTestHooks = {},
+): Promise<QuarantineCanonicalOutcome> {
+  return withPutPageOperationLock(engine, sourceId, slug, async () => {
+    try {
+      const freshPage = await engine.getPage(slug, { sourceId });
+      if (!freshPage) return { ok: false, error: 'page disappeared before quarantine mutation' };
+      const freshTags = await engine.getTags(slug, { sourceId });
+      const prepared = prepare(freshPage, freshTags);
+      if ('noChange' in prepared) {
+        return { ok: true, noChange: true, message: prepared.noChange };
+      }
+      const markdown = prepared.markdown;
+
+      const disabled = await isWriteThroughDisabled(engine);
+      let target: Awaited<ReturnType<typeof resolvePageWriteTarget>> | undefined;
+      let dbOnly = disabled;
+      if (!disabled) {
+        target = await resolvePageWriteTarget(engine, slug, sourceId);
+        if (!target.ok) {
+          if (
+            target.skipped === 'no_repo_configured'
+            || target.skipped === 'source_repo_belongs_to_other_source'
+          ) dbOnly = true;
+          else return { ok: false, error: target.skipped };
+        }
+      }
+
+      let expectedTargetSha256: string | null = null;
+      if (!dbOnly && target?.ok) {
+        let before = await loadCanonicalProjection(engine, sourceId, slug);
+        if (!before || !projectionIsFresh(before)) {
+          before = await persistCanonicalProjectionFromRow(engine, sourceId, slug);
+        }
+        if (existsSync(target.filePath)) {
+          const bytes = readFileSync(target.filePath);
+          const actual = sha256Utf8(bytes);
+          if (actual !== before.sha256 || bytes.length !== before.sizeBytes) {
+            return {
+              ok: false,
+              error: 'canonical file differs before quarantine mutation; sync/re-read first',
+            };
+          }
+          expectedTargetSha256 = actual;
+        }
+      }
+
+      let result: ImportResult;
+      try {
+        result = await importFromContent(engine, slug, markdown, {
+          sourceId,
+          noEmbed,
+          forceRechunk: true,
+        });
+      } catch (error) {
+        return {
+          ok: false,
+          error: error instanceof Error ? error.message : String(error),
+        };
+      }
+      const importFailure = requiredWriteFailure(result);
+      if (importFailure) return { ok: false, error: importFailure, result };
+      const receipt = result.canonical_receipt;
+      if (!receipt) {
+        return { ok: false, error: 'canonical import returned no receipt', result };
+      }
+      await testHooks.afterImportBeforeReceiptCheck?.();
+      const committed = await loadCanonicalProjection(engine, sourceId, slug);
+      if (!projectionMatchesReceipt(committed, receipt)) {
+        return {
+          ok: false,
+          error: 'quarantine import no longer owns the canonical projection',
+          result,
+        };
+      }
+      if (dbOnly) return { ok: true, noChange: false, result };
+      if (!target?.ok) return { ok: false, error: 'canonical target classification lost', result };
+      const writeThrough = await writePageThrough(engine, slug, {
+        sourceId,
+        expectedPath: target.filePath,
+        expectedTargetSha256,
+      });
+      const writeFailure = requiredWriteFailure(result, writeThrough);
+      if (writeFailure) {
+        return { ok: false, error: writeFailure, result, writeThrough };
+      }
+
+      const after = await loadCanonicalProjection(engine, sourceId, slug);
+      const bytes = readFileSync(target.filePath);
+      if (
+        !projectionMatchesReceipt(after, receipt)
+        || bytes.length !== receipt.sizeBytes
+        || sha256Utf8(bytes) !== receipt.sha256
+      ) {
+        return {
+          ok: false,
+          error: 'canonical planes moved after quarantine commit',
+          result,
+          writeThrough,
+        };
+      }
+      return { ok: true, noChange: false, result, writeThrough };
+    } catch (error) {
+      return { ok: false, error: error instanceof Error ? error.message : String(error) };
+    }
+  });
+}
+
 
 export async function runQuarantine(engine: BrainEngine, args: string[]): Promise<void> {
   const sub = args[0];

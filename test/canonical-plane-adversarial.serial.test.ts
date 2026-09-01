@@ -928,6 +928,16 @@ describe('watcher self-origin and static renderer guard', () => {
     const f = path.join(tmp, 'note.md');
     const body = '# Hello\n';
     fs.writeFileSync(f, body);
+    await engine.executeRaw(
+      `UPDATE sources SET local_path = $1 WHERE id = 'default'`,
+      [tmp],
+    );
+    await importFromContent(engine, 'note', `---\ntitle: Note\n---\n\n${body}`, {
+      noEmbed: true, sourceId: 'default', sourcePath: 'note.md',
+    });
+    await persistCanonicalProjectionFromRow(engine, 'default', 'note');
+    const stored = await loadCanonicalProjection(engine, 'default', 'note');
+    fs.writeFileSync(f, stored!.content);
     const emitter = new EventEmitter();
     const state = { readyFired: false };
     const stub = {
@@ -952,10 +962,11 @@ describe('watcher self-origin and static renderer guard', () => {
     } as unknown as FSWatcher;
     const source = createFileWatcherSource({
       brainDir: tmp,
+      sourceId: 'default',
       debounceMs: 30,
       _watchFactory: () => stub,
     });
-    const harness = new IngestionTestHarness();
+    const harness = new IngestionTestHarness({ engine });
     const start = harness.run(source);
     state.readyFired = true;
     emitter.emit('ready');
@@ -977,18 +988,37 @@ describe('watcher self-origin and static renderer guard', () => {
     const files = [
       'core/takes-write.ts',
       'core/facts/fence-write.ts',
+      'core/facts/forget.ts',
       'core/timeline-write-through.ts',
       'core/cycle/patterns.ts',
+      'core/cycle/synthesize.ts',
       'core/output/writer.ts',
       'core/write-through.ts',
       'core/ops/tags.ts',
+      'commands/quarantine.ts',
+      'commands/import.ts',
+      'commands/sync.ts',
     ];
     for (const rel of files) {
       const src = fs.readFileSync(path.join(root, rel), 'utf8');
-      expect(src.includes('writePageThrough') || src.includes('persistCanonicalProjectionFromRow') || src.includes('applyCanonicalMarkdownToStore')).toBe(true);
+      expect(
+        src.includes('writePageThrough')
+        || src.includes('persistCanonicalProjectionFromRow')
+        || src.includes('applyCanonicalMarkdownToStore')
+        || src.includes('importFromFile')
+        || src.includes('mutateQuarantinePage')
+        || src.includes('partitionSyncFailures'),
+      ).toBe(true);
       expect(src).not.toMatch(/writeFileSync\([^)]*serializeMarkdown/);
       expect(src).not.toMatch(/writeFileSync\([^)]*serializePageToMarkdown/);
     }
+    const watcher = fs.readFileSync(
+      path.join(root, 'core/ingestion/sources/file-watcher.ts'),
+      'utf8',
+    );
+    expect(watcher).toContain('matchesStoredProjection');
+    expect(watcher).not.toMatch(/writeFileSync\([^)]*serializeMarkdown/);
+    expect(watcher).not.toMatch(/writeFileSync\([^)]*serializePageToMarkdown/);
     const canonical = fs.readFileSync(path.join(root, 'core/page-canonical.ts'), 'utf8');
     expect(canonical).toContain('export function buildCanonicalPageProjection');
   });
@@ -1059,7 +1089,7 @@ describe('atomic canonical identity', () => {
       [slug],
     );
     const stale = await loadCanonicalProjection(engine, 'default', slug);
-    expect(stale!.semanticContentHash).toBe(before!.content_hash);
+    expect(stale!.semanticContentHash === before!.content_hash).toBe(true);
     expect(String(stale!.inputGeneration)).not.toBe(String(stale!.basisGeneration));
 
     const result = await importFromContent(engine, slug, content, {
