@@ -39,8 +39,8 @@ export interface AtomicWriteOpts {
    * still parses (backlinks uses parseMarkdown here).
    */
   verify?: (onDisk: string) => void;
-  /** If set, refuse the rename when the current target SHA differs. */
-  expectedTargetHash?: string;
+  /** string = exact existing digest; null = target must not exist. */
+  expectedTargetHash?: string | null;
 }
 
 export function atomicWriteFileSync(filePath: string, content: string, opts?: AtomicWriteOpts): void {
@@ -79,13 +79,22 @@ export function atomicWriteFileSync(filePath: string, content: string, opts?: At
     // inode's mode exactly; this keeps that property.
     if (mode !== null) chmodSync(tmpPath, mode);
 
-    if (opts?.expectedTargetHash) {
-      if (!existsSync(filePath)) {
-        throw new Error('atomic-write: expected target missing');
-      }
-      const actual = createHash('sha256').update(readFileSync(filePath)).digest('hex');
-      if (actual !== opts.expectedTargetHash) {
-        throw new Error('atomic-write: target hash mismatch');
+    if (opts && Object.hasOwn(opts, 'expectedTargetHash')) {
+      const expected = opts.expectedTargetHash;
+      if (expected === null) {
+        if (existsSync(filePath)) {
+          throw new Error('atomic-write: unexpected target appeared');
+        }
+      } else {
+        if (!existsSync(filePath)) {
+          throw new Error('atomic-write: expected target missing');
+        }
+        const actual = createHash('sha256')
+          .update(readFileSync(filePath))
+          .digest('hex');
+        if (actual !== expected) {
+          throw new Error('atomic-write: target hash mismatch');
+        }
       }
     }
     if (opts?.verify) {

@@ -35,18 +35,24 @@
  */
 
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, readFileSync, writeFileSync, renameSync, appendFileSync, unlinkSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, appendFileSync } from 'node:fs';
 import { dirname, isAbsolute, relative } from 'node:path';
 
 import type { BrainEngine, NewFact, FactVisibility } from '../engine.ts';
-import { inferTypeFromPack } from '../markdown.ts';
+import { inferTypeFromPack, parseMarkdown } from '../markdown.ts';
 import { loadActivePackBestEffort } from '../schema-pack/best-effort.ts';
-import { withPageLock } from '../page-lock.ts';
+import { withPutPageOperationLock } from '../ops/put-page-lock.ts';
 import { gbrainPath } from '../config.ts';
-import { isWriteThroughDisabled, resolvePageWriteTarget, writePageThrough } from '../write-through.ts';
-import { applyCanonicalMarkdownToStore } from '../page-canonical.ts';
+import { isWriteThroughDisabled, resolvePageWriteTarget, verifyOrRepairPageFile } from '../write-through.ts';
+import {
+  loadCanonicalProjection,
+  persistCanonicalProjectionFromRow,
+  projectionIsFresh,
+  sha256Utf8,
+} from '../page-canonical.ts';
+import { commitCanonicalMarkdownMutation } from '../canonical-mutation.ts';
 import { isDurabilityHardened, commitWriteThroughFile } from '../brain-repo-durability.ts';
-import { upsertFactRow, parseFactsFence } from '../facts-fence.ts';
+import { upsertFactRow, parseFactsFence, type ParsedFact } from '../facts-fence.ts';
 import { extractFactsFromFenceText } from './extract-from-fence.ts';
 import { logStubGuardEvent } from './stub-guard-audit.ts';
 
@@ -100,16 +106,6 @@ export interface FenceWriteResult {
    * fell through resolution and produced a top-level `jared.md` stub.
    */
   stubGuardBlocked?: true;
-  /**
-   * True when the shared page-target resolver could not produce a usable
-   * fence file path (source tree missing / not a directory, or a hostile
-   * recorded `source_path` escaping the tree). Rows were NOT inserted; the
-   * caller is expected to route the facts to the legacy DB-only path so
-   * they aren't silently dropped. Unlike the old blind `mkdir -p`, we do
-   * NOT resurrect a deleted source tree just to hold a fence — the same
-   * refusal writePageThrough applies (#2018 `repo_not_found`).
-   */
-  targetUnresolvable?: true;
 }
 
 const FAILURE_LOG_PATH = (): string => gbrainPath('facts.write_failures.jsonl');
@@ -255,12 +251,28 @@ function stubEntityPage(
  * failure on the page (no rows inserted, no duplicate count, no
  * fact_ids).
  */
+function sameCanonicalFenceFact(row: ParsedFact, input: FenceInputFact): boolean {
+  const explicitFrom = input.validFrom?.toISOString().slice(0, 10);
+  const until = input.validUntil?.toISOString().slice(0, 10);
+  return row.active
+    && row.claim === input.fact
+    && row.kind === (input.kind ?? 'fact')
+    && row.confidence === (input.confidence ?? 1)
+    && row.visibility === input.visibility
+    && row.notability === (input.notability ?? 'medium')
+    && (explicitFrom === undefined || row.validFrom === explicitFrom)
+    && (row.validUntil ?? undefined) === until
+    && (row.source ?? '') === input.source
+    && (row.context ?? '') === (input.context ?? '');
+}
+
 export async function writeFactsToFence(
   engine: BrainEngine,
   target: FenceTarget,
   facts: FenceInputFact[],
 ): Promise<FenceWriteResult> {
-  if (target.localPath === null) {
+  const sourceRoot = target.localPath;
+  if (sourceRoot === null) {
     return { inserted: 0, ids: [], legacyFallback: true };
   }
   if (facts.length === 0) {
@@ -288,83 +300,75 @@ export async function writeFactsToFence(
   // of minting a slug-derived twin beside a human-named vault file.
   const resolved = await resolvePageWriteTarget(engine, target.slug, target.sourceId);
   if (!resolved.ok) {
-    // Target tree unusable (deleted dir, hostile source_path row, …) — the
-    // caller routes the facts to the legacy DB-only path so they are
-    // recorded, not dropped.
-    return { inserted: 0, ids: [], targetUnresolvable: true };
+    if (
+      resolved.skipped === 'no_repo_configured'
+      || resolved.skipped === 'source_repo_belongs_to_other_source'
+    ) {
+      return { inserted: 0, ids: [], legacyFallback: true };
+    }
+    recordWriteFailure(
+      target.slug, target.sourceId, [resolved.skipped], sourceRoot,
+    );
+    return { inserted: 0, ids: [], fenceWriteFailed: true };
   }
-  const { filePath, writeRoot } = resolved;
-  const tmpPath = `${filePath}.tmp`;
-  const durabilityEnabled = isDurabilityHardened(writeRoot);
+  const { filePath } = resolved;
 
-  return withPageLock(
+  return withPutPageOperationLock(
+    engine,
+    target.sourceId,
     target.slug,
     async () => {
-      // 1. Read existing body or stub-create.
-      let body: string;
-      if (existsSync(filePath)) {
-        body = readFileSync(filePath, 'utf-8');
-      } else {
-        // Stub-creation guard. Phantom entity pages at the brain root were
-        // being spawned when resolveEntitySlug fell through to a bare
-        // slugify because pg_trgm scored too low on short bare names. The
-        // resolver now has a prefix-expansion step that catches most of
-        // those, but this guard is the second wall: refuse to stub-create
-        // a page whose slug has no directory prefix (people/, companies/,
-        // deals/, topics/, etc.). The caller routes these facts to the
-        // legacy DB-only path so they aren't silently dropped — the fact
-        // still gets recorded, it just doesn't spawn a phantom entity
-        // page on disk.
-        //
-        // Sunset target: v0.36. Once `stub_guard_24h` (the gbrain doctor
-        // surface backed by the audit log written here) reads <5 hits/week
-        // for 3 consecutive weeks on production brains, the prefix-expansion
-        // in resolveEntitySlug is sufficient and this guard can be removed.
-        // The audit log under `~/.gbrain/audit/stub-guard-YYYY-Www.jsonl`
-        // is the operator visibility surface for that retirement decision.
-        if (!target.slug.includes('/')) {
+      if (!target.slug.includes('/')) {
+        const existingPage = await engine.getPage(target.slug, { sourceId: target.sourceId });
+        if (!existingPage && !existsSync(filePath)) {
           logStubGuardEvent({
             slug: target.slug,
             source_id: target.sourceId,
             fact_count: facts.length,
           });
-          // eslint-disable-next-line no-console
           console.warn(
             `[facts] refusing to stub-create unprefixed entity page slug=${target.slug} — routing to legacy DB-only path. Provide a directory prefix (people/, companies/, etc.) to opt into fence writes.`,
           );
           return { inserted: 0, ids: [], stubGuardBlocked: true };
         }
-        // Stub-create the parent directory if it doesn't exist.
-        mkdirSync(dirname(filePath), { recursive: true });
-        const activePack = await loadActivePackBestEffort({ engine } as never);
-        body = stubEntityPage(target.slug, activePack?.manifest ?? null);
       }
 
-      // 2. Upsert each fact onto the fence in input order. row_num
-      //    monotonically increases (max-existing + 1 per call, append-only).
-      //
-      //    Seed the counter from the DB as well as the fence file. Uniqueness
-      //    is enforced by idx_facts_fence_key on
-      //    (source_id, source_markdown_slug, row_num) in Postgres, but
-      //    upsertFactRow derives the next value from the fence in the markdown
-      //    alone — and falls back to 1 when the file has no fence at all. Any
-      //    write path that rewrites a page without preserving its facts fence
-      //    (put_page write-through, sync, dream-cycle reverse-render) therefore
-      //    resets the counter below what the DB already holds, and the next
-      //    absorb re-issues a row_num that is already taken. That surfaces as
-      //    "duplicate key value violates unique constraint idx_facts_fence_key"
-      //    and the whole batch of facts is dropped.
-      //
-      //    Symptom in the wild: a page whose fence had been rewritten away had
-      //    24 facts in the DB and none in the file, so every subsequent absorb
-      //    on it failed permanently. Taking the max of both sources keeps the
-      //    file as the readable mirror while the DB stays authoritative about
-      //    which row_nums have been issued.
-      //
-      //    Degrades to the previous file-only behaviour if the lookup fails
-      //    (pre-v51 brain without the fence columns, or a transient DB error):
-      //    a fence write must not become impossible just because the counter
-      //    hint is unavailable.
+      const existingPage = await engine.getPage(target.slug, { sourceId: target.sourceId });
+      if (existingPage) {
+        let projection = await loadCanonicalProjection(
+          engine, target.sourceId, target.slug,
+        );
+        if (!projection || !projectionIsFresh(projection)) {
+          projection = await persistCanonicalProjectionFromRow(
+            engine, target.sourceId, target.slug,
+          );
+        }
+        const health = await verifyOrRepairPageFile(
+          engine,
+          target.slug,
+          projection.semanticContentHash,
+          { sourceId: target.sourceId },
+        );
+        if (
+          (health.file_status !== 'healthy' && health.file_status !== 'repaired')
+          || health.path !== filePath
+        ) {
+          throw new Error(
+            `FACTS_FILE_UNAVAILABLE:${health.error ?? health.skipped ?? health.file_status}`,
+          );
+        }
+      }
+
+      const existed = existsSync(filePath);
+      const beforeBytes = existed ? readFileSync(filePath) : null;
+      const expectedTargetSha256 = beforeBytes ? sha256Utf8(beforeBytes) : null;
+      const activePack = beforeBytes
+        ? null
+        : await loadActivePackBestEffort({ engine } as never);
+      let body = beforeBytes
+        ? beforeBytes.toString('utf8')
+        : stubEntityPage(target.slug, activePack?.manifest ?? null);
+
       let dbMaxRowNum = 0;
       try {
         const rows = await engine.executeRaw<{ max_row_num: number | null }>(
@@ -383,108 +387,99 @@ export async function writeFactsToFence(
       let nextRowNum = Math.max(fileMaxRowNum, dbMaxRowNum) + 1;
 
       const assignedRowNums: number[] = [];
-      for (const f of facts) {
-        const validFromStr = (f.validFrom ?? new Date()).toISOString().slice(0, 10);
-        const { body: updated, rowNum } = upsertFactRow(body, {
-          rowNum:      nextRowNum++,
-          claim:       f.fact,
-          kind:        (f.kind ?? 'fact') as 'fact' | 'event' | 'preference' | 'commitment' | 'belief',
-          confidence:  f.confidence ?? 1.0,
-          visibility:  f.visibility,
-          notability:  f.notability ?? 'medium',
-          validFrom:   validFromStr,
-          // MEMORY_VERBS v1 (c5): remember's ttl threads through to the fence
-          // cell — was hard-coded undefined, which silently dropped expiry on
-          // this path. extractFactsFromFenceText derives the DB column from it.
-          validUntil:  f.validUntil ? f.validUntil.toISOString().slice(0, 10) : undefined,
-          source:      f.source,
-          context:     f.context ?? undefined,
-        });
-        body = updated;
-        assignedRowNums.push(rowNum);
-      }
-
-      // Snapshot the prewrite git state INSIDE the lock, immediately before
-      // the write: an out-of-lock snapshot raced concurrent fence writers — a
-      // waiter observed the holder's not-yet-committed rename as pre-existing
-      // dirt and mis-attributed it in the audit.
-      const durabilityPrewriteState: FactFenceGitPathState = durabilityEnabled
-        ? gitPathState(writeRoot, filePath)
-        : 'clean';
-
-      // 3. Atomic write: .tmp first, then parse-validate, then rename.
-      writeFileSync(tmpPath, body, 'utf-8');
-
-      // 4. Parse-before-rename: re-read the .tmp content and verify the
-      //    fence is well-formed. Anything malformed → leave .tmp in
-      //    place as quarantine, write JSONL, do NOT insert to DB.
-      const tmpBody = readFileSync(tmpPath, 'utf-8');
-      const parsed = parseFactsFence(tmpBody);
-      if (parsed.warnings.length > 0) {
-        recordWriteFailure(target.slug, target.sourceId, parsed.warnings, filePath);
-        return { inserted: 0, ids: [], fenceWriteFailed: true };
-      }
-
-      // 5. Store the mutated markdown as the canonical projection, then
-      //    write/verify those bytes. Independent rename is not a complete
-      //    canonical mutation when the page row already exists.
-      const page = await engine.getPage(target.slug, { sourceId: target.sourceId });
-      if (page) {
-        try { unlinkSync(tmpPath); } catch { /* tmp is only a parse-validate artifact */ }
-        await applyCanonicalMarkdownToStore(engine, target.sourceId, target.slug, tmpBody);
-        const wt = await writePageThrough(engine, target.slug, { sourceId: target.sourceId });
-        if (!wt.written && wt.skipped !== 'disabled_by_config' && wt.skipped !== 'no_repo_configured') {
-          recordWriteFailure(
-            target.slug,
-            target.sourceId,
-            [wt.error ?? wt.skipped ?? 'canonical write-through failed'],
-            filePath,
-          );
-          return { inserted: 0, ids: [], fenceWriteFailed: true };
+      for (const input of facts) {
+        const parsedNow = parseFactsFence(body);
+        if (parsedNow.warnings.length > 0) {
+          throw new Error(`FACTS_FENCE_MALFORMED:${parsedNow.warnings.join('|')}`);
         }
-      } else {
-        renameSync(tmpPath, filePath);
+        const already = parsedNow.facts.find((row) =>
+          sameCanonicalFenceFact(row, input),
+        );
+        if (already) {
+          assignedRowNums.push(already.rowNum);
+          continue;
+        }
+        const validFrom = (input.validFrom ?? new Date()).toISOString().slice(0, 10);
+        const appended = upsertFactRow(body, {
+          rowNum: nextRowNum++,
+          claim: input.fact,
+          kind: input.kind ?? 'fact',
+          confidence: input.confidence ?? 1,
+          visibility: input.visibility,
+          notability: input.notability ?? 'medium',
+          validFrom,
+          validUntil: input.validUntil?.toISOString().slice(0, 10),
+          source: input.source,
+          context: input.context ?? undefined,
+        });
+        body = appended.body;
+        assignedRowNums.push(appended.rowNum);
       }
 
-      // 6. Stamp the DB. extractFactsFromFenceText handles the
-      //    validFrom/validUntil date derivation + the strikethrough
-      //    semantic distinction. We only want to insert the NEW rows
-      //    (those with row_nums in assignedRowNums), so filter the
-      //    re-parsed facts to that subset.
-      const allExtracted = extractFactsFromFenceText(parsed.facts, target.slug, target.sourceId);
-      const newRowSet = new Set(assignedRowNums);
-      const toInsert = allExtracted.filter(r => newRowSet.has(r.row_num));
-
-      // Carry per-input embedding + sessionId across — the fence
-      // parser doesn't reconstruct embeddings (they're not in the
-      // fence text) and source_session is runtime provenance that
-      // isn't a fence column either. Stitch them back by row_num
-      // index.
-      const enriched = toInsert.map((row, i) => ({
-        ...row,
-        embedding:      facts[i].embedding,
-        source_session: facts[i].sessionId,
-      }));
-
-      const result = await engine.insertFacts(enriched, { source_id: target.sourceId }); // gbrain-allow-direct-insert: writeFactsToFence is the markdown-first reconcile path; runs only after the atomic fence write commits
-      // v0.46 (#3014) — an unresolvable `superseded by #N` reference (self
-      // / dangling / struck target) leaves superseded_by NULL; log it rather
-      // than swallow it. The row still lands (expired_at set for struck
-      // rows), never a bad FK.
-      for (const w of result.warnings) {
-        // eslint-disable-next-line no-console
-        console.warn(`[facts.supersession] ${w}`);
+      const parsedFence = parseFactsFence(body);
+      if (parsedFence.warnings.length > 0) {
+        throw new Error(`FACTS_FENCE_MALFORMED:${parsedFence.warnings.join('|')}`);
       }
-      if (durabilityEnabled && !page) {
-        await commitFactFenceFile(
-          writeRoot,
-          filePath,
+      const extractedByRow = new Map(
+        extractFactsFromFenceText(parsedFence.facts, target.slug, target.sourceId)
+          .map((row) => [row.row_num, row] as const),
+      );
+      const enriched = assignedRowNums.map((rowNum, index) => {
+        const row = extractedByRow.get(rowNum);
+        if (!row) throw new Error(`FACTS_ROW_NOT_REEXTRACTED:${rowNum}`);
+        return {
+          ...row,
+          embedding: facts[index]!.embedding,
+          source_session: facts[index]!.sessionId,
+        };
+      });
+
+      try {
+        const committed = await commitCanonicalMarkdownMutation(
+          engine,
+          target.sourceId,
+          target.slug,
+          body,
+          async (tx) => {
+            const existing = await tx.getPage(target.slug, { sourceId: target.sourceId });
+            if (!existing) {
+              const parsedPage = parseMarkdown(body, `${target.slug}.md`);
+              await tx.putPage(target.slug, {
+                type: parsedPage.type,
+                title: parsedPage.title,
+                compiled_truth: parsedPage.compiled_truth,
+                timeline: parsedPage.timeline,
+                frontmatter: parsedPage.frontmatter,
+              }, { sourceId: target.sourceId });
+              for (const tag of parsedPage.tags) {
+                await tx.addTag(target.slug, tag, { sourceId: target.sourceId });
+              }
+            }
+            const mirrored = await tx.insertFacts( // gbrain-allow-direct-insert: writeFactsToFence is the markdown-first reconcile path; runs inside the canonical mutation transaction
+              enriched,
+              { source_id: target.sourceId },
+              { inTransaction: true, verifyIdenticalOnConflict: true },
+            );
+            if (mirrored.inserted !== enriched.length) {
+              throw new Error('FACTS_MIRROR_COUNT_MISMATCH');
+            }
+            return mirrored;
+          },
+          { expectedPath: filePath, expectedTargetSha256 },
+        );
+        for (const warning of committed.value.warnings) {
+          console.warn(`[facts.supersession] ${warning}`);
+        }
+        return { inserted: committed.value.inserted, ids: committed.value.ids };
+      } catch (error) {
+        recordWriteFailure(
           target.slug,
           target.sourceId,
-          durabilityPrewriteState,
+          [error instanceof Error ? error.message : String(error)],
+          filePath,
         );
+        throw error;
       }
-      return { inserted: result.inserted, ids: result.ids };
     },
     { timeoutMs: 5_000 },
   );

@@ -37,9 +37,8 @@
  * limitation — see ops/takes.ts.)
  */
 
-import { readFileSync, existsSync, mkdirSync } from 'node:fs';
-import { dirname, join } from 'node:path';
-import { atomicWriteFileSync } from './atomic-write.ts';
+import { readFileSync, existsSync } from 'node:fs';
+import { join } from 'node:path';
 import type { BrainEngine, TakeBatchInput, TakeKind } from './engine.ts';
 import {
   parseTakesFence,
@@ -51,11 +50,21 @@ import {
   type ParsedTake,
   type ParseResult,
 } from './takes-fence.ts';
-import { withPageLock } from './page-lock.ts';
+import { withPutPageOperationLock } from './ops/put-page-lock.ts';
+import { OperationError } from './ops/contract.ts';
 import { resolvePageFilePath, resolveSourceLocalFilePath } from './markdown.ts';
-import { sanitizeRecordedSourcePath, recordedPathFromFileUri, writePageThrough } from './write-through.ts';
+import { sanitizeRecordedSourcePath, recordedPathFromFileUri, verifyOrRepairPageFile } from './write-through.ts';
 import { isWriteTargetContained, msysToNativePath } from './path-confine.ts';
-import { applyCanonicalMarkdownToStore } from './page-canonical.ts';
+import {
+  loadCanonicalProjection,
+  persistCanonicalProjectionFromRow,
+  projectionIsFresh,
+  sha256Utf8,
+} from './page-canonical.ts';
+import {
+  CanonicalMutationPartialError,
+  commitCanonicalMarkdownMutation,
+} from './canonical-mutation.ts';
 
 export type TakesWriteErrorCode =
   | 'page_not_found'      // slug has no pages row (scoped)
@@ -67,7 +76,8 @@ export type TakesWriteErrorCode =
   | 'mirror_unavailable'  // sync.repo_path unset, page file absent, or write target escapes the source root
   | 'page_locked'         // lock contention within the timeout (retryable)
   | 'fence_unparsed'      // the page's fence has parser-skipped rows a whole-fence re-render would delete
-  | 'invalid_input';      // free-text field carries control chars, fence markers, or out-of-range values
+  | 'invalid_input'       // free-text field carries control chars, fence markers, or out-of-range values
+  | 'partial_write';      // store committed; canonical file verification failed
 
 export class TakesWriteError extends Error {
   code: TakesWriteErrorCode;
@@ -103,11 +113,6 @@ export interface TakesWriteTarget {
  * still true because the markdown row is on disk.
  */
 export interface TakeMirror { written: true; path: string; mirror_warning?: string }
-
-/** DB-mirror failures are non-fatal (md is canonical) — stringify for the warning. */
-function mirrorErrorMessage(err: unknown): string {
-  return err instanceof Error ? err.message : String(err);
-}
 
 /**
  * Resolve the markdown brain dir for takes write-through. Returns null when
@@ -191,20 +196,23 @@ async function resolveTakesFilePath(
 /** Test seam: pins the #2955 msys local_path healing at THIS read site. */
 export const __takesWriteTesting = { resolveTakesFilePath };
 
-async function getPageId(engine: BrainEngine, slug: string, sourceId?: string): Promise<number> {
-  const rows = sourceId
-    ? await engine.executeRaw<{ id: number }>(
-        `SELECT id FROM pages WHERE slug = $1 AND source_id = $2 LIMIT 1`,
-        [slug, sourceId],
-      )
-    : await engine.executeRaw<{ id: number }>(
-        `SELECT id FROM pages WHERE slug = $1 LIMIT 1`,
-        [slug],
-      );
+async function getPageId(
+  engine: BrainEngine,
+  slug: string,
+  sourceId?: string,
+): Promise<number> {
+  const sid = sourceId ?? 'default';
+  const rows = await engine.executeRaw<{ id: number }>(
+    `SELECT id
+       FROM pages
+      WHERE source_id = $1 AND slug = $2 AND deleted_at IS NULL
+      LIMIT 1`,
+    [sid, slug],
+  );
   if (!rows[0]) {
     throw new TakesWriteError(
       'page_not_found',
-      `Page not found in brain: ${slug}${sourceId ? ` (source=${sourceId})` : ''}.`,
+      `Page not found in brain: ${slug} (source=${sid}).`,
       'Run a brain sync first, or check the slug/source.',
     );
   }
@@ -295,27 +303,42 @@ function findFenceRow(takes: ParsedTake[], rowNum: number, allowList: HolderAllo
   return target;
 }
 
-function readPageBody(path: string): string {
-  if (!existsSync(path)) {
+async function readCanonicalPageBody(
+  target: TakesWriteTarget,
+  path: string,
+): Promise<{ body: string; expectedTargetSha256: string }> {
+  const sourceId = target.sourceId ?? 'default';
+  let projection = await loadCanonicalProjection(target.engine, sourceId, target.slug);
+  if (!projection || !projectionIsFresh(projection)) {
+    projection = await persistCanonicalProjectionFromRow(target.engine, sourceId, target.slug);
+  }
+  const health = await verifyOrRepairPageFile(
+    target.engine,
+    target.slug,
+    projection.semanticContentHash,
+    { sourceId },
+  );
+  if (
+    (health.file_status !== 'healthy' && health.file_status !== 'repaired')
+    || health.path !== path
+  ) {
     throw new TakesWriteError(
       'mirror_unavailable',
-      `Page file not found at ${path} — takes are markdown-canonical, so the write is refused.`,
+      health.error ?? health.skipped ?? 'canonical file unavailable',
       'takes_mirror_unavailable',
     );
   }
-  return readFileSync(path, 'utf-8');
+  const bytes = readFileSync(path);
+  return { body: bytes.toString('utf8'), expectedTargetSha256: sha256Utf8(bytes) };
 }
 
-/**
- * Persist the mutated markdown as the stored canonical projection, then
- * write/verify those exact bytes. File-first independent writes are no
- * longer a complete canonical mutation.
- */
-async function commitTakesMarkdown(
+async function commitTakesMarkdown<T>(
   target: TakesWriteTarget,
   markdown: string,
   writeRoot: string,
   path: string,
+  expectedTargetSha256: string,
+  mutateDb: (tx: BrainEngine) => Promise<T>,
 ): Promise<string> {
   if (!isWriteTargetContained(path, writeRoot)) {
     throw new TakesWriteError(
@@ -324,32 +347,27 @@ async function commitTakesMarkdown(
       'path_escapes_source_root',
     );
   }
-  const sourceId = target.sourceId ?? 'default';
-  const testDouble = typeof target.engine.getPage !== 'function';
   try {
-    await applyCanonicalMarkdownToStore(target.engine, sourceId, target.slug, markdown);
-    const wt = await writePageThrough(target.engine, target.slug, { sourceId });
-    if (wt.written && wt.path) return wt.path;
-    if (!testDouble) {
+    const result = await commitCanonicalMarkdownMutation(
+      target.engine,
+      target.sourceId ?? 'default',
+      target.slug,
+      markdown,
+      mutateDb,
+      { expectedPath: path, expectedTargetSha256 },
+    );
+    if (!result.file.path) throw new Error('canonical writer returned no path');
+    return result.file.path;
+  } catch (error) {
+    if (error instanceof CanonicalMutationPartialError) {
       throw new TakesWriteError(
-        'mirror_unavailable',
-        wt.error ?? `takes canonical write-through failed (${wt.skipped ?? 'unknown'})`,
-        wt.skipped ?? 'canonical_write_failed',
+        'partial_write',
+        error.message,
+        'The store committed; an identical retry may repair only the canonical file.',
       );
     }
-  } catch (err) {
-    if (err instanceof TakesWriteError) throw err;
-    if (!testDouble) {
-      throw new TakesWriteError(
-        'mirror_unavailable',
-        err instanceof Error ? err.message : String(err),
-        'canonical_write_failed',
-      );
-    }
+    throw error;
   }
-  mkdirSync(dirname(path), { recursive: true });
-  atomicWriteFileSync(path, markdown);
-  return path;
 }
 
 /**
@@ -398,19 +416,19 @@ function toBatchInput(pageId: number, t: ParsedTake, supersededBy?: number | nul
 
 async function withTakesLock<T>(target: TakesWriteTarget, fn: () => Promise<T>): Promise<T> {
   try {
-    return await withPageLock(target.slug, fn, {
-      ...(target.lockTimeoutMs !== undefined ? { timeoutMs: target.lockTimeoutMs } : {}),
-    });
-  } catch (err) {
-    if (err instanceof TakesWriteError) throw err;
-    if (err instanceof Error && err.message.includes('could not acquire lock')) {
-      throw new TakesWriteError(
-        'page_locked',
-        `Another writer holds the page lock for ${target.slug} — retry shortly.`,
-        'retryable',
-      );
+    return await withPutPageOperationLock(
+      target.engine,
+      target.sourceId ?? 'default',
+      target.slug,
+      fn,
+      { ...(target.lockTimeoutMs !== undefined ? { timeoutMs: target.lockTimeoutMs } : {}) },
+    );
+  } catch (error) {
+    if (error instanceof TakesWriteError) throw error;
+    if (error instanceof OperationError && error.code === 'write_conflict') {
+      throw new TakesWriteError('page_locked', error.message, 'retryable');
     }
-    throw err;
+    throw error;
   }
 }
 
@@ -447,10 +465,7 @@ export async function addTakeToPage(
     const { path, writeRoot } = await resolveTakesFilePath(
       target.engine, target.brainDir, target.slug, target.sourceId,
     );
-    const body = existsSync(path) ? readFileSync(path, 'utf-8') : '';
-    // F1: guard only fires when a fence ALREADY exists (an empty/fence-less body
-    // parses to zero warnings) — a whole-fence re-render must not delete rows
-    // this version couldn't parse.
+    const { body, expectedTargetSha256 } = await readCanonicalPageBody(target, path);
     assertFenceRoundTrips(parseTakesFence(body));
     const { body: nextBody, rowNum } = upsertTakeRow(body, {
       claim: input.claim,
@@ -461,22 +476,29 @@ export async function addTakeToPage(
       sinceDate: input.sinceDate,
       active: true,
     });
-    const writtenPath = await commitTakesMarkdown(target, nextBody, writeRoot, path);
-    let mirrorWarning: string | undefined;
-    try {
-      await target.engine.addTakesBatch([{
-        page_id: pageId, row_num: rowNum, claim: input.claim, kind: input.kind,
-        holder: input.holder, weight: input.weight ?? 0.5,
-        since_date: input.sinceDate, source: input.source,
-        active: true, superseded_by: null,
-      }]);
-    } catch (err) {
-      // P1-4/F4: md is canonical + already written — a failed DB mirror is
-      // healed by the next reconcile, so surface a warning instead of throwing
-      // (a throw would make the caller retry and duplicate the durable md row).
-      mirrorWarning = mirrorErrorMessage(err);
-    }
-    return { rowNum, mirror: { written: true, path: writtenPath, ...(mirrorWarning ? { mirror_warning: mirrorWarning } : {}) } };
+    const writtenPath = await commitTakesMarkdown(
+      target,
+      nextBody,
+      writeRoot,
+      path,
+      expectedTargetSha256,
+      async (tx) => {
+        const mirrored = await tx.addTakesBatch([{
+          page_id: pageId,
+          row_num: rowNum,
+          claim: input.claim,
+          kind: input.kind,
+          holder: input.holder,
+          weight: input.weight ?? 0.5,
+          since_date: input.sinceDate,
+          source: input.source,
+          active: true,
+          superseded_by: null,
+        }], { inTransaction: true });
+        if (mirrored !== 1) throw new Error('TAKES_MIRROR_COUNT_MISMATCH');
+      },
+    );
+    return { rowNum, mirror: { written: true, path: writtenPath } };
   });
 }
 
@@ -502,7 +524,7 @@ export async function updateTakeOnPage(
     const { path, writeRoot } = await resolveTakesFilePath(
       target.engine, target.brainDir, target.slug, target.sourceId,
     );
-    const body = readPageBody(path);
+    const { body, expectedTargetSha256 } = await readCanonicalPageBody(target, path);
     const parsed = parseTakesFence(body);
     assertFenceRoundTrips(parsed); // F1: refuse a whole-fence re-render that would drop skipped rows.
     const targetRow = findFenceRow(parsed.takes, rowNum, target.allowList, target.slug);
@@ -521,16 +543,18 @@ export async function updateTakeOnPage(
       sinceDate: fields.sinceDate ?? targetRow.sinceDate,
     };
     const allRows = parsed.takes.map(t => (t.rowNum === rowNum ? updated : t));
-    const writtenPath = await commitTakesMarkdown(target, replaceFence(body, allRows), writeRoot, path);
-    // Mirror md→DB with the reconcile primitive (upsert on (page_id,row_num));
-    // base columns only, resolution columns preserved by the DO UPDATE list.
-    let mirrorWarning: string | undefined;
-    try {
-      await target.engine.addTakesBatch([toBatchInput(pageId, updated)]);
-    } catch (err) {
-      mirrorWarning = mirrorErrorMessage(err); // P1-4/F4: md written; DB mirror deferred to reconcile.
-    }
-    return { rowNum, mirror: { written: true, path: writtenPath, ...(mirrorWarning ? { mirror_warning: mirrorWarning } : {}) } };
+    const writtenPath = await commitTakesMarkdown(
+      target,
+      replaceFence(body, allRows),
+      writeRoot,
+      path,
+      expectedTargetSha256,
+      async (tx) => {
+        const mirrored = await tx.addTakesBatch([toBatchInput(pageId, updated)], { inTransaction: true });
+        if (mirrored !== 1) throw new Error('TAKES_MIRROR_COUNT_MISMATCH');
+      },
+    );
+    return { rowNum, mirror: { written: true, path: writtenPath } };
   });
 }
 
@@ -559,7 +583,7 @@ export async function supersedeTakeOnPage(
     const { path, writeRoot } = await resolveTakesFilePath(
       target.engine, target.brainDir, target.slug, target.sourceId,
     );
-    const body = readPageBody(path);
+    const { body, expectedTargetSha256 } = await readCanonicalPageBody(target, path);
     const parsed = parseTakesFence(body);
     assertFenceRoundTrips(parsed); // F1: refuse a whole-fence re-render that would drop skipped rows.
     const targetRow = findFenceRow(parsed.takes, rowNum, target.allowList, target.slug);
@@ -583,22 +607,24 @@ export async function supersedeTakeOnPage(
       sinceDate: input.sinceDate,
       source: input.source,
     });
-    const writtenPath = await commitTakesMarkdown(target, nextBody, writeRoot, path);
-    // Mirror BOTH affected rows exactly as the fence now states them:
-    // old → inactive + superseded_by pointer, new → active append.
-    const after = parseTakesFence(nextBody).takes;
-    const oldAfter = after.find(t => t.rowNum === rowNum);
-    const newAfter = after.find(t => t.rowNum === newRowNum);
-    const mirrorRows: TakeBatchInput[] = [];
-    if (oldAfter) mirrorRows.push(toBatchInput(pageId, oldAfter, newRowNum));
-    if (newAfter) mirrorRows.push(toBatchInput(pageId, newAfter, null));
-    let mirrorWarning: string | undefined;
-    try {
-      await target.engine.addTakesBatch(mirrorRows);
-    } catch (err) {
-      mirrorWarning = mirrorErrorMessage(err); // P1-4/F4: md written; DB mirror deferred to reconcile.
-    }
-    return { oldRow: rowNum, newRow: newRowNum, mirror: { written: true, path: writtenPath, ...(mirrorWarning ? { mirror_warning: mirrorWarning } : {}) } };
+    const writtenPath = await commitTakesMarkdown(
+      target,
+      nextBody,
+      writeRoot,
+      path,
+      expectedTargetSha256,
+      async (tx) => {
+        const after = parseTakesFence(nextBody).takes;
+        const oldAfter = after.find(t => t.rowNum === rowNum);
+        const newAfter = after.find(t => t.rowNum === newRowNum);
+        const mirrorRows: TakeBatchInput[] = [];
+        if (oldAfter) mirrorRows.push(toBatchInput(pageId, oldAfter, newRowNum));
+        if (newAfter) mirrorRows.push(toBatchInput(pageId, newAfter, null));
+        const mirrored = await tx.addTakesBatch(mirrorRows, { inTransaction: true });
+        if (mirrored !== mirrorRows.length) throw new Error('TAKES_MIRROR_COUNT_MISMATCH');
+      },
+    );
+    return { oldRow: rowNum, newRow: newRowNum, mirror: { written: true, path: writtenPath } };
   });
 }
 
@@ -626,7 +652,7 @@ export async function resolveTakeOnPage(
     const { path, writeRoot } = await resolveTakesFilePath(
       target.engine, target.brainDir, target.slug, target.sourceId,
     );
-    const body = readPageBody(path);
+    const { body, expectedTargetSha256 } = await readCanonicalPageBody(target, path);
     const parsed = parseTakesFence(body);
     assertFenceRoundTrips(parsed); // F1: refuse a whole-fence re-render that would drop skipped rows.
     const targetRow = findFenceRow(parsed.takes, rowNum, target.allowList, target.slug);
@@ -653,12 +679,6 @@ export async function resolveTakeOnPage(
       resolvedBy: input.resolvedBy,
     };
     const allRows = parsed.takes.map(t => (t.rowNum === rowNum ? updated : t));
-    const writtenPath = await commitTakesMarkdown(target, replaceFence(body, allRows), writeRoot, path);
-    // Resolution fields aren't in TakeBatchInput — mirror via resolveTake.
-    // A drifted DB missing the row is self-healed md→DB (upsert the base row,
-    // then resolve): the markdown is the truth being propagated.
-    // One shared argument object so the self-heal retry can never silently
-    // diverge from the primary call.
     const resolveArgs = {
       quality: input.quality,
       outcome,
@@ -667,25 +687,25 @@ export async function resolveTakeOnPage(
       source: input.evidence,
       resolvedBy: input.resolvedBy,
     };
-    // P1-4/F4: md is canonical + already written — a failed DB mirror (incl. a
-    // failed self-heal) is healed by the next reconcile, so it surfaces as a
-    // warning, never a throw (a throw would make the caller retry the durable
-    // md write and duplicate the row).
-    let mirrorWarning: string | undefined;
-    try {
-      await target.engine.resolveTake(pageId, rowNum, resolveArgs);
-    } catch (err) {
-      if (err instanceof Error && err.message.includes('TAKE_ROW_NOT_FOUND')) {
+    const writtenPath = await commitTakesMarkdown(
+      target,
+      replaceFence(body, allRows),
+      writeRoot,
+      path,
+      expectedTargetSha256,
+      async (tx) => {
         try {
-          await target.engine.addTakesBatch([toBatchInput(pageId, targetRow)]);
-          await target.engine.resolveTake(pageId, rowNum, resolveArgs);
-        } catch (healErr) {
-          mirrorWarning = mirrorErrorMessage(healErr);
+          await tx.resolveTake(pageId, rowNum, resolveArgs);
+        } catch (err) {
+          if (err instanceof Error && err.message.includes('TAKE_ROW_NOT_FOUND')) {
+            await tx.addTakesBatch([toBatchInput(pageId, targetRow)], { inTransaction: true });
+            await tx.resolveTake(pageId, rowNum, resolveArgs);
+          } else {
+            throw err;
+          }
         }
-      } else {
-        mirrorWarning = mirrorErrorMessage(err);
-      }
-    }
-    return { rowNum, quality: input.quality, mirror: { written: true, path: writtenPath, ...(mirrorWarning ? { mirror_warning: mirrorWarning } : {}) } };
+      },
+    );
+    return { rowNum, quality: input.quality, mirror: { written: true, path: writtenPath } };
   });
 }

@@ -5076,7 +5076,7 @@ export class PostgresEngine implements BrainEngine {
   async insertFacts(
     rows: Array<NewFact & { row_num: number; source_markdown_slug: string; superseded_by_row?: number }>,
     ctx: { source_id: string },
-    opts?: { deleteForPageFirst?: { slug: string; excludeSourcePrefixes?: string[]; preserveExpiredLegacy?: boolean } },
+    opts?: InsertFactsOptions,
   ): Promise<{ inserted: number; ids: number[]; warnings: string[]; deleted: number }> {
     return factsImpl.insertFacts(this.factsDeps, rows, ctx, opts);
   }

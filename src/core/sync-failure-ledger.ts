@@ -720,7 +720,7 @@ export function decideSyncFailureSeverity(args: {
 export interface SyncGateInput {
   sourceId: string;
   /** All per-file failures this run, including sentinels like `<head>`. */
-  failedFiles: Array<{ path: string; error: string; line?: number }>;
+  failedFiles: Array<{ path: string; error: string; line?: number; hard?: boolean }>;
   /** File paths that imported successfully this run (clears their rows). */
   succeededPaths: string[];
   /** Pin commit the run drained to (stamped on recorded failures). */
@@ -745,10 +745,25 @@ export interface SyncGateOutcome {
  * ledger under a single lock, decides, then on advance runs `advance()`
  * FIRST and only marks auto_skipped/acknowledged afterwards (#1939 Codex #5).
  */
+
+export function partitionSyncFailures<T extends {
+  path: string;
+  error: string;
+  hard?: boolean;
+}>(failedFiles: readonly T[]): { sentinels: T[]; fileFailures: T[] } {
+  return {
+    sentinels: failedFiles.filter(
+      (failure) => failure.hard === true || !isSkippablePath(failure.path),
+    ),
+    fileFailures: failedFiles.filter(
+      (failure) => failure.hard !== true && isSkippablePath(failure.path),
+    ),
+  };
+}
+
 export async function applySyncFailureGate(input: SyncGateInput): Promise<SyncGateOutcome> {
   const threshold = input.threshold ?? resolveAutoSkipThreshold();
-  const sentinels = input.failedFiles.filter(f => !isSkippablePath(f.path));
-  const fileFailures = input.failedFiles.filter(f => isSkippablePath(f.path));
+  const { sentinels, fileFailures } = partitionSyncFailures(input.failedFiles);
 
   // Fast path: clean run touched no failures and no successes — nothing to
   // reconcile in the ledger, just advance.

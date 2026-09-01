@@ -18,7 +18,7 @@ import { mkdtempSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { PGLiteEngine } from '../../src/core/pglite-engine.ts';
-import { runPhaseSynthesize, renderPageToMarkdown, TRIAGE_VERSION, __testing as synthTesting } from '../../src/core/cycle/synthesize.ts';
+import { runPhaseSynthesize, TRIAGE_VERSION, __testing as synthTesting } from '../../src/core/cycle/synthesize.ts';
 import { TIER_DEFAULTS } from '../../src/core/model-config.ts';
 
 interface TestRig {
@@ -376,7 +376,7 @@ describe('E2E synthesize — round-trip self-consumption guard (v0.23.2)', () =>
       //    code path that stamps `dream_generated: true` into frontmatter.
       const page = await rig.engine.getPage(slug);
       expect(page).not.toBeNull();
-      const md = renderPageToMarkdown(page!, ['dream-cycle']);
+      const md = synthTesting.renderDreamPreviewMarkdown(page!, ['dream-cycle']);
       // Sanity: the marker must actually be in the rendered output.
       expect(md).toMatch(/dream_generated:\s*true/);
       expect(md.length).toBeGreaterThan(100);
@@ -437,7 +437,7 @@ describe('E2E synthesize — round-trip self-consumption guard (v0.23.2)', () =>
         frontmatter: {},
       });
       const page = await rig.engine.getPage(slug);
-      const md = renderPageToMarkdown(page!, ['dream-cycle']);
+      const md = synthTesting.renderDreamPreviewMarkdown(page!, ['dream-cycle']);
       writeFileSync(join(rig.corpusDir, '2026-04-30-bypass.txt'), md + '\n' + 'x '.repeat(500));
 
       await withoutAnthropicKey(async () => {
@@ -489,7 +489,7 @@ describe('E2E synthesize — round-trip self-consumption guard (v0.23.2)', () =>
         timeline: '',
         frontmatter: {},
       });
-      const md = renderPageToMarkdown((await rig.engine.getPage(slug))!, ['dream-cycle']);
+      const md = synthTesting.renderDreamPreviewMarkdown((await rig.engine.getPage(slug))!, ['dream-cycle']);
       writeFileSync(join(rig.corpusDir, '2026-04-30-leaked.txt'), md + '\n' + 'x '.repeat(500));
 
       // Real conversation transcript (no frontmatter, plain prose).

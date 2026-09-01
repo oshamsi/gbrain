@@ -18,7 +18,7 @@ import {
   isDreamOutput,
   DREAM_OUTPUT_MARKER_RE,
 } from '../src/core/cycle/transcript-discovery.ts';
-import { judgeSignificance, renderPageToMarkdown, type JudgeClient } from '../src/core/cycle/synthesize.ts';
+import { judgeSignificance, type JudgeClient, __testing as synthTesting } from '../src/core/cycle/synthesize.ts';
 
 let tmpDir: string;
 
@@ -205,7 +205,7 @@ describe('readSingleTranscript', () => {
 describe('self-consumption guard (v0.23.2 marker-based)', () => {
   test('REGRESSION: catches actual reverseWriteSlugs output from a real Page', () => {
     // Build a Page like the synthesize subagent would produce, run it through
-    // the same renderPageToMarkdown the orchestrator uses, and assert the guard
+    // the same renderDreamPreviewMarkdown the orchestrator uses, and assert the guard
     // fires. Codex finding #5: synthetic-string fixtures don't prove the guard
     // catches what the synthesize phase actually produces.
     const page = {
@@ -216,7 +216,7 @@ describe('self-consumption guard (v0.23.2 marker-based)', () => {
       timeline: '',
       frontmatter: {},
     };
-    const md = renderPageToMarkdown(page as any, ['dream-cycle']);
+    const md = synthTesting.renderDreamPreviewMarkdown(page as any, ['dream-cycle']);
     const path = makeTranscript('2026-04-30-output.txt', md + '\n' + 'x'.repeat(3000));
     const result = readSingleTranscript(path, { minChars: 100 });
     expect(result).toBeNull();

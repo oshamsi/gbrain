@@ -18,6 +18,7 @@
  *     ON CONFLICT semantics in importFromContent).
  */
 
+import { existsSync, readFileSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import type { BrainEngine } from '../engine.ts';
 import type { PhaseResult, PhaseError } from '../cycle.ts';
@@ -27,7 +28,19 @@ import { waitForCompletionRenewing, TimeoutError } from '../minions/wait-for-com
 import type { MinionJobInput, MinionJobStatus, SubagentHandlerData } from '../minions/types.ts';
 import { truncateUtf8 } from '../text-safe.ts';
 import type { PageType } from '../types.ts';
-import { writePageThrough } from '../write-through.ts';
+import { withPutPageOperationLock } from '../ops/put-page-lock.ts';
+import {
+  isWriteThroughDisabled,
+  resolvePageWriteTarget,
+  writePageThrough,
+} from '../write-through.ts';
+import {
+  generationKey,
+  loadCanonicalProjection,
+  persistCanonicalProjectionFromRow,
+  projectionIsFresh,
+  sha256Utf8,
+} from '../page-canonical.ts';
 // #2415: allow-list + output-root resolution shared with the synthesize
 // phase — both phases must agree on the configured namespace.
 // runSubagentsInline is shared too: a job submitted via queue.add() sits in
@@ -292,12 +305,14 @@ export async function runPhasePatterns(
     const writtenRefs = await collectChildPutPageSlugs(engine, [job.id], cycleSourceId);
 
     // Reverse-write to fs.
-    const reverseWriteCount = await reverseWriteRefs(engine, opts.brainDir, writtenRefs, cycleSourceId);
+    const reverseWrite = await reverseWriteRefs(engine, opts.brainDir, writtenRefs, cycleSourceId);
 
     const details = {
       reflections_considered: reflections.length,
       patterns_written: writtenRefs.length,
-      reverse_write_count: reverseWriteCount,
+      reverse_write_count: reverseWrite.written,
+      reverse_write_not_projected: reverseWrite.notProjected,
+      reverse_write_failures: reverseWrite.failures,
       child_outcome: outcome,
       job_id: job.id,
     };
@@ -334,7 +349,27 @@ export async function runPhasePatterns(
       };
     }
 
-    return ok(`${writtenRefs.length} pattern page(s) written/updated (${outcome})`, details);
+    if (reverseWrite.failures.length === 0) {
+      return ok(`${writtenRefs.length} pattern page(s) written/updated (${outcome})`, details);
+    }
+    if (reverseWrite.written > 0) {
+      return {
+        phase: 'patterns',
+        status: 'warn',
+        duration_ms: 0,
+        summary: `${reverseWrite.written} pattern page(s) verified; ${reverseWrite.failures.length} reverse-write failure(s)`,
+        details,
+      };
+    }
+    return {
+      phase: 'patterns',
+      status: 'fail',
+      duration_ms: 0,
+      summary: 'pattern reverse-write produced no verified file-backed pages',
+      details,
+      error: makeError('InternalError', 'PATTERNS_REVERSE_WRITE_FAIL',
+        reverseWrite.failures[0]?.error ?? 'canonical reverse-write failed'),
+    };
   } catch (e) {
     return failed(makeError('InternalError', 'PATTERNS_PHASE_FAIL',
       e instanceof Error ? (e.message || 'patterns phase threw') : String(e)));
@@ -550,33 +585,108 @@ async function collectChildPutPageSlugs(
 
 import { validateSourceId } from '../utils.ts';
 
+type ReverseWriteReport = {
+  written: number;
+  notProjected: number;
+  failures: Array<{ slug: string; source_id: string; error: string }>;
+};
+
+type ReverseWriteTestHooks = {
+  afterWriteBeforeProof?: (
+    ref: { slug: string; source_id: string },
+  ) => void | Promise<void>;
+};
+
 async function reverseWriteRefs(
   engine: BrainEngine,
-  brainDir: string,
+  _brainDir: string,
   refs: Array<{ slug: string; source_id: string }>,
-  nativeSourceId = 'default',
-): Promise<number> {
-  let count = 0;
+  _nativeSourceId = 'default',
+  testHooks: ReverseWriteTestHooks = {},
+): Promise<ReverseWriteReport> {
+  const failures: ReverseWriteReport['failures'] = [];
+  let written = 0;
+  let notProjected = 0;
   for (const { slug, source_id } of refs) {
-    // v0.32.8 F6: guard against malformed source_id (would let join() break
-    // out of brainDir). validateSourceId throws on `..`, `/`, etc.
     validateSourceId(source_id);
-    const page = await engine.getPage(slug, { sourceId: source_id });
-    if (!page) continue;
+    if (!await engine.getPage(slug, { sourceId: source_id })) {
+      failures.push({ slug, source_id, error: 'page_missing' });
+      continue;
+    }
     try {
-      const wt = await writePageThrough(engine, slug, { sourceId: source_id });
-      if (wt.written) count++;
-      else {
-        process.stderr.write(
-          `[dream] reverse-write ${slug}@${source_id} skipped: ${wt.error ?? wt.skipped ?? 'unknown'}\n`,
-        );
-      }
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      process.stderr.write(`[dream] reverse-write ${slug}@${source_id} failed: ${msg}\n`);
+      await withPutPageOperationLock(engine, source_id, slug, async () => {
+        if (await isWriteThroughDisabled(engine)) { notProjected++; return; }
+        const target = await resolvePageWriteTarget(engine, slug, source_id);
+        if (!target.ok) {
+          if (
+            target.skipped === 'no_repo_configured'
+            || target.skipped === 'source_repo_belongs_to_other_source'
+          ) { notProjected++; return; }
+          failures.push({ slug, source_id, error: target.skipped });
+          return;
+        }
+
+        let committed = await loadCanonicalProjection(engine, source_id, slug);
+        if (!committed || !projectionIsFresh(committed)) {
+          committed = await persistCanonicalProjectionFromRow(engine, source_id, slug);
+        }
+        if (!committed || !projectionIsFresh(committed)) {
+          failures.push({ slug, source_id, error: 'stale_projection' });
+          return;
+        }
+
+        const expectedTargetSha256 = existsSync(target.filePath)
+          ? sha256Utf8(readFileSync(target.filePath))
+          : null;
+        const outcome = await writePageThrough(engine, slug, {
+          sourceId: source_id,
+          expectedPath: target.filePath,
+          expectedTargetSha256,
+        });
+        await testHooks.afterWriteBeforeProof?.({ slug, source_id });
+
+        const current = await loadCanonicalProjection(engine, source_id, slug);
+        let rawMatches = false;
+        try {
+          const bytes = readFileSync(target.filePath);
+          rawMatches = bytes.length === committed.sizeBytes
+            && sha256Utf8(bytes) === committed.sha256;
+        } catch { /* classified below */ }
+        const stillOwnsReceipt = current != null
+          && projectionIsFresh(current)
+          && current.sha256 === committed.sha256
+          && current.sizeBytes === committed.sizeBytes
+          && current.semanticContentHash === committed.semanticContentHash
+          && generationKey(current.inputGeneration)
+            === generationKey(committed.inputGeneration)
+          && generationKey(current.basisGeneration)
+            === generationKey(committed.basisGeneration);
+        if (
+          outcome.written === true
+          && outcome.path === target.filePath
+          && stillOwnsReceipt
+          && rawMatches
+        ) {
+          written++;
+        } else {
+          failures.push({
+            slug,
+            source_id,
+            error: outcome.written !== true
+              ? (outcome.error ?? outcome.skipped ?? 'canonical_write_failed')
+              : 'canonical planes moved after reverse-write',
+          });
+        }
+      });
+    } catch (error) {
+      failures.push({
+        slug,
+        source_id,
+        error: error instanceof Error ? error.message : String(error),
+      });
     }
   }
-  return count;
+  return { written, notProjected, failures };
 }
 
 // ── Status helpers ───────────────────────────────────────────────────

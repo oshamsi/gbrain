@@ -121,6 +121,8 @@ import type { BatchAuditSite } from './retry.ts';
 export interface BatchOpts {
   auditSite?: BatchAuditSite;
   signal?: AbortSignal;
+  /** Caller already owns the transaction; never retry an aborted tx handle. */
+  inTransaction?: boolean;
 }
 
 /** Input row for addLinksBatch. Optional fields default to '' (matches NOT NULL DDL). */
@@ -714,6 +716,18 @@ export function clampSearchLimit(limit: number | undefined, defaultLimit = 20, c
   if (limit === undefined || limit === null || !Number.isFinite(limit) || Number.isNaN(limit)) return defaultLimit;
   if (limit <= 0) return defaultLimit;
   return Math.min(Math.floor(limit), cap);
+}
+
+export interface InsertFactsOptions {
+  deleteForPageFirst?: {
+    slug: string;
+    excludeSourcePrefixes?: string[];
+    preserveExpiredLegacy?: boolean;
+  };
+  /** The supplied engine is already the outer transaction proxy. */
+  inTransaction?: boolean;
+  /** Return an existing fence row only when every caller-owned field matches. */
+  verifyIdenticalOnConflict?: boolean;
 }
 
 export interface BrainEngine {
@@ -1982,7 +1996,7 @@ export interface BrainEngine {
   insertFacts(
     rows: Array<NewFact & { row_num: number; source_markdown_slug: string; superseded_by_row?: number }>,
     ctx: { source_id: string },
-    opts?: { deleteForPageFirst?: { slug: string; excludeSourcePrefixes?: string[]; preserveExpiredLegacy?: boolean } },
+    opts?: InsertFactsOptions,
   ): Promise<{ inserted: number; ids: number[]; warnings: string[]; deleted: number }>;
 
   /**

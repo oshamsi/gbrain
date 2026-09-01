@@ -71,6 +71,7 @@ import {
 } from './page-canonical.ts';
 import { atomicWriteFileSync } from './atomic-write.ts';
 import { registerSelfWrite } from './self-write-guard.ts';
+import { withPutPageOperationLock } from './ops/put-page-lock.ts';
 
 /**
  * v0.20.0 Cathedral II Layer 8 D2 — markdown fence extraction helper.
@@ -569,6 +570,31 @@ async function reconcileUnchangedProjections(
   }
 }
 
+
+export interface CanonicalImportReceipt {
+  sha256: string;
+  sizeBytes: number;
+  semanticContentHash: string;
+  inputGeneration: string | number | null;
+  basisGeneration: string | number | null;
+}
+
+function canonicalImportReceiptOf(projection: {
+  sha256: string;
+  sizeBytes: number;
+  semanticContentHash: string;
+  inputGeneration: string | number | null;
+  basisGeneration: string | number | null;
+}): CanonicalImportReceipt {
+  return {
+    sha256: projection.sha256,
+    sizeBytes: projection.sizeBytes,
+    semanticContentHash: projection.semanticContentHash,
+    inputGeneration: projection.inputGeneration,
+    basisGeneration: projection.basisGeneration,
+  };
+}
+
 export interface ImportResult {
   slug: string;
   status: 'imported' | 'skipped' | 'error';
@@ -613,6 +639,8 @@ export interface ImportResult {
    */
   partial?: boolean;
   file_status?: 'healthy' | 'repaired' | 'repair_failed' | 'not_projected';
+  /** Projection produced inside this import's committing transaction. */
+  canonical_receipt?: CanonicalImportReceipt;
 }
 
 const MAX_FILE_SIZE = 5_000_000; // 5MB
@@ -1290,7 +1318,7 @@ export async function importFromContent(
   // schema DEFAULT — required for multi-source brains; harmless ('default')
   // for single-source callers.
   const txOpts = { sourceId: sourceId ?? 'default' };
-  const writtenPage = await engine.transaction(async (tx) => {
+  const written = await engine.transaction(async (tx) => {
     if (existing) await tx.createVersion(slug, txOpts);
 
     // v0.29.1 — compute effective_date from frontmatter precedence chain.
@@ -1391,7 +1419,11 @@ export async function importFromContent(
     // Store the canonical markdown projection in the same transaction as the
     // structured row + tags. Built from the committed row so engine-stamped
     // ingested_at is included (S2 will pass a single clock into putPage).
-    await persistCanonicalProjectionFromRow(tx, txOpts.sourceId, slug);
+    const canonicalProjection = await persistCanonicalProjectionFromRow(
+      tx,
+      txOpts.sourceId,
+      slug,
+    );
 
     if (chunks.length > 0) {
       await tx.upsertChunks(slug, chunks, txOpts);
@@ -1448,7 +1480,10 @@ export async function importFromContent(
         );
       } catch { /* same reason — silent skip */ }
     }
-    return committedPage;
+    return {
+      committedPage,
+      canonicalReceipt: canonicalImportReceiptOf(canonicalProjection),
+    };
   }).catch(async (err: unknown) => {
     // #4287: name the dimension-mismatch rollback instead of letting the bare
     // pgvector message ("expected N dimensions, not M") surface with no code,
@@ -1469,7 +1504,7 @@ export async function importFromContent(
   const verification = await verifyPageReadable(
     engine, slug, hash, sourceId, 'importFromContent', {
       allowSuperseded: opts.expectedContentHash !== undefined,
-      committedPage: writtenPage,
+      committedPage: written.committedPage,
     },
   );
   const supersededAfterCommit = verification.outcome === 'superseded';
@@ -1504,6 +1539,7 @@ export async function importFromContent(
     ...(pageQuarantined ? { quarantined: true } : {}),
     ...(pageFlagged ? { flagged: true, flag_reason: pageFlagReason } : {}),
     ...(typeWarning ? { type_warning: typeWarning } : {}),
+    canonical_receipt: written.canonicalReceipt,
   };
 }
 
@@ -1517,22 +1553,28 @@ export async function importFromContent(
  * `people/elon` page on the next `gbrain sync` or `gbrain import`. In shared
  * brains where PRs are mergeable, this is a silent page-hijack primitive.
  */
+
+export interface ImportFileOptions {
+  noEmbed?: boolean;
+  inferFrontmatter?: boolean;
+  sourceId?: string;
+  forceRechunk?: boolean;
+  activePack?: {
+    page_types: ReadonlyArray<{
+      name: string;
+      path_prefixes: ReadonlyArray<string>;
+      aliases?: ReadonlyArray<string>;
+    }>;
+  };
+  /** Test-only seam immediately before a source-file CAS rewrite. */
+  _beforeCanonicalRewriteForTest?: () => void;
+}
+
 export async function importFromFile(
   engine: BrainEngine,
   filePath: string,
   relativePath: string,
-  opts: {
-    noEmbed?: boolean;
-    inferFrontmatter?: boolean;
-    sourceId?: string;
-    forceRechunk?: boolean;
-    /**
-     * v0.39 T1.5: active schema pack threaded through to importFromContent so
-     * `parseMarkdown` uses pack-driven type inference. Load ONCE per command;
-     * never per file (codex perf finding #7).
-     */
-    activePack?: { page_types: ReadonlyArray<{ name: string; path_prefixes: ReadonlyArray<string>; aliases?: ReadonlyArray<string> }> };
-  } = {},
+  opts: ImportFileOptions = {},
 ): Promise<ImportResult> {
   // Defense-in-depth: reject symlinks before reading content.
   const lstat = lstatSync(filePath);
@@ -1545,7 +1587,9 @@ export async function importFromFile(
     return { slug: relativePath, status: 'skipped', chunks: 0, error: `File too large (${stat.size} bytes)` };
   }
 
-  let content = readFileSync(filePath, 'utf-8');
+  const sourceBytes = readFileSync(filePath, 'utf8');
+  const sourceSha = sha256Utf8(sourceBytes);
+  let content = sourceBytes;
 
   // Defense-in-depth for callers that bypass the sync/import classifiers
   // (direct importFromFile, reindex, capture paths): a malformed filename is
@@ -1692,53 +1736,67 @@ export async function importFromFile(
   // precedence in computeEffectiveDate. e.g. `daily/2024-03-15.md` →
   // filename `2024-03-15`.
   const fileBasename = basename(relativePath, '.md');
-  const result = await importFromContent(engine, resolvedSlug, content, {
-    ...opts,
-    filename: fileBasename,
-    sourcePath: relativePath,
-    // The disk file IS the source of truth: a file the user emptied is a
-    // deliberate clear, so it passes putPage's empty-overwrite guard.
-    allowEmptyOverwrite: true,
-  });
-  // File→store authority: if the stored canonical projection differs from the
-  // source file, rewrite that same file under the importer. Sync's Git/anchor
-  // flow owns commit handling — do not call per-page write-through commit.
-  // A rewrite failure is partial, never ordinary success.
-  if (result.status !== 'error' && result.skip_reason !== 'malformed_path') {
-    const sourceId = opts.sourceId ?? 'default';
-    try {
-      let stored = await loadCanonicalProjection(engine, sourceId, result.slug);
-      if (!stored || !projectionIsFresh(stored)) {
-        stored = await persistCanonicalProjectionFromRow(engine, sourceId, result.slug);
+  return withPutPageOperationLock(
+    engine,
+    opts.sourceId ?? 'default',
+    resolvedSlug,
+    async () => {
+      if (sha256Utf8(readFileSync(filePath)) !== sourceSha) {
+        return {
+          slug: resolvedSlug,
+          status: 'skipped' as const,
+          chunks: 0,
+          partial: true,
+          file_status: 'repair_failed' as const,
+          error: 'SOURCE_CHANGED_BEFORE_IMPORT',
+        };
       }
-      if (!projectionIsFresh(stored)) {
-        // Test doubles persist without generation stamps; still rewrite
-        // bytes when content exists. Real engines must not claim health.
-        if (stored.inputGeneration != null || stored.basisGeneration != null || !stored.content) {
-          return {
-            ...result,
-            partial: true,
-            file_status: 'repair_failed',
-            error: result.error ?? 'stale_projection',
-          };
+      const result = await importFromContent(engine, resolvedSlug, content, {
+        ...opts,
+        filename: fileBasename,
+        sourcePath: relativePath,
+        allowEmptyOverwrite: true,
+      });
+      if (result.status === 'error' || result.skip_reason === 'malformed_path') return result;
+
+      try {
+        const sourceId = opts.sourceId ?? 'default';
+        let stored = await loadCanonicalProjection(engine, sourceId, result.slug);
+        if (!stored || !projectionIsFresh(stored)) {
+          stored = await persistCanonicalProjectionFromRow(engine, sourceId, result.slug);
         }
+        if (!projectionIsFresh(stored)) throw new Error('stale_projection');
+
+        const preRepair = readFileSync(filePath, 'utf8');
+        if (sha256Utf8(preRepair) !== sourceSha) {
+          return { ...result, partial: true, file_status: 'repair_failed' as const,
+            error: 'SOURCE_CHANGED_DURING_IMPORT' };
+        }
+        if (stored.content !== preRepair) {
+          opts._beforeCanonicalRewriteForTest?.();
+          atomicWriteFileSync(filePath, stored.content, { expectedTargetHash: sourceSha });
+        }
+        const finalBytes = readFileSync(filePath);
+        if (sha256Utf8(finalBytes) !== stored.sha256 || finalBytes.length !== stored.sizeBytes) {
+          return { ...result, partial: true, file_status: 'repair_failed' as const,
+            error: 'CANONICAL_FILE_POSTWRITE_MISMATCH' };
+        }
+        registerSelfWrite(filePath, { sha256: stored.sha256 });
+        return {
+          ...result,
+          file_status: stored.content === sourceBytes ? 'healthy' as const : 'repaired' as const,
+        };
+      } catch (error) {
+        return {
+          ...result,
+          partial: true,
+          file_status: 'repair_failed' as const,
+          error: error instanceof Error ? error.message : String(error),
+        };
       }
-      if (content !== stored.content) {
-        atomicWriteFileSync(filePath, stored.content);
-        registerSelfWrite(filePath, { sha256: stored.sha256 || sha256Utf8(stored.content) });
-        return { ...result, file_status: 'repaired' };
-      }
-      return { ...result, file_status: 'healthy' };
-    } catch (e) {
-      return {
-        ...result,
-        partial: true,
-        file_status: 'repair_failed',
-        error: result.error ?? (e instanceof Error ? e.message : String(e)),
-      };
-    }
-  }
-  return result;
+    },
+    { timeoutMs: 5_000 },
+  );
 }
 
 /**

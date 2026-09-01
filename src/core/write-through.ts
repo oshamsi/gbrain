@@ -21,12 +21,12 @@
  * only does "row exists + repo is a real dir → stored canonical bytes + atomic write".
  */
 
-import { existsSync, statSync, mkdirSync, writeFileSync, renameSync, unlinkSync, readdirSync, readFileSync } from 'fs';
+import { existsSync, statSync, mkdirSync, readdirSync, readFileSync } from 'fs';
 import { basename, dirname, isAbsolute, join, relative, resolve } from 'path';
-import { randomBytes } from 'crypto';
 import type { BrainEngine } from './engine.ts';
 import { resolvePageFilePath, resolveSourceLocalFilePath } from './markdown.ts';
 import { isWriteTargetContained, msysToNativePath } from './path-confine.ts';
+import { atomicWriteFileSync } from './atomic-write.ts';
 import {
   loadCanonicalProjection,
   persistCanonicalProjectionFromRow,
@@ -101,6 +101,12 @@ export interface WriteThroughResult {
 export interface WritePageThroughOpts {
   sourceId?: string;
   logger?: WriteThroughLogger;
+  /** Resolved path captured with the preimage; mismatch aborts before I/O. */
+  expectedPath?: string;
+  /** undefined = caller has no CAS; null = target must still be absent. */
+  expectedTargetSha256?: string | null;
+  /** Test-only seam after repair reads its preimage and before its CAS write. */
+  _beforeRepairWriteForTest?: () => void | Promise<void>;
 }
 
 /**
@@ -349,6 +355,9 @@ export async function writePageThrough(
       return { written: false, skipped: target.skipped };
     }
     const { filePath, writeRoot } = target;
+    if (opts.expectedPath !== undefined && filePath !== opts.expectedPath) {
+      return { written: false, error: 'write target moved before canonical write' };
+    }
 
     const writtenPage = await engine.getPage(slug, { sourceId });
     if (!writtenPage) {
@@ -399,22 +408,11 @@ export async function writePageThrough(
     // already exists, silently leaving the DB and the .md file plane out of sync.
     if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
 
-    // Atomic write: unique temp sibling + rename. Unique name (pid + random)
-    // so two concurrent saves to the same target can't clobber each other's
-    // temp file. Clean up the temp on any failure so we never leak a stray
-    // `.tmp` next to the real file.
-    const tmpPath = `${filePath}.tmp.${process.pid}.${randomBytes(4).toString('hex')}`;
-    try {
-      writeFileSync(tmpPath, md, 'utf8');
-      renameSync(tmpPath, filePath);
-    } catch (writeErr) {
-      try {
-        if (existsSync(tmpPath)) unlinkSync(tmpPath);
-      } catch {
-        // best-effort cleanup; surface the original write error below
-      }
-      throw writeErr;
-    }
+    atomicWriteFileSync(filePath, md, {
+      ...(opts.expectedTargetSha256 !== undefined
+        ? { expectedTargetHash: opts.expectedTargetSha256 }
+        : {}),
+    });
 
     const onDisk = readFileSync(filePath);
     if (sha256Utf8(onDisk) !== projection.sha256 || onDisk.length !== projection.sizeBytes) {
@@ -501,14 +499,25 @@ export async function verifyOrRepairPageFile(
       return { written: false, error: 'stale_projection', file_status: 'repair_failed', file_repaired: false };
     }
   }
-  let needsRepair = !existsSync(filePath);
-  if (!needsRepair) {
-    try {
-      const onDisk = readFileSync(filePath);
-      needsRepair = sha256Utf8(onDisk) !== projection.sha256 || onDisk.length !== projection.sizeBytes;
-    } catch {
-      needsRepair = true;
+  let needsRepair: boolean;
+  let expectedTargetSha256: string | null;
+  try {
+    const onDisk = readFileSync(filePath);
+    expectedTargetSha256 = sha256Utf8(onDisk);
+    needsRepair = expectedTargetSha256 !== projection.sha256
+      || onDisk.length !== projection.sizeBytes;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+      return {
+        written: false,
+        error: error instanceof Error ? error.message : String(error),
+        path: filePath,
+        file_status: 'repair_failed',
+        file_repaired: false,
+      };
     }
+    expectedTargetSha256 = null;
+    needsRepair = true;
   }
   if (!needsRepair) {
     return {
@@ -519,12 +528,16 @@ export async function verifyOrRepairPageFile(
       file_repaired: false,
     };
   }
+  await opts._beforeRepairWriteForTest?.();
   const result = await writePageThrough(engine, slug, {
     sourceId,
     logger: opts.logger,
+    expectedPath: filePath,
+    expectedTargetSha256,
   });
   if (result.written === true) {
     return { ...result, file_status: 'repaired', file_repaired: true };
   }
-  return { ...result, file_status: 'repair_failed', file_repaired: false };
+  return { ...result, path: result.path ?? filePath,
+    file_status: 'repair_failed', file_repaired: false };
 }

@@ -41,9 +41,13 @@ export interface PgliteTakesDeps {
 
 export async function addTakesBatch(deps: PgliteTakesDeps, rowsIn: TakeBatchInput[], opts?: BatchOpts): Promise<number> {
     if (rowsIn.length === 0) return 0;
-    // v0.42.26: wrap in batchRetry to match links/timeline (takes was the only
-    // batch primitive without retry resilience).
-    return deps.batchRetry(opts?.auditSite ?? 'addTakesBatch', opts?.signal, () => _addTakesBatchOnce(deps, rowsIn), rowsIn.length);
+    if (opts?.inTransaction) return _addTakesBatchOnce(deps, rowsIn);
+    return deps.batchRetry(
+      opts?.auditSite ?? 'addTakesBatch',
+      opts?.signal,
+      () => _addTakesBatchOnce(deps, rowsIn),
+      rowsIn.length,
+    );
   }
 
 async function _addTakesBatchOnce(deps: PgliteTakesDeps, rowsIn: TakeBatchInput[]): Promise<number> {

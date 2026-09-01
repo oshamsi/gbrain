@@ -6,10 +6,10 @@
  * (cycle).
  */
 
-import type { Operation } from './contract.ts';
+import { OperationError, type Operation } from './contract.ts';
 import { enforceSubagentSlugFence, enforceClientSlugFence, sourceScopeOpts } from './context.ts';
 import { slugHiddenFromCaller } from '../search/private-visibility.ts';
-import { writeTimelineEntryThrough } from '../timeline-write-through.ts';
+import { writeTimelineEntryThrough, type TimelineWriteThroughOutcome } from '../timeline-write-through.ts';
 
 // --- Timeline ---
 
@@ -70,7 +70,7 @@ const add_timeline_entry: Operation = {
       source: (p.source as string) || '',
       detail: (p.detail as string) || '',
     };
-    let writeThrough: Awaited<ReturnType<typeof writeTimelineEntryThrough>> | undefined;
+    let writeThrough: TimelineWriteThroughOutcome | undefined;
     if (!isSandboxSubagent) {
       writeThrough = await writeTimelineEntryThrough(
         ctx.engine,
@@ -79,42 +79,42 @@ const add_timeline_entry: Operation = {
         entryInput,
         { logger: ctx.logger },
       );
-      if (writeThrough.handled) {
-        return {
-          status: 'ok',
-          write_through: {
-            written: writeThrough.file?.written ?? false,
-            ...(writeThrough.file?.path ? { path: writeThrough.file.path } : {}),
-            ...(writeThrough.file?.skipped ? { skipped: writeThrough.file.skipped } : {}),
-            ...(writeThrough.file?.error ? { error: writeThrough.file.error } : {}),
-          },
-          ...(writeThrough.entry ? { entry: writeThrough.entry } : {}),
-        };
+      switch (writeThrough.kind) {
+        case 'written':
+          return {
+            status: 'ok',
+            slug: p.slug,
+            entry: writeThrough.entry,
+            write_through: writeThrough.file,
+          };
+        case 'duplicate':
+          return { status: 'skipped', reason: 'duplicate', slug: p.slug };
+        case 'partial':
+          throw new OperationError(
+            'partial_write',
+            writeThrough.error,
+            'Retry only after reading the current page; an identical retry may repair the file.',
+          );
+        case 'db_only':
+          break;
       }
     }
 
-    // When the helper failed AFTER the canonical bullet reached the on-disk
-    // file, `writeThrough.entry` carries the canonical tuple (source 'manual'
-    // default, collapsed one-line summary) that the next sync re-extracts
-    // from that bullet. The fallback MUST store that tuple — inserting the
-    // raw input tuple would recreate the duplicate class on the error path
-    // (raw row now + re-extracted canonical row later).
-    const canonical = writeThrough?.entry;
     const inserted = await ctx.engine.addTimelineEntry(p.slug as string, { // gbrain-allow-direct-insert: add_timeline_entry MCP op is the explicit canonical surface for manual timeline entries on DB-only brains; FS-canonical brains route through writeTimelineEntryThrough above
-      date: canonical?.date ?? date,
-      source: canonical ? canonical.source : entryInput.source,
-      summary: canonical ? canonical.summary : entryInput.summary,
+      date,
+      source: entryInput.source,
+      summary: entryInput.summary,
       detail: entryInput.detail,
     }, sourceOpts);
     const writeThroughReport = {
       written: false,
-      skipped: isSandboxSubagent ? 'subagent_sandbox' : (writeThrough?.skipped ?? 'db_only'),
-      ...(writeThrough?.error ? { error: writeThrough.error } : {}),
+      skipped: isSandboxSubagent
+        ? 'subagent_sandbox'
+        : writeThrough!.skipped,
     };
-    // #3827: the (page_id, date, summary, source) unique index deduplicates
-    // via ON CONFLICT DO NOTHING. Report the drop instead of lying 'ok' —
-    // an MCP caller retrying an identical entry now sees it was skipped.
-    if (!inserted) return { status: 'skipped', reason: 'duplicate', write_through: writeThroughReport };
+    if (!inserted) {
+      return { status: 'skipped', reason: 'duplicate', write_through: writeThroughReport };
+    }
     return { status: 'ok', write_through: writeThroughReport };
   },
   cliHints: { name: 'timeline-add', positional: ['slug', 'date', 'summary'] },

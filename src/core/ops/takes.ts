@@ -346,6 +346,8 @@ function mapTakesWriteError(err: unknown): never {
         e.detail = 'takes_mirror_unavailable';
         throw e;
       }
+      case 'partial_write':
+        throw new OperationError('partial_write', err.message, err.hint);
       case 'page_locked': {
         const e = new OperationError('unavailable', err.message, 'Retry shortly.');
         e.detail = 'retryable';

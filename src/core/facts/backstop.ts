@@ -710,14 +710,9 @@ async function runPipelineWithBody(
     );
 
     if (result.fenceWriteFailed) {
-      // Fence parse-validate rejected the .tmp; .tmp stays as
-      // quarantine. The JSONL log is the operator surface. Treat
-      // every fact in this entity group as not-inserted (no fact_id
-      // returned). Do NOT fall through to legacy DB-only — that
-      // would write rows to a DB index whose fence is broken.
-      continue;
+      throw new Error(`FACTS_CANONICAL_WRITE_FAILED:${ctx.sourceId}/${slug}`);
     }
-    if (result.stubGuardBlocked || result.targetUnresolvable) {
+    if (result.stubGuardBlocked) {
       // v0.34.5: writeFactsToFence refused to spawn a phantom
       // unprefixed entity page (e.g. `jared.md` at brain root).
       // #4204: or the shared page-target resolver found the source

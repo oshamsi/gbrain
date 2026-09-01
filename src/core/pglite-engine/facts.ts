@@ -3,11 +3,13 @@
  * (containment sprint C15). Free functions over a NARROW deps surface — the
  * live PGLite handle only. Never the whole engine class.
  */
-import type { PGlite } from '@electric-sql/pglite';
+import type { PGlite, Transaction as PGliteTransaction } from '@electric-sql/pglite';
 import type {
   FactRow, FactKind, FactVisibility, FactInsertStatus,
   NewFact, FactListOpts, FactsHealth,
+  InsertFactsOptions,
 } from '../engine.ts';
+type PgliteFactsQuery = Pick<PGlite | PGliteTransaction, 'query'>;
 import { MAX_SEARCH_LIMIT, clampSearchLimit } from '../engine.ts';
 import { AUDIT_ROW_SOURCES } from '../facts/audit-sources.ts';
 import { resolveSupersededByRow, isInt4RowRef, type SupersedeTarget } from '../facts/supersede-resolve.ts';
@@ -126,7 +128,7 @@ export async function insertFacts(
   deps: PgliteFactsDeps,
     rows: Array<NewFact & { row_num: number; source_markdown_slug: string; superseded_by_row?: number }>,
     ctx: { source_id: string },
-    opts?: { deleteForPageFirst?: { slug: string; excludeSourcePrefixes?: string[]; preserveExpiredLegacy?: boolean } },
+    opts?: InsertFactsOptions,
   ): Promise<{ inserted: number; ids: number[]; warnings: string[]; deleted: number }> {
     if (rows.length === 0) return { inserted: 0, ids: [], warnings: [], deleted: 0 };
 
@@ -142,7 +144,31 @@ export async function insertFacts(
     // v0.46 (#3014): the fence path carries struck rows — `expired_at` is
     // stamped inline, and `superseded by #N` references are resolved to
     // `facts.superseded_by` in a second pass below (same transaction).
-    const ids = await deps.db.transaction(async (tx) => {
+    const run = async (tx: PgliteFactsQuery) => {
+      const conflictSql = opts?.verifyIdenticalOnConflict
+        ? `ON CONFLICT (source_id, source_markdown_slug, row_num)
+       WHERE row_num IS NOT NULL
+       DO UPDATE SET row_num = facts.row_num
+       WHERE facts.entity_slug IS NOT DISTINCT FROM EXCLUDED.entity_slug
+         AND facts.fact IS NOT DISTINCT FROM EXCLUDED.fact
+         AND facts.kind IS NOT DISTINCT FROM EXCLUDED.kind
+         AND facts.visibility IS NOT DISTINCT FROM EXCLUDED.visibility
+         AND facts.notability IS NOT DISTINCT FROM EXCLUDED.notability
+         AND facts.context IS NOT DISTINCT FROM EXCLUDED.context
+         AND facts.valid_from IS NOT DISTINCT FROM EXCLUDED.valid_from
+         AND facts.valid_until IS NOT DISTINCT FROM EXCLUDED.valid_until
+         AND facts.expired_at IS NOT DISTINCT FROM EXCLUDED.expired_at
+         AND facts.source IS NOT DISTINCT FROM EXCLUDED.source
+         AND facts.source_session IS NOT DISTINCT FROM EXCLUDED.source_session
+         AND facts.confidence IS NOT DISTINCT FROM EXCLUDED.confidence
+         AND facts.embedding IS NOT DISTINCT FROM EXCLUDED.embedding
+         AND facts.claim_metric IS NOT DISTINCT FROM EXCLUDED.claim_metric
+         AND facts.claim_value IS NOT DISTINCT FROM EXCLUDED.claim_value
+         AND facts.claim_unit IS NOT DISTINCT FROM EXCLUDED.claim_unit
+         AND facts.claim_period IS NOT DISTINCT FROM EXCLUDED.claim_period
+         AND facts.event_type IS NOT DISTINCT FROM EXCLUDED.event_type`
+        : `ON CONFLICT (source_id, source_markdown_slug, row_num)
+       WHERE row_num IS NOT NULL DO NOTHING`;
       // v0.46 (#3014) — atomic reconcile: wipe the page's fence-owned rows
       // as the FIRST statement of this transaction so a failing insert
       // below rolls the delete back too. Inlined (not a deleteFactsForPage
@@ -220,9 +246,7 @@ export async function insertFacts(
                  $17, $18, $19, $20,
                  $21
                )
-               ON CONFLICT (source_id, source_markdown_slug, row_num)
-               WHERE row_num IS NOT NULL
-               DO NOTHING
+               ${conflictSql}
                RETURNING id`
             : `INSERT INTO facts (
                  source_id, entity_slug, fact, kind, visibility, notability, context,
@@ -238,9 +262,7 @@ export async function insertFacts(
                  $18, $19, $20, $21,
                  $22
                )
-               ON CONFLICT (source_id, source_markdown_slug, row_num)
-               WHERE row_num IS NOT NULL
-               DO NOTHING
+               ${conflictSql}
                RETURNING id`,
           embedStr === null
             ? [ctx.source_id, entitySlug, input.fact, kind, visibility, notability, context, validFrom, validUntil, expiredAt, input.source, sourceSession, confidence, embeddedAt, input.row_num, input.source_markdown_slug, claimMetric, claimValue, claimUnit, claimPeriod, eventType]
@@ -285,7 +307,10 @@ export async function insertFacts(
         }
       }
       return out;
-    });
+    };
+    const ids = opts?.inTransaction
+      ? await run(deps.db)
+      : await deps.db.transaction(run);
     return { inserted: ids.length, ids, warnings, deleted };
   }
 

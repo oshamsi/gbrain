@@ -50,12 +50,21 @@ import type { BrainEngine } from './engine.ts';
 import {
   isWriteThroughDisabled,
   resolvePageWriteTarget,
-  writePageThrough,
+  verifyOrRepairPageFile,
   type WriteThroughLogger,
   type WriteThroughResult,
 } from './write-through.ts';
-import { applyCanonicalMarkdownToStore } from './page-canonical.ts';
-import { withPageLock } from './page-lock.ts';
+import {
+  loadCanonicalProjection,
+  persistCanonicalProjectionFromRow,
+  projectionIsFresh,
+  sha256Utf8,
+} from './page-canonical.ts';
+import { withPutPageOperationLock } from './ops/put-page-lock.ts';
+import {
+  CanonicalMutationPartialError,
+  commitCanonicalMarkdownMutation,
+} from './canonical-mutation.ts';
 import { findTimelineSplitIndex } from './markdown.ts';
 import { extractTimelineFromContent } from './timeline-extract.ts';
 
@@ -75,39 +84,14 @@ export interface CanonicalTimelineTuple {
   summary: string;
 }
 
-export interface TimelineWriteThroughOutcome {
-  /**
-   * True when this helper OWNED the write: `pages.timeline` spliced, the
-   * canonical `timeline_entries` row inserted, and the disk write attempted
-   * (its own outcome in `file` — best-effort, like put_page's write-through).
-   * False → nothing was written here; the caller MUST run the legacy DB-only
-   * insert so the entry is recorded (unchanged pre-#1856 path).
-   */
-  handled: boolean;
-  /** Disk write outcome (present when handled). */
-  file?: WriteThroughResult;
-  /**
-   * The canonical tuple. Present when handled (it was stored in
-   * timeline_entries), and ALSO present alongside `error` when the bullet
-   * already reached the on-disk file before the failure — in that case the
-   * caller's DB-only fallback MUST store THIS tuple, not the raw input,
-   * or the next sync re-extract of the bullet inserts a duplicate.
-   */
-  entry?: CanonicalTimelineTuple;
-  /** Why the FS-canonical path didn't apply (when handled=false). */
-  skipped?:
-    | 'disabled_by_config'
-    | 'no_repo_configured'
-    | 'repo_not_found'
-    | 'source_repo_belongs_to_other_source'
-    | 'path_escapes_source_root'
-    | 'page_not_found'
-    | 'render_not_roundtrippable'
-    | 'file_missing'
-    | 'case_insensitive_collision'
-    | 'splice_not_roundtrippable';
-  /** Set when the helper threw mid-way; caller still falls back to DB-only. */
-  error?: string;
+export type TimelineWriteThroughOutcome =
+  | { kind: 'written'; handled: true; file: WriteThroughResult; entry: CanonicalTimelineTuple }
+  | { kind: 'db_only'; handled: false; skipped: 'disabled_by_config' | 'no_repo_configured' | 'source_repo_belongs_to_other_source' }
+  | { kind: 'duplicate'; handled: false }
+  | { kind: 'partial'; handled: false; file?: WriteThroughResult; error: string };
+
+class DuplicateTimelineEntryError extends Error {
+  constructor() { super('duplicate timeline entry'); }
 }
 
 /**
@@ -314,63 +298,60 @@ export async function writeTimelineEntryThrough(
   entry: TimelineEntryWriteInput,
   opts: { logger?: WriteThroughLogger } = {},
 ): Promise<TimelineWriteThroughOutcome> {
-  // Set the moment the atomic rename lands: from then on the canonical bullet
-  // EXISTS on disk, so any later failure must hand the canonical tuple to the
-  // caller's DB-only fallback or the next sync re-extract duplicates it.
-  let onDisk: CanonicalTimelineTuple | undefined;
   try {
     if (await isWriteThroughDisabled(engine)) {
-      return { handled: false, skipped: 'disabled_by_config' };
+      return { kind: 'db_only', handled: false, skipped: 'disabled_by_config' };
     }
     const target = await resolvePageWriteTarget(engine, slug, sourceId);
     if (!target.ok) {
-      return { handled: false, skipped: target.skipped };
+      if (
+        target.skipped === 'no_repo_configured'
+        || target.skipped === 'source_repo_belongs_to_other_source'
+      ) return { kind: 'db_only', handled: false, skipped: target.skipped };
+      return { kind: 'partial', handled: false, error: target.skipped };
     }
-    const { filePath, writeRoot } = target;
 
     const page = await engine.getPage(slug, { sourceId });
     if (!page) {
-      // Let the caller's legacy insert raise the canonical "page not found"
-      // error instead of inventing a second error shape here.
-      return { handled: false, skipped: 'page_not_found' };
+      return { kind: 'partial', handled: false, error: 'page_not_found' };
     }
 
     const rendered = renderTimelineEntry(entry, slug);
     if (!rendered) {
-      return { handled: false, skipped: 'render_not_roundtrippable' };
+      return { kind: 'partial', handled: false, error: 'render_not_roundtrippable' };
     }
 
-    // Same page lock as the facts fence writer (fence-write.ts) so concurrent
-    // fence/timeline writers to the same page serialize their read-modify-
-    // write cycles instead of dropping each other's atomic renames.
-    return await withPageLock(
+    return await withPutPageOperationLock(
+      engine,
+      sourceId,
       slug,
       async (): Promise<TimelineWriteThroughOutcome> => {
-        // Read-modify-write on the ON-DISK file: the disk copy is the merge
-        // point for file-only edits (facts fences, hand edits) the pages row
-        // doesn't carry — never regenerate the whole file from the DB row.
-        // Missing file → DB-only fallback rather than fabricating one.
-        if (!existsSync(filePath)) {
-          return { handled: false, skipped: 'file_missing' };
+        const health = await verifyOrRepairPageFile(
+          engine, slug, page.content_hash, { sourceId, logger: opts.logger },
+        );
+        if (health.file_status !== 'healthy' && health.file_status !== 'repaired') {
+          return {
+            kind: 'partial',
+            handled: false,
+            file: health,
+            error: health.error ?? health.skipped ?? 'canonical file unavailable',
+          };
         }
-        // #2831 mirror (writePageThrough's guard): on a case-insensitive
-        // filesystem the path can exist because the FS folds it onto a
-        // DIFFERENTLY-cased slug's file — splicing there would edit the
-        // other page's artifact.
-        const dir = dirname(filePath);
-        const base = basename(filePath);
-        if (!readdirSync(dir).includes(base)) {
-          opts.logger?.warn(
-            `[timeline-write-through] case-insensitive collision for ${slug}: another entry occupies ${filePath} — falling back to DB-only`,
-          );
-          return { handled: false, skipped: 'case_insensitive_collision' };
+        if (health.path !== target.filePath) {
+          return { kind: 'partial', handled: false, error: 'timeline target moved' };
         }
-
-        const beforeText = readFileSync(filePath, 'utf8');
-        const afterText = spliceTimelineIntoFileText(beforeText, entry.date, rendered.block);
-
-        // fence-write's parse-before-rename analog: the spliced text must
-        // re-extract the canonical tuple, or the file is not touched.
+        const dir = dirname(target.filePath);
+        const base = basename(target.filePath);
+        if (existsSync(dir) && !readdirSync(dir).includes(base) && existsSync(target.filePath)) {
+          return { kind: 'partial', handled: false, error: 'case_insensitive_collision' };
+        }
+        const beforeBytes = readFileSync(target.filePath);
+        const expectedTargetSha256 = sha256Utf8(beforeBytes);
+        const afterText = spliceTimelineIntoFileText(
+          beforeBytes.toString('utf8'),
+          entry.date,
+          rendered.block,
+        );
         const roundTrips = extractTimelineFromContent(afterText, slug).some(
           (e) =>
             e.date === rendered.canonical.date &&
@@ -378,38 +359,147 @@ export async function writeTimelineEntryThrough(
             e.summary === rendered.canonical.summary,
         );
         if (!roundTrips) {
-          return { handled: false, skipped: 'splice_not_roundtrippable' };
+          return { kind: 'partial', handled: false, error: 'splice_not_roundtrippable' };
         }
 
-        // Persist the spliced markdown (file is the merge point for
-        // file-only extras) as the stored projection, then write/verify
-        // those exact bytes. Independent rename + timeline-only UPDATE
-        // left the projection stale.
-        await applyCanonicalMarkdownToStore(engine, sourceId, slug, afterText);
-        const file = await writePageThrough(engine, slug, { sourceId, logger: opts.logger });
-        if (!file.written) {
-          return { handled: false, file, error: file.error ?? file.skipped };
+        try {
+          const committed = await commitCanonicalMarkdownMutation(
+            engine,
+            sourceId,
+            slug,
+            afterText,
+            async (tx) => {
+              const inserted = await tx.addTimelineEntry(slug, { // gbrain-allow-direct-insert: timeline write-through — the canonical markdown gains the same entry in this call, and the stored tuple is derived from the rendered bullet so sync/extract reconciliation dedups against it
+                date: rendered.canonical.date,
+                source: rendered.canonical.source,
+                summary: rendered.canonical.summary,
+                detail: entry.detail || '',
+              }, { sourceId, skipExistenceCheck: true });
+              if (!inserted) throw new DuplicateTimelineEntryError();
+              return rendered.canonical;
+            },
+            {
+              logger: opts.logger,
+              expectedPath: target.filePath,
+              expectedTargetSha256,
+            },
+          );
+          return { kind: 'written', handled: true, file: committed.file, entry: committed.value };
+        } catch (error) {
+          if (error instanceof DuplicateTimelineEntryError) {
+            try {
+              const duplicateRows = await engine.executeRaw<{ detail: string | null }>(
+                `SELECT te.detail
+                   FROM timeline_entries te
+                   JOIN pages p ON p.id = te.page_id
+                  WHERE p.source_id = $1 AND p.slug = $2 AND p.deleted_at IS NULL
+                    AND te.date = $3::date AND te.summary = $4 AND te.source = $5
+                  LIMIT 1`,
+                [
+                  sourceId,
+                  slug,
+                  rendered.canonical.date,
+                  rendered.canonical.summary,
+                  rendered.canonical.source,
+                ],
+              );
+              if (
+                duplicateRows.length !== 1
+                || (duplicateRows[0]!.detail ?? '') !== (entry.detail ?? '')
+              ) {
+                return {
+                  kind: 'partial',
+                  handled: false,
+                  error: 'timeline duplicate key exists with different detail',
+                };
+              }
+              let duplicateProjection = await loadCanonicalProjection(engine, sourceId, slug);
+              if (!duplicateProjection || !projectionIsFresh(duplicateProjection)) {
+                duplicateProjection = await persistCanonicalProjectionFromRow(engine, sourceId, slug);
+              }
+              const duplicatePage = await engine.getPage(slug, { sourceId });
+              if (!duplicatePage) {
+                return {
+                  kind: 'partial', handled: false,
+                  error: 'timeline page disappeared while repairing duplicate',
+                };
+              }
+              const duplicateMaterialized = extractTimelineFromContent(
+                duplicatePage.timeline ?? '',
+                slug,
+              ).some((candidate) =>
+                candidate.date === rendered.canonical.date
+                && (candidate.source ?? '') === rendered.canonical.source
+                && candidate.summary === rendered.canonical.summary
+              );
+              if (!duplicateMaterialized) {
+                const materialized = await commitCanonicalMarkdownMutation(
+                  engine,
+                  sourceId,
+                  slug,
+                  afterText,
+                  async () => rendered.canonical,
+                  {
+                    logger: opts.logger,
+                    expectedPath: target.filePath,
+                    expectedTargetSha256,
+                  },
+                );
+                return {
+                  kind: 'written',
+                  handled: true,
+                  file: materialized.file,
+                  entry: materialized.value,
+                };
+              }
+
+              const repaired = await verifyOrRepairPageFile(
+                engine,
+                slug,
+                duplicateProjection.semanticContentHash,
+                { sourceId, logger: opts.logger },
+              );
+              if (
+                (repaired.file_status === 'healthy' || repaired.file_status === 'repaired')
+                && repaired.path === target.filePath
+              ) {
+                return { kind: 'duplicate', handled: false };
+              }
+              return {
+                kind: 'partial',
+                handled: false,
+                file: repaired,
+                error: repaired.error ?? repaired.skipped
+                  ?? 'duplicate row exists but file is not canonical',
+              };
+            } catch (repairError) {
+              return {
+                kind: 'partial',
+                handled: false,
+                error: repairError instanceof Error ? repairError.message : String(repairError),
+              };
+            }
+          }
+          if (error instanceof CanonicalMutationPartialError) {
+            return {
+              kind: 'partial',
+              handled: false,
+              file: error.writeThrough,
+              error: error.message,
+            };
+          }
+          return {
+            kind: 'partial',
+            handled: false,
+            error: error instanceof Error ? error.message : String(error),
+          };
         }
-        onDisk = rendered.canonical;
-
-        // Store the tuple the FS extractor recovers from the bullet just
-        // spliced in, so every later sync/rebuild re-extraction
-        // conflicts-no-ops instead of duplicating (#1856's dedup-tuple
-        // divergence).
-        await engine.addTimelineEntry(slug, { // gbrain-allow-direct-insert: timeline write-through — the canonical markdown gains the same entry in this call, and the stored tuple is derived from the rendered bullet so sync/extract reconciliation dedups against it
-          date: rendered.canonical.date,
-          source: rendered.canonical.source,
-          summary: rendered.canonical.summary,
-          detail: entry.detail || '',
-        }, { sourceId, skipExistenceCheck: true });
-
-        return { handled: true, file, entry: rendered.canonical };
       },
       { timeoutMs: 5_000 },
     );
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     opts.logger?.warn(`[timeline-write-through] failed for ${slug}: ${msg}`);
-    return { handled: false, error: msg, ...(onDisk ? { entry: onDisk } : {}) };
+    return { kind: 'partial', handled: false, error: msg };
   }
 }

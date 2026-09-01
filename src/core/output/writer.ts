@@ -17,18 +17,58 @@
  * a bad citation or dangling back-link never lands on disk.
  */
 
+import { existsSync, readFileSync } from 'node:fs';
 import type { BrainEngine } from '../engine.ts';
 import type { PageType, TimelineInput } from '../types.ts';
 import type { ResolverContext } from '../resolvers/interface.ts';
 import { SlugRegistry } from './slug-registry.ts';
-import { persistCanonicalProjectionFromRow } from '../page-canonical.ts';
-import { writePageThrough } from '../write-through.ts';
+import {
+  loadCanonicalProjection,
+  persistCanonicalProjectionFromRow,
+  projectionIsFresh,
+  sha256Utf8,
+} from '../page-canonical.ts';
+import {
+  isWriteThroughDisabled,
+  resolvePageWriteTarget,
+  writePageThrough,
+  type WriteThroughResult,
+} from '../write-through.ts';
+import { withPutPageOperationLock } from '../ops/put-page-lock.ts';
+import {
+  renderTimelineEntry,
+  spliceTimelineBlock,
+} from '../timeline-write-through.ts';
 
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
 
 export type StrictMode = 'strict' | 'lint' | 'off';
+
+type CanonicalFlushPlan =
+  | {
+      mode: 'file';
+      slug: string;
+      projectionSha256: string;
+      projectionSizeBytes: number;
+      filePath: string;
+      expectedTargetSha256: string | null;
+    }
+  | {
+      mode: 'not_projected';
+      slug: string;
+      projectionSha256: string;
+    };
+
+type CanonicalTargetPreimage =
+  | {
+      mode: 'file';
+      slug: string;
+      filePath: string;
+      expectedTargetSha256: string | null;
+    }
+  | { mode: 'not_projected'; slug: string };
 
 export interface BrainWriterOptions {
   /**
@@ -48,6 +88,8 @@ export interface BrainWriterOptions {
    * source's row with it.
    */
   sourceId?: string;
+  _afterCommitBeforeFlushForTest?: (plans: readonly CanonicalFlushPlan[]) => void;
+  _afterPageReadBeforeMutationForTest?: (slug: string) => void;
 }
 
 export interface EntityInput {
@@ -78,7 +120,8 @@ export interface ValidationReport {
 
 export class WriteError extends Error {
   constructor(
-    public code: 'validation_failed' | 'invalid_input' | 'slug_collision' | 'unknown',
+    public code: 'validation_failed' | 'invalid_input' | 'slug_collision' | 'unknown'
+      | 'canonical_target_unavailable' | 'canonical_file_diverged' | 'partial_write',
     message: string,
     public findings?: ValidationFinding[],
   ) {
@@ -148,11 +191,14 @@ export function slugRegistryLockKey(sourceId: string | undefined, slug: string):
 class WriteTxImpl implements WriteTx {
   readonly touchedSlugs = new Set<string>();
   private slugRegistry: SlugRegistry;
+  private readonly canonicalTargets = new Map<string, CanonicalTargetPreimage>();
+  readonly canonicalPages = new Map<string, CanonicalFlushPlan>();
 
   constructor(
     private engine: BrainEngine,
     public readonly context: ResolverContext,
     private sourceId?: string,
+    private afterPageReadBeforeMutationForTest?: (slug: string) => void,
   ) {
     this.slugRegistry = new SlugRegistry(engine, sourceId);
   }
@@ -162,11 +208,136 @@ class WriteTxImpl implements WriteTx {
     return { sourceId: this.sourceId ?? 'default' };
   }
 
-  /** Refresh the stored projection and write/verify canonical file bytes. */
-  private async projectAndWrite(slug: string): Promise<void> {
+  private async prepareCanonicalTarget(
+    slug: string,
+    opts: { creating?: boolean; expectedContentHash?: string } = {},
+  ): Promise<void> {
+    if (this.canonicalTargets.has(slug)) return;
     const sourceId = this.scope().sourceId;
-    await persistCanonicalProjectionFromRow(this.engine, sourceId, slug);
-    await writePageThrough(this.engine, slug, { sourceId });
+    if (!opts.creating) {
+      if (!opts.expectedContentHash) {
+        throw new WriteError(
+          'canonical_file_diverged',
+          `BrainWriter cannot fence a page without its semantic hash: ${sourceId}/${slug}`,
+        );
+      }
+      const locked = await this.engine.executeRaw<{ id: number | string }>(
+        `SELECT id FROM pages
+          WHERE source_id = $1 AND slug = $2 AND deleted_at IS NULL
+            AND content_hash = $3
+          FOR UPDATE`,
+        [sourceId, slug, opts.expectedContentHash],
+      );
+      if (locked.length !== 1) {
+        throw new WriteError(
+          'canonical_file_diverged',
+          `BrainWriter page moved after its logical read: ${sourceId}/${slug}`,
+        );
+      }
+    }
+    if (await isWriteThroughDisabled(this.engine)) {
+      this.canonicalTargets.set(slug, { mode: 'not_projected', slug });
+      return;
+    }
+    const target = await resolvePageWriteTarget(this.engine, slug, sourceId);
+    if (!target.ok) {
+      if (
+        target.skipped === 'no_repo_configured'
+        || target.skipped === 'source_repo_belongs_to_other_source'
+      ) {
+        this.canonicalTargets.set(slug, { mode: 'not_projected', slug });
+        return;
+      }
+      throw new WriteError(
+        'canonical_target_unavailable',
+        `BrainWriter canonical target unavailable for ${sourceId}/${slug}: ${target.skipped}`,
+      );
+    }
+
+    let expectedTargetSha256: string | null = null;
+    if (existsSync(target.filePath)) {
+      if (opts.creating) {
+        throw new WriteError(
+          'canonical_file_diverged',
+          `BrainWriter refuses to create ${sourceId}/${slug} over an orphan canonical file`,
+        );
+      }
+      let before = await loadCanonicalProjection(this.engine, sourceId, slug);
+      if (!before || !projectionIsFresh(before)) {
+        before = await persistCanonicalProjectionFromRow(this.engine, sourceId, slug);
+      }
+      if (
+        opts.expectedContentHash !== undefined
+        && before.semanticContentHash !== opts.expectedContentHash
+      ) {
+        throw new WriteError(
+          'canonical_file_diverged',
+          `BrainWriter page moved between logical read and canonical preflight: ${sourceId}/${slug}`,
+        );
+      }
+      const bytes = readFileSync(target.filePath);
+      expectedTargetSha256 = sha256Utf8(bytes);
+      if (
+        expectedTargetSha256 !== before.sha256
+        || bytes.length !== before.sizeBytes
+      ) {
+        throw new WriteError(
+          'canonical_file_diverged',
+          `BrainWriter canonical file differs from the pre-mutation store projection: ${target.filePath}`,
+        );
+      }
+    } else if (!opts.creating) {
+      // Prove that an existing row really has a fresh canonical projection even
+      // when its file is absent. The post-commit sink may then create it with a
+      // null CAS; any file appearing in the meantime makes that CAS fail.
+      let before = await loadCanonicalProjection(this.engine, sourceId, slug);
+      if (!before || !projectionIsFresh(before)) {
+        before = await persistCanonicalProjectionFromRow(this.engine, sourceId, slug);
+      }
+      if (
+        opts.expectedContentHash !== undefined
+        && before.semanticContentHash !== opts.expectedContentHash
+      ) {
+        throw new WriteError(
+          'canonical_file_diverged',
+          `BrainWriter page moved between logical read and canonical preflight: ${sourceId}/${slug}`,
+        );
+      }
+    }
+    this.canonicalTargets.set(slug, {
+      mode: 'file',
+      slug,
+      filePath: target.filePath,
+      expectedTargetSha256,
+    });
+  }
+
+  private async project(slug: string): Promise<void> {
+    const prepared = this.canonicalTargets.get(slug);
+    if (!prepared) {
+      throw new WriteError(
+        'unknown',
+        `BrainWriter internal error: ${slug} mutated before canonical target preparation`,
+      );
+    }
+    const sourceId = this.scope().sourceId;
+    const projection = await persistCanonicalProjectionFromRow(
+      this.engine,
+      sourceId,
+      slug,
+    );
+    if (prepared.mode === 'file') {
+      this.canonicalPages.set(slug, {
+        ...prepared,
+        projectionSha256: projection.sha256,
+        projectionSizeBytes: projection.sizeBytes,
+      });
+    } else {
+      this.canonicalPages.set(slug, {
+        ...prepared,
+        projectionSha256: projection.sha256,
+      });
+    }
   }
 
   async createEntity(input: EntityInput): Promise<string> {
@@ -212,6 +383,8 @@ class WriteTxImpl implements WriteTx {
       displayName: input.displayName,
       type: input.type,
     });
+    await this.prepareCanonicalTarget(slug, { creating: true });
+    this.afterPageReadBeforeMutationForTest?.(slug);
     await this.engine.putPage(slug, {
       type: input.type,
       title: input.displayName,
@@ -219,19 +392,49 @@ class WriteTxImpl implements WriteTx {
       timeline: input.timeline ?? '',
       frontmatter: input.frontmatter ?? {},
     }, this.scope());
-    await this.projectAndWrite(slug);
+    await this.project(slug);
     this.touchedSlugs.add(slug);
     return slug;
   }
 
   async appendTimeline(slug: string, entry: TimelineInput): Promise<void> {
-    await this.engine.addTimelineEntry(slug, entry, this.scope()); // gbrain-allow-direct-insert: BrainWriter is the canonical synthesize-phase write surface — output gets fenced into pages via putPage in the same transaction
+    const page = await this.engine.getPage(slug, this.scope());
+    if (!page) throw new WriteError('invalid_input', `appendTimeline: page not found: ${slug}`);
+    if (!page.content_hash) throw new WriteError('canonical_file_diverged', `appendTimeline: page has no semantic hash: ${slug}`);
+    await this.prepareCanonicalTarget(slug, {
+      expectedContentHash: page.content_hash,
+    });
+    this.afterPageReadBeforeMutationForTest?.(slug);
+    const rendered = renderTimelineEntry(entry, slug);
+    if (!rendered) {
+      throw new WriteError('invalid_input', `appendTimeline: entry does not round-trip: ${slug}`);
+    }
+    const inserted = await this.engine.addTimelineEntry(slug, { // gbrain-allow-direct-insert: BrainWriter is the canonical synthesize-phase write surface — output gets fenced into pages via putPage in the same transaction
+      ...entry,
+      date: rendered.canonical.date,
+      source: rendered.canonical.source,
+      summary: rendered.canonical.summary,
+    }, this.scope());
+    if (!inserted) throw new WriteError('invalid_input', `appendTimeline: duplicate entry: ${slug}`);
+    await this.engine.putPage(slug, {
+      type: page.type,
+      title: page.title,
+      compiled_truth: page.compiled_truth,
+      timeline: spliceTimelineBlock(page.timeline ?? '', entry.date, rendered.block),
+      frontmatter: page.frontmatter,
+    }, this.scope());
+    await this.project(slug);
     this.touchedSlugs.add(slug);
   }
 
   async setCompiledTruth(slug: string, body: string): Promise<void> {
     const existing = await this.engine.getPage(slug, this.scope());
     if (!existing) throw new WriteError('invalid_input', `setCompiledTruth: page not found: ${slug}`);
+    if (!existing.content_hash) throw new WriteError('canonical_file_diverged', `setCompiledTruth: page has no semantic hash: ${slug}`);
+    await this.prepareCanonicalTarget(slug, {
+      expectedContentHash: existing.content_hash,
+    });
+    this.afterPageReadBeforeMutationForTest?.(slug);
     await this.engine.putPage(slug, {
       type: existing.type,
       title: existing.title,
@@ -239,13 +442,18 @@ class WriteTxImpl implements WriteTx {
       timeline: existing.timeline,
       frontmatter: existing.frontmatter,
     }, this.scope());
-    await this.projectAndWrite(slug);
+    await this.project(slug);
     this.touchedSlugs.add(slug);
   }
 
   async setFrontmatterField(slug: string, key: string, value: unknown): Promise<void> {
     const existing = await this.engine.getPage(slug, this.scope());
     if (!existing) throw new WriteError('invalid_input', `setFrontmatterField: page not found: ${slug}`);
+    if (!existing.content_hash) throw new WriteError('canonical_file_diverged', `setFrontmatterField: page has no semantic hash: ${slug}`);
+    await this.prepareCanonicalTarget(slug, {
+      expectedContentHash: existing.content_hash,
+    });
+    this.afterPageReadBeforeMutationForTest?.(slug);
     const nextFm = { ...existing.frontmatter, [key]: value };
     await this.engine.putPage(slug, {
       type: existing.type,
@@ -254,7 +462,7 @@ class WriteTxImpl implements WriteTx {
       timeline: existing.timeline,
       frontmatter: nextFm,
     }, this.scope());
-    await this.projectAndWrite(slug);
+    await this.project(slug);
     this.touchedSlugs.add(slug);
   }
 
@@ -287,6 +495,9 @@ export class BrainWriter {
   private validators: PageValidator[] = [];
   private strictMode: StrictMode;
   private sourceId?: string;
+  private readonly afterCommitBeforeFlushForTest?:
+    (plans: readonly CanonicalFlushPlan[]) => void;
+  private readonly afterPageReadBeforeMutationForTest?: (slug: string) => void;
 
   constructor(
     private engine: BrainEngine,
@@ -294,6 +505,9 @@ export class BrainWriter {
   ) {
     this.strictMode = opts.strictMode ?? 'lint';
     this.sourceId = opts.sourceId;
+    this.afterCommitBeforeFlushForTest = opts._afterCommitBeforeFlushForTest;
+    this.afterPageReadBeforeMutationForTest =
+      opts._afterPageReadBeforeMutationForTest;
   }
 
   register(validator: PageValidator): void {
@@ -313,8 +527,14 @@ export class BrainWriter {
     let report: ValidationReport | null = null;
 
     const strictSourceId = this.sourceId;
+    let canonicalPages: CanonicalFlushPlan[] = [];
     const txResult = await this.engine.transaction(async (txEngine) => {
-      const tx = new WriteTxImpl(txEngine, ctx, strictSourceId);
+      const tx = new WriteTxImpl(
+        txEngine,
+        ctx,
+        strictSourceId,
+        this.afterPageReadBeforeMutationForTest,
+      );
       const result = await fn(tx);
 
       // Validators run before the outer transaction commits.
@@ -329,9 +549,110 @@ export class BrainWriter {
         }
       }
 
+      canonicalPages = [...tx.canonicalPages.values()]
+        .sort((a, b) => a.slug.localeCompare(b.slug));
       return result;
-    });
+    }); // COMMITTED; validator rollback exits before any file sink.
 
+    this.afterCommitBeforeFlushForTest?.(canonicalPages);
+
+    const failures: Array<{ slug: string; outcome: WriteThroughResult }> = [];
+    for (const expected of canonicalPages) {
+      if (expected.mode === 'not_projected') continue;
+      try {
+        await withPutPageOperationLock(
+          this.engine,
+          strictSourceId ?? 'default',
+          expected.slug,
+          async () => {
+            const sourceId = strictSourceId ?? 'default';
+            const before = await loadCanonicalProjection(
+              this.engine, sourceId, expected.slug,
+            );
+            if (
+              !before
+              || !projectionIsFresh(before)
+              || before.sha256 !== expected.projectionSha256
+              || before.sizeBytes !== expected.projectionSizeBytes
+            ) {
+              failures.push({
+                slug: expected.slug,
+                outcome: { written: false, error: 'projection_moved_before_file_flush' },
+              });
+              return;
+            }
+            if (await isWriteThroughDisabled(this.engine)) {
+              failures.push({
+                slug: expected.slug,
+                outcome: { written: false, error: 'projection_mode_moved_after_commit' },
+              });
+              return;
+            }
+            const target = await resolvePageWriteTarget(this.engine, expected.slug, sourceId);
+            if (!target.ok) {
+              failures.push({
+                slug: expected.slug,
+                outcome: { written: false, skipped: target.skipped },
+              });
+              return;
+            }
+            if (target.filePath !== expected.filePath) {
+              failures.push({
+                slug: expected.slug,
+                outcome: { written: false, error: 'projection_target_moved_after_commit' },
+              });
+              return;
+            }
+            const currentTargetSha256 = existsSync(target.filePath)
+              ? sha256Utf8(readFileSync(target.filePath))
+              : null;
+            if (currentTargetSha256 !== expected.expectedTargetSha256) {
+              failures.push({
+                slug: expected.slug,
+                outcome: { written: false, error: 'canonical_file_preimage_moved' },
+              });
+              return;
+            }
+            const outcome = await writePageThrough(this.engine, expected.slug, {
+              sourceId,
+              expectedPath: expected.filePath,
+              expectedTargetSha256: expected.expectedTargetSha256,
+            });
+            const after = await loadCanonicalProjection(
+              this.engine, sourceId, expected.slug,
+            );
+            let fileMatches = false;
+            if (outcome.written && outcome.path === target.filePath) {
+              const bytes = readFileSync(target.filePath);
+              fileMatches = sha256Utf8(bytes) === expected.projectionSha256
+                && bytes.length === expected.projectionSizeBytes;
+            }
+            if (
+              !outcome.written
+              || !after
+              || !projectionIsFresh(after)
+              || after.sha256 !== expected.projectionSha256
+              || !fileMatches
+            ) failures.push({ slug: expected.slug, outcome });
+          },
+          { timeoutMs: 5_000 },
+        );
+      } catch (error) {
+        failures.push({
+          slug: expected.slug,
+          outcome: {
+            written: false,
+            error: error instanceof Error ? error.message : String(error),
+          },
+        });
+      }
+    }
+    if (failures.length > 0) {
+      throw new WriteError(
+        'partial_write',
+        `BrainWriter committed store rows but canonical file verification failed: ${JSON.stringify(failures)}`,
+      );
+    }
     return { result: txResult, report: report ?? emptyReport() };
   }
 

@@ -7,10 +7,12 @@
 import type postgres from 'postgres';
 
 type PgSql = ReturnType<typeof postgres>;
+type PgFactsQuery = PgSql | postgres.TransactionSql;
 
 import type {
   FactRow, FactKind, FactVisibility, FactInsertStatus,
   NewFact, FactListOpts, FactsHealth,
+  InsertFactsOptions,
 } from '../engine.ts';
 import { MAX_SEARCH_LIMIT, clampSearchLimit } from '../engine.ts';
 import { tryParseEmbedding } from '../utils.ts';
@@ -122,7 +124,7 @@ export async function insertFacts(
   deps: PgFactsDeps,
     rows: Array<NewFact & { row_num: number; source_markdown_slug: string; superseded_by_row?: number }>,
     ctx: { source_id: string },
-    opts?: { deleteForPageFirst?: { slug: string; excludeSourcePrefixes?: string[]; preserveExpiredLegacy?: boolean } },
+    opts?: InsertFactsOptions,
   ): Promise<{ inserted: number; ids: number[]; warnings: string[]; deleted: number }> {
     if (rows.length === 0) return { inserted: 0, ids: [], warnings: [], deleted: 0 };
 
@@ -142,7 +144,33 @@ export async function insertFacts(
     // v0.46 (#3014): the fence path carries struck rows — `expired_at` is
     // stamped inline here, and `superseded by #N` references are resolved
     // to `facts.superseded_by` in a second pass below (same transaction).
-    const ids = await sql.begin(async (tx) => {
+    const run = async (tx: PgFactsQuery) => {
+      const conflict = opts?.verifyIdenticalOnConflict
+        ? tx`
+      ON CONFLICT (source_id, source_markdown_slug, row_num)
+      WHERE row_num IS NOT NULL
+      DO UPDATE SET row_num = facts.row_num
+      WHERE facts.entity_slug IS NOT DISTINCT FROM EXCLUDED.entity_slug
+        AND facts.fact IS NOT DISTINCT FROM EXCLUDED.fact
+        AND facts.kind IS NOT DISTINCT FROM EXCLUDED.kind
+        AND facts.visibility IS NOT DISTINCT FROM EXCLUDED.visibility
+        AND facts.notability IS NOT DISTINCT FROM EXCLUDED.notability
+        AND facts.context IS NOT DISTINCT FROM EXCLUDED.context
+        AND facts.valid_from IS NOT DISTINCT FROM EXCLUDED.valid_from
+        AND facts.valid_until IS NOT DISTINCT FROM EXCLUDED.valid_until
+        AND facts.expired_at IS NOT DISTINCT FROM EXCLUDED.expired_at
+        AND facts.source IS NOT DISTINCT FROM EXCLUDED.source
+        AND facts.source_session IS NOT DISTINCT FROM EXCLUDED.source_session
+        AND facts.confidence IS NOT DISTINCT FROM EXCLUDED.confidence
+        AND facts.embedding IS NOT DISTINCT FROM EXCLUDED.embedding
+        AND facts.claim_metric IS NOT DISTINCT FROM EXCLUDED.claim_metric
+        AND facts.claim_value IS NOT DISTINCT FROM EXCLUDED.claim_value
+        AND facts.claim_unit IS NOT DISTINCT FROM EXCLUDED.claim_unit
+        AND facts.claim_period IS NOT DISTINCT FROM EXCLUDED.claim_period
+        AND facts.event_type IS NOT DISTINCT FROM EXCLUDED.event_type`
+        : tx`
+      ON CONFLICT (source_id, source_markdown_slug, row_num)
+      WHERE row_num IS NOT NULL DO NOTHING`;
       // v0.46 (#3014) — atomic reconcile: wipe the page's fence-owned rows
       // as the FIRST statement of this transaction so a failing insert
       // below rolls the delete back too. Inlined (not a deleteFactsForPage
@@ -218,9 +246,7 @@ export async function insertFacts(
             ${claimMetric}, ${claimValue}, ${claimUnit}, ${claimPeriod},
             ${eventType}
           )
-          ON CONFLICT (source_id, source_markdown_slug, row_num)
-          WHERE row_num IS NOT NULL
-          DO NOTHING
+          ${conflict}
           RETURNING id
         `;
         if (ins[0]) out.push(Number(ins[0].id));
@@ -262,7 +288,10 @@ export async function insertFacts(
         }
       }
       return out;
-    });
+    };
+    const ids = opts?.inTransaction
+      ? await run(sql)
+      : await sql.begin(run);
     return { inserted: ids.length, ids, warnings, deleted };
   }
 

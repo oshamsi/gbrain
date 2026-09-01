@@ -32,11 +32,22 @@
  *      / thin-client state.
  */
 
-import { existsSync, readFileSync, writeFileSync, renameSync } from 'node:fs';
+import { readFileSync } from 'node:fs';
 
 import type { BrainEngine } from '../engine.ts';
-import { withPageLock } from '../page-lock.ts';
-import { resolvePageWriteTarget } from '../write-through.ts';
+import { withPutPageOperationLock } from '../ops/put-page-lock.ts';
+import {
+  isWriteThroughDisabled,
+  resolvePageWriteTarget,
+  verifyOrRepairPageFile,
+} from '../write-through.ts';
+import {
+  loadCanonicalProjection,
+  persistCanonicalProjectionFromRow,
+  projectionIsFresh,
+  sha256Utf8,
+} from '../page-canonical.ts';
+import { commitCanonicalMarkdownMutation } from '../canonical-mutation.ts';
 import { parseFactsFence, renderFactsTable, type ParsedFact } from '../facts-fence.ts';
 
 export interface ForgetFactResult {
@@ -125,85 +136,94 @@ export async function forgetFactInFence(
     return { ok: false, path: 'not_found', reason };
   }
   const row = rows[0];
+  const wasAlreadyExpired = row.expired_at !== null;
 
-  if (row.expired_at !== null) {
-    return { ok: false, path: 'already_expired', reason };
-  }
-
-  // Fence path requires: v51 columns set + source.local_path set.
+  // Fence path requires v51 fence coordinates. entity_slug is not part of
+  // the canonical fence coordinate.
   const canFence =
     row.row_num !== null &&
-    row.source_markdown_slug !== null &&
-    row.entity_slug !== null;
+    row.source_markdown_slug !== null;
+
+  const expireLegacy = async (): Promise<ForgetFactResult> => {
+    if (wasAlreadyExpired) {
+      return { ok: false, path: 'already_expired', reason };
+    }
+    const ok = await engine.expireFact(factId); // gbrain-allow-direct-insert: legacy fallback path inside forgetFactInFence — fence rewrite not possible (pre-v51 row / missing local_path / write_through disabled)
+    return { ok, path: 'legacy_db', reason };
+  };
 
   if (!canFence) {
-    // Legacy path — DB-only forget. Doesn't survive `gbrain rebuild`.
-    const ok = await engine.expireFact(factId); // gbrain-allow-direct-insert: legacy fallback path inside forgetFactInFence — fence rewrite not possible (pre-v51 row / missing local_path / file deleted / row_num drift)
-    return { ok, path: 'legacy_db', reason };
+    return expireLegacy();
   }
 
-  // Look up source.local_path.
   const sources = await engine.executeRaw<SourceRow>(
     `SELECT id, local_path FROM sources WHERE id = $1 LIMIT 1`,
     [row.source_id],
   );
   const localPath = sources[0]?.local_path ?? null;
-  if (!localPath) {
-    const ok = await engine.expireFact(factId); // gbrain-allow-direct-insert: legacy fallback path inside forgetFactInFence — fence rewrite not possible (pre-v51 row / missing local_path / file deleted / row_num drift)
-    return { ok, path: 'legacy_db', reason };
+  if (localPath == null) {
+    return expireLegacy();
+  }
+  if (await isWriteThroughDisabled(engine)) {
+    return expireLegacy();
   }
 
   const slug = row.source_markdown_slug!;
   const targetRowNum = row.row_num!;
-  // #4204: resolve the fence file the same way writeFactsToFence /
-  // writePageThrough do (recorded source_path preference, own-local_path
-  // root). A bare `join(localPath, slug.md)` misses fences that live in a
-  // human-named vault file, degrading forget to a DB-only expire while the
-  // fence keeps the live row for the next absorb to resurrect.
-  const resolved = await resolvePageWriteTarget(engine, slug, row.source_id);
-  if (!resolved.ok) {
-    const ok = await engine.expireFact(factId); // gbrain-allow-direct-insert: legacy fallback path inside forgetFactInFence — fence rewrite not possible (pre-v51 row / missing local_path / file deleted / row_num drift)
-    return { ok, path: 'legacy_db', reason };
-  }
-  const filePath = resolved.filePath;
-  const tmpPath = `${filePath}.tmp`;
 
-  if (!existsSync(filePath)) {
-    // File deleted out from under us — only the DB has the row.
-    // Legacy path is the safe behavior; the operator can fix the
-    // tree mismatch separately.
-    const ok = await engine.expireFact(factId); // gbrain-allow-direct-insert: legacy fallback path inside forgetFactInFence — fence rewrite not possible (pre-v51 row / missing local_path / file deleted / row_num drift)
-    return { ok, path: 'legacy_db', reason };
-  }
-
-  return withPageLock(slug, async () => {
-    const body = readFileSync(filePath, 'utf-8');
-    const parsed = parseFactsFence(body);
-
-    // Find the target row in the fence by row_num.
-    const target = parsed.facts.find(f => f.rowNum === targetRowNum);
-    if (!target) {
-      // Fence is missing the row — DB drifted from markdown. Fall
-      // through to legacy expire so the user's intent succeeds; doctor
-      // surfaces the drift separately.
-      const ok = await engine.expireFact(factId); // gbrain-allow-direct-insert: legacy fallback path inside forgetFactInFence — fence rewrite not possible (pre-v51 row / missing local_path / file deleted / row_num drift)
+  return withPutPageOperationLock(engine, row.source_id, slug, async () => {
+    if (await isWriteThroughDisabled(engine)) {
+      if (wasAlreadyExpired) {
+        return { ok: false, path: 'already_expired', reason };
+      }
+      const ok = await engine.expireFact(factId); // gbrain-allow-direct-insert: legacy fallback path inside forgetFactInFence — fence rewrite not possible (pre-v51 row / missing local_path / write_through disabled)
       return { ok, path: 'legacy_db', reason };
     }
+    const target = await resolvePageWriteTarget(engine, slug, row.source_id);
+    if (!target.ok) {
+      throw new Error(`FACT_FORGET_TARGET_UNAVAILABLE:${target.skipped}`);
+    }
+    let projection = await loadCanonicalProjection(engine, row.source_id, slug);
+    if (!projection || !projectionIsFresh(projection)) {
+      projection = await persistCanonicalProjectionFromRow(engine, row.source_id, slug);
+    }
+    const health = await verifyOrRepairPageFile(
+      engine,
+      slug,
+      projection.semanticContentHash,
+      { sourceId: row.source_id },
+    );
+    if (health.file_status !== 'healthy' && health.file_status !== 'repaired') {
+      throw new Error(`FACT_FORGET_FILE_UNAVAILABLE:${health.error ?? health.skipped}`);
+    }
+    if (health.path !== target.filePath) throw new Error('FACT_FORGET_PATH_MOVED');
+    const beforeBytes = readFileSync(target.filePath);
+    const expectedTargetSha256 = sha256Utf8(beforeBytes);
+    const body = beforeBytes.toString('utf8');
+    const parsedFence = parseFactsFence(body);
+    if (parsedFence.warnings.length > 0) {
+      throw new Error(`FACT_FORGET_FENCE_MALFORMED:${parsedFence.warnings.join('|')}`);
+    }
+    const fenceRow = parsedFence.facts.find((fact) => fact.rowNum === targetRowNum);
+    if (!fenceRow) throw new Error('FACT_FORGET_ROW_MISSING');
+    if (wasAlreadyExpired) {
+      // This is the post-commit retry path. verifyOrRepair above must first heal
+      // store-new/file-old; only then may idempotence report already_expired.
+      if (fenceRow.active) throw new Error('FACT_FORGET_EXPIRED_BUT_FENCE_ACTIVE');
+      return { ok: false, path: 'already_expired', reason };
+    }
 
-    // Mutate: strike out claim (already-strikethrough rows stay
-    // strikethrough), set valid_until = today, append "forgotten:
-    // <reason>" to context (preserving any existing context).
     const today = todayUtc();
-    const existingContext = target.context?.trim() ?? '';
+    const existingContext = fenceRow.context?.trim() ?? '';
     const newContext = existingContext
       ? `${existingContext} | forgotten: ${reason}`
       : `forgotten: ${reason}`;
 
-    const updated: ParsedFact[] = parsed.facts.map(f =>
+    const updated: ParsedFact[] = parsedFence.facts.map(f =>
       f.rowNum === targetRowNum
         ? {
             ...f,
-            active: false,        // strikethrough on render
+            active: false,
             validUntil: today,
             context: newContext,
             forgotten: true,
@@ -211,39 +231,40 @@ export async function forgetFactInFence(
         : f,
     );
 
-    // Render + atomic .tmp + parse-validate + rename.
     const newFence = renderFactsTable(updated);
     const begin = body.indexOf('<!--- gbrain:facts:begin -->');
-    const end   = body.indexOf('<!--- gbrain:facts:end -->', begin + 1);
+    const end = body.indexOf('<!--- gbrain:facts:end -->', begin + 1);
     if (begin === -1 || end === -1) {
-      // Race / corruption: fence disappeared between parse and render.
-      // Legacy fallback.
-      const ok = await engine.expireFact(factId); // gbrain-allow-direct-insert: legacy fallback path inside forgetFactInFence — fence rewrite not possible (pre-v51 row / missing local_path / file deleted / row_num drift)
-      return { ok, path: 'legacy_db', reason };
+      throw new Error('FACT_FORGET_FENCE_MALFORMED:markers');
     }
     const newBody = body.slice(0, begin) + newFence + body.slice(end + '<!--- gbrain:facts:end -->'.length);
-
-    writeFileSync(tmpPath, newBody, 'utf-8');
-    const tmpBody = readFileSync(tmpPath, 'utf-8');
-    const validate = parseFactsFence(tmpBody);
+    const validate = parseFactsFence(newBody);
     if (validate.warnings.length > 0) {
-      // Quarantine .tmp; leave the canonical file alone; fall back to
-      // DB expire so the user's forget intent still succeeds.
-      const ok = await engine.expireFact(factId); // gbrain-allow-direct-insert: legacy fallback path inside forgetFactInFence — fence rewrite not possible (pre-v51 row / missing local_path / file deleted / row_num drift)
-      return { ok, path: 'legacy_db', reason };
+      throw new Error(`FACT_FORGET_FENCE_MALFORMED:${validate.warnings.join('|')}`);
     }
-    renameSync(tmpPath, filePath);
 
-    // Stamp the DB to match: valid_until = today, expired_at = now().
-    // This keeps DB query patterns (active facts WHERE expired_at IS NULL)
-    // accurate the moment the forget commits, without waiting for the
-    // next extract_facts cycle phase to reconcile.
-    await engine.executeRaw(
-      `UPDATE facts SET valid_until = $1, expired_at = now()
-       WHERE id = $2 AND expired_at IS NULL`,
-      [today, factId],
+    await commitCanonicalMarkdownMutation(
+      engine,
+      row.source_id,
+      slug,
+      newBody,
+      async (tx) => {
+        const changed = await tx.executeRaw<{ id: string }>(
+          `UPDATE facts
+              SET valid_until = $1, expired_at = now()
+            WHERE id = $2 AND expired_at IS NULL
+            RETURNING id`,
+          [today, factId],
+        );
+        if (!Array.isArray(changed) || changed.length !== 1) {
+          throw new Error('FACT_FORGET_CONFLICT');
+        }
+      },
+      {
+        expectedPath: target.filePath,
+        expectedTargetSha256,
+      },
     );
-
     return { ok: true, path: 'fence', reason };
   }, { timeoutMs: 5_000 });
 }

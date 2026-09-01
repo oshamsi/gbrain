@@ -44,10 +44,13 @@ export interface PgTakesDeps {
 
 export async function addTakesBatch(deps: PgTakesDeps, rowsIn: TakeBatchInput[], opts?: BatchOpts): Promise<number> {
     if (rowsIn.length === 0) return 0;
-    // v0.42.26: takes is a batch primitive too — wrap in batchRetry so a
-    // Supavisor circuit-breaker blip doesn't silently drop takes the way it
-    // could before (links/timeline already had this; takes was the gap).
-    return deps.batchRetry(opts?.auditSite ?? 'addTakesBatch', opts?.signal, () => _addTakesBatchOnce(deps, rowsIn), rowsIn.length);
+    if (opts?.inTransaction) return _addTakesBatchOnce(deps, rowsIn);
+    return deps.batchRetry(
+      opts?.auditSite ?? 'addTakesBatch',
+      opts?.signal,
+      () => _addTakesBatchOnce(deps, rowsIn),
+      rowsIn.length,
+    );
   }
 
 async function _addTakesBatchOnce(deps: PgTakesDeps, rowsIn: TakeBatchInput[]): Promise<number> {

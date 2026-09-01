@@ -158,13 +158,13 @@ export async function writeSingleFact(
     );
 
     if (result.fenceWriteFailed) {
-      // Parse-validate rejected the .tmp (quarantined). Hard failure — do NOT
-      // fall through to a DB row whose fence is broken (pipeline policy).
+      // Canonical fence write failed. Hard failure — do NOT fall through
+      // to a DB row whose fence is broken (pipeline policy).
       throw new Error(
-        `facts fence write failed for ${resolvedSlug} — .tmp quarantined; see the facts write-failure JSONL log`,
+        `facts fence write failed for ${resolvedSlug} — see the facts write-failure JSONL log`,
       );
     }
-    if (!result.stubGuardBlocked && !result.legacyFallback && !result.targetUnresolvable) {
+    if (!result.stubGuardBlocked && !result.legacyFallback) {
       const newId = result.ids[0];
       if (supersedeId !== null && newId !== undefined) {
         await expireSuperseded(engine, supersedeId, newId);
@@ -185,8 +185,7 @@ export async function writeSingleFact(
       };
     }
     // stubGuardBlocked / legacyFallback (sync.write_through off, or the
-    // defensive null-localPath echo) / targetUnresolvable (#4204: source
-    // tree unusable) → DB-only path below.
+    // defensive null-localPath echo) → DB-only path below.
   }
 
   const inserted = await engine.insertFact(newFact, { // gbrain-allow-direct-insert: writeSingleFact legacy path for unparented / thin-client / stub-guarded facts (mirrors the pipeline's fallback buckets)

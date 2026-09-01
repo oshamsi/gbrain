@@ -66,10 +66,27 @@ export { runSubagentsInline, runDrainRenewalTick };
 import { loadAllowedSlugPrefixes } from './filing-rules.ts';
 export { loadAllowedSlugPrefixes };
 import { discoverTranscripts, DEFAULT_EXCLUDE_PATTERNS, type DiscoveredTranscript } from './transcript-discovery.ts';
-import { serializeMarkdown, serializePageToMarkdown } from '../markdown.ts';
+import { existsSync, readFileSync } from 'node:fs';
+import { parseMarkdown, serializeMarkdown, serializePageToMarkdown } from '../markdown.ts';
+import {
+  commitCanonicalMarkdownMutation,
+  commitCanonicalRowMutation,
+} from '../canonical-mutation.ts';
+import { withPutPageOperationLock } from '../ops/put-page-lock.ts';
 import type { Page, PageType } from '../types.ts';
-import { writePageThrough } from '../write-through.ts';
-import { persistCanonicalProjectionFromRow } from '../page-canonical.ts';
+import {
+  isWriteThroughDisabled,
+  resolvePageWriteTarget,
+  verifyOrRepairPageFile,
+  writePageThrough,
+} from '../write-through.ts';
+import {
+  generationKey,
+  loadCanonicalProjection,
+  persistCanonicalProjectionFromRow,
+  projectionIsFresh,
+  sha256Utf8,
+} from '../page-canonical.ts';
 import { validateSourceId } from '../utils.ts';
 import { safeSplitIndex } from '../text-safe.ts';
 import { PAGE_SLUG_SEG } from '../cjk.ts';
@@ -966,19 +983,28 @@ export async function runPhaseSynthesize(
     // of every child-written page BEFORE reverse-rendering, so generated pages
     // are queryable (`frontmatter->>'dream_generated'`) and a later put_page
     // write-through (which re-renders from the DB row) can't erase the stamp.
-    await stampDreamProvenance(engine, writtenRefs, summaryDate);
-
-    // Dual-write: reverse-render each DB row → markdown file.
-    const reverseWriteCount = await reverseWriteRefs(engine, opts.brainDir, writtenRefs, cycleSourceId);
-
-    // Summary index page (deterministic; orchestrator-written via direct
-    // engine.putPage so no allow-list path needed).
+    const stampFailures = await stampDreamProvenance(engine, writtenRefs, summaryDate);
+    const reverse = await reverseWriteRefs(
+      engine, opts.brainDir, writtenRefs, cycleSourceId,
+    );
+    const reverseWriteCount = reverse.written;
     const summarySlug = buildDreamSummarySlug(config.outputRoot, summaryDate);
-    // Back-compat: writeSummaryPage takes string[] for display; map refs back to slugs.
     const writtenSlugs = writtenRefs.map(r => r.slug);
-    if (SUMMARY_SLUG_RE.test(summarySlug)) {
-      await writeSummaryPage(engine, opts.brainDir, summarySlug, summaryDate, writtenSlugs, childOutcomes, cycleSourceId);
-    }
+    const summaryWrite = SUMMARY_SLUG_RE.test(summarySlug)
+      ? await writeSummaryPage(
+          engine, opts.brainDir, summarySlug, summaryDate,
+          writtenSlugs, childOutcomes, cycleSourceId,
+        )
+      : undefined;
+    const canonicalFailures = [
+      ...stampFailures,
+      ...reverse.failures,
+      ...(summaryWrite && !summaryWrite.written && !summaryWrite.notProjected ? [{
+        slug: summarySlug,
+        source_id: cycleSourceId,
+        error: summaryWrite.error ?? 'unknown',
+      }] : []),
+    ];
 
     // CDX-8: deferred-embed closure. Oneshot children write chunks with
     // `embedding IS NULL`; the global `embed` phase only runs on SOME
@@ -1090,7 +1116,11 @@ export async function runPhaseSynthesize(
     // still-unknown keys) AND nothing was budget-deferred (#4168 adversarial:
     // "deferred transcripts retry next cycle" is a lie if the next cycle is
     // cooldown-skipped for half a day).
-    if (failedChildren.length === 0 && budgetExhaustedDeferrals.length === 0) {
+    if (
+      failedChildren.length === 0
+      && budgetExhaustedDeferrals.length === 0
+      && canonicalFailures.length === 0
+    ) {
       await engine.setConfig('dream.synthesize.last_completion_ts', new Date().toISOString());
     } else {
       process.stderr.write(
@@ -1108,6 +1138,19 @@ export async function runPhaseSynthesize(
     const turnsSamples = childOutcomes.filter(
       (o): o is { jobId: number; status: string; turns: number } => typeof o.turns === 'number',
     );
+    if (canonicalFailures.length > 0) {
+      return {
+        phase: 'synthesize',
+        status: reverse.written > 0 || stampFailures.length < writtenRefs.length ? 'warn' : 'fail',
+        duration_ms: ms,
+        summary: `${canonicalFailures.length} canonical write failure(s) during dream persist`,
+        details: {
+          canonical_failures: canonicalFailures,
+          reverse_write_count: reverse.written,
+          reverse_write_not_projected: reverse.notProjected,
+        },
+      };
+    }
     return ok(`${submittedTranscripts} transcript(s) synthesized in ${(ms / 1000).toFixed(1)}s${deferralSuffix}`, {
       transcripts_discovered: transcripts.length,
       transcripts_processed: submittedTranscripts,
@@ -2567,68 +2610,234 @@ function findLegacyCompletion(
  * engine method). Best-effort per row: a stamp failure never kills the
  * phase (the render-time override still covers the file).
  */
+async function prepareDreamTargetPreimage(
+  engine: BrainEngine,
+  sourceId: string,
+  slug: string,
+  filePath: string,
+): Promise<{ ok: true; sha256: string | null } | { ok: false; error: string }> {
+  const page = await engine.getPage(slug, { sourceId });
+  if (!page) {
+    return existsSync(filePath)
+      ? { ok: false, error: 'canonical target exists without a page row' }
+      : { ok: true, sha256: null };
+  }
+  let projection = await loadCanonicalProjection(engine, sourceId, slug);
+  if (!projection || !projectionIsFresh(projection)) {
+    projection = await persistCanonicalProjectionFromRow(engine, sourceId, slug);
+  }
+  if (!projection || !projectionIsFresh(projection)) {
+    return { ok: false, error: 'stale_projection' };
+  }
+  const health = await verifyOrRepairPageFile(
+    engine,
+    slug,
+    projection.semanticContentHash,
+    { sourceId },
+  );
+  if (
+    (health.file_status !== 'healthy' && health.file_status !== 'repaired')
+    || health.path !== filePath
+  ) {
+    return {
+      ok: false,
+      error: health.error ?? health.skipped ?? 'canonical file unavailable',
+    };
+  }
+  return { ok: true, sha256: sha256Utf8(readFileSync(filePath)) };
+}
+
+async function stampOneDreamProvenance(
+  engine: BrainEngine,
+  sourceId: string,
+  slug: string,
+  cycleDate: string,
+  rawSource?: string,
+): Promise<{ written: boolean; notProjected?: true; error?: string }> {
+  return withPutPageOperationLock(engine, sourceId, slug, async () => {
+    const mutate = async (tx: BrainEngine): Promise<void> => {
+      const rows = await tx.executeRaw<{ slug: string }>(
+        `UPDATE pages
+            SET frontmatter = COALESCE(frontmatter, '{}'::jsonb)
+                 || jsonb_strip_nulls(jsonb_build_object(
+                      'dream_generated', true,
+                      'dream_cycle_date', $1,
+                      'raw_source', $2
+                    ))
+          WHERE source_id = $3 AND slug = $4 AND deleted_at IS NULL
+          RETURNING slug`,
+        [cycleDate, rawSource ?? null, sourceId, slug],
+      );
+      if (rows.length !== 1) throw new Error('DREAM_STAMP_ROW_MOVED');
+    };
+    const disabled = await isWriteThroughDisabled(engine);
+    if (disabled) {
+      await engine.transaction(async (tx) => {
+        await mutate(tx);
+        await persistCanonicalProjectionFromRow(tx, sourceId, slug);
+      });
+      return { written: false, notProjected: true };
+    }
+    const target = await resolvePageWriteTarget(engine, slug, sourceId);
+    if (!target.ok) {
+      if (
+        target.skipped === 'no_repo_configured'
+        || target.skipped === 'source_repo_belongs_to_other_source'
+      ) {
+        await engine.transaction(async (tx) => {
+          await mutate(tx);
+          await persistCanonicalProjectionFromRow(tx, sourceId, slug);
+        });
+        return { written: false, notProjected: true };
+      }
+      return { written: false, error: target.skipped };
+    }
+    const preimage = await prepareDreamTargetPreimage(
+      engine, sourceId, slug, target.filePath,
+    );
+    if (!preimage.ok) return { written: false, error: preimage.error };
+    await commitCanonicalRowMutation(
+      engine, sourceId, slug, mutate,
+      {
+        expectedPath: target.filePath,
+        expectedTargetSha256: preimage.sha256,
+      },
+    );
+    return { written: true };
+  });
+}
+
 async function stampDreamProvenance(
   engine: BrainEngine,
   refs: Array<{ slug: string; source_id: string; raw_source?: string }>,
   cycleDate: string,
-): Promise<void> {
-  if (refs.length === 0) return;
-  const { executeRawJsonb } = await import('../sql-query.ts');
-  for (const { slug, source_id, raw_source } of refs) {
+): Promise<Array<{ slug: string; source_id: string; error: string }>> {
+  const failures: Array<{ slug: string; source_id: string; error: string }> = [];
+  for (const ref of refs) {
     try {
-      await executeRawJsonb(
-        engine,
-        `UPDATE pages
-            SET frontmatter = COALESCE(frontmatter, '{}'::jsonb) || $3::jsonb
-          WHERE slug = $1 AND source_id = $2`,
-        [slug, source_id],
-        // #1978 raw-source persistence: record the transcript path the
-        // synthesis was derived from, so `gbrain doctor` (raw_provenance
-        // check) can verify every generated page carries a raw trace.
-        [{
-          dream_generated: true,
-          dream_cycle_date: cycleDate,
-          ...(raw_source ? { raw_source } : {}),
-        }],
+      const result = await stampOneDreamProvenance(
+        engine, ref.source_id, ref.slug, cycleDate, ref.raw_source,
       );
-      const { persistCanonicalProjectionFromRow } = await import('../page-canonical.ts');
-      await persistCanonicalProjectionFromRow(engine, source_id, slug);
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      process.stderr.write(`[dream] provenance stamp ${slug}@${source_id} failed: ${msg}\n`);
+      if (!result.written && !result.notProjected) {
+        failures.push({
+          slug: ref.slug, source_id: ref.source_id,
+          error: result.error ?? 'dream provenance write failed',
+        });
+      }
+    } catch (error) {
+      failures.push({
+        slug: ref.slug, source_id: ref.source_id,
+        error: error instanceof Error ? error.message : String(error),
+      });
     }
   }
+  return failures;
 }
 
 // ── Reverse-write DB rows → markdown files ───────────────────────────
 
+type ReverseWriteReport = {
+  written: number;
+  notProjected: number;
+  failures: Array<{ slug: string; source_id: string; error: string }>;
+};
+
+type ReverseWriteTestHooks = {
+  afterWriteBeforeProof?: (
+    ref: { slug: string; source_id: string },
+  ) => void | Promise<void>;
+};
+
 async function reverseWriteRefs(
   engine: BrainEngine,
-  brainDir: string,
+  _brainDir: string,
   refs: Array<{ slug: string; source_id: string }>,
-  nativeSourceId = 'default',
-): Promise<number> {
-  let count = 0;
+  _nativeSourceId = 'default',
+  testHooks: ReverseWriteTestHooks = {},
+): Promise<ReverseWriteReport> {
+  const failures: ReverseWriteReport['failures'] = [];
+  let written = 0;
+  let notProjected = 0;
   for (const { slug, source_id } of refs) {
-    // v0.32.8 F6: validate source_id is filesystem-safe before any join().
     validateSourceId(source_id);
-    const page = await engine.getPage(slug, { sourceId: source_id });
-    if (!page) continue;
+    if (!await engine.getPage(slug, { sourceId: source_id })) {
+      failures.push({ slug, source_id, error: 'page_missing' });
+      continue;
+    }
     try {
-      const wt = await writePageThrough(engine, slug, { sourceId: source_id });
-      if (wt.written) count++;
-      else {
-        process.stderr.write(
-          `[dream] reverse-write ${slug}@${source_id} skipped: ${wt.error ?? wt.skipped ?? 'unknown'}\n`,
-        );
-      }
-    } catch (e) {
-      // Per-slug failures are non-fatal — phase continues.
-      const msg = e instanceof Error ? e.message : String(e);
-      process.stderr.write(`[dream] reverse-write ${slug}@${source_id} failed: ${msg}\n`);
+      await withPutPageOperationLock(engine, source_id, slug, async () => {
+        if (await isWriteThroughDisabled(engine)) { notProjected++; return; }
+        const target = await resolvePageWriteTarget(engine, slug, source_id);
+        if (!target.ok) {
+          if (
+            target.skipped === 'no_repo_configured'
+            || target.skipped === 'source_repo_belongs_to_other_source'
+          ) { notProjected++; return; }
+          failures.push({ slug, source_id, error: target.skipped });
+          return;
+        }
+
+        let committed = await loadCanonicalProjection(engine, source_id, slug);
+        if (!committed || !projectionIsFresh(committed)) {
+          committed = await persistCanonicalProjectionFromRow(engine, source_id, slug);
+        }
+        if (!committed || !projectionIsFresh(committed)) {
+          failures.push({ slug, source_id, error: 'stale_projection' });
+          return;
+        }
+
+        const expectedTargetSha256 = existsSync(target.filePath)
+          ? sha256Utf8(readFileSync(target.filePath))
+          : null;
+        const outcome = await writePageThrough(engine, slug, {
+          sourceId: source_id,
+          expectedPath: target.filePath,
+          expectedTargetSha256,
+        });
+        await testHooks.afterWriteBeforeProof?.({ slug, source_id });
+
+        const current = await loadCanonicalProjection(engine, source_id, slug);
+        let rawMatches = false;
+        try {
+          const bytes = readFileSync(target.filePath);
+          rawMatches = bytes.length === committed.sizeBytes
+            && sha256Utf8(bytes) === committed.sha256;
+        } catch { /* classified below */ }
+        const stillOwnsReceipt = current != null
+          && projectionIsFresh(current)
+          && current.sha256 === committed.sha256
+          && current.sizeBytes === committed.sizeBytes
+          && current.semanticContentHash === committed.semanticContentHash
+          && generationKey(current.inputGeneration)
+            === generationKey(committed.inputGeneration)
+          && generationKey(current.basisGeneration)
+            === generationKey(committed.basisGeneration);
+        if (
+          outcome.written === true
+          && outcome.path === target.filePath
+          && stillOwnsReceipt
+          && rawMatches
+        ) {
+          written++;
+        } else {
+          failures.push({
+            slug,
+            source_id,
+            error: outcome.written !== true
+              ? (outcome.error ?? outcome.skipped ?? 'canonical_write_failed')
+              : 'canonical planes moved after reverse-write',
+          });
+        }
+      });
+    } catch (error) {
+      failures.push({
+        slug,
+        source_id,
+        error: error instanceof Error ? error.message : String(error),
+      });
     }
   }
-  return count;
+  return { written, notProjected, failures };
 }
 
 /**
@@ -2638,7 +2847,7 @@ async function reverseWriteRefs(
  * writePageThrough. Override-capable rendering is for named noncanonical
  * artifacts only.
  */
-export function renderPageToMarkdown(page: Page, tags: string[]): string {
+function renderDreamPreviewMarkdown(page: Page, tags: string[]): string {
   return serializePageToMarkdown(page, tags, {
     frontmatterOverrides: {
       dream_generated: true,
@@ -2649,6 +2858,58 @@ export function renderPageToMarkdown(page: Page, tags: string[]): string {
 
 // ── Summary index page ───────────────────────────────────────────────
 
+async function writeDreamSummary(
+  engine: BrainEngine,
+  sourceId: string,
+  slug: string,
+  markdown: string,
+): Promise<{ written: boolean; notProjected?: true; error?: string }> {
+  return withPutPageOperationLock(engine, sourceId, slug, async () => {
+    const disabled = await isWriteThroughDisabled(engine);
+    const parsed = parseMarkdown(markdown, `${slug}.md`);
+    const mutate = async (tx: BrainEngine): Promise<void> => {
+      await tx.putPage(slug, {
+        type: parsed.type,
+        title: parsed.title,
+        compiled_truth: parsed.compiled_truth,
+        timeline: parsed.timeline || '',
+        frontmatter: parsed.frontmatter,
+      }, { sourceId });
+      for (const tag of parsed.tags) await tx.addTag(slug, tag, { sourceId });
+    };
+    if (disabled) {
+      await engine.transaction(async (tx) => {
+        await mutate(tx);
+        await persistCanonicalProjectionFromRow(tx, sourceId, slug);
+      });
+      return { written: false, notProjected: true };
+    }
+    const target = await resolvePageWriteTarget(engine, slug, sourceId);
+    if (!target.ok) {
+      if (
+        target.skipped === 'no_repo_configured'
+        || target.skipped === 'source_repo_belongs_to_other_source'
+      ) {
+        await engine.transaction(async (tx) => {
+          await mutate(tx);
+          await persistCanonicalProjectionFromRow(tx, sourceId, slug);
+        });
+        return { written: false, notProjected: true };
+      }
+      return { written: false, error: target.skipped };
+    }
+    const preimage = await prepareDreamTargetPreimage(
+      engine, sourceId, slug, target.filePath,
+    );
+    if (!preimage.ok) return { written: false, error: preimage.error };
+    await commitCanonicalMarkdownMutation(
+      engine, sourceId, slug, markdown, mutate,
+      { expectedPath: target.filePath, expectedTargetSha256: preimage.sha256 },
+    );
+    return { written: true };
+  });
+}
+
 async function writeSummaryPage(
   engine: BrainEngine,
   brainDir: string,
@@ -2657,7 +2918,7 @@ async function writeSummaryPage(
   writtenSlugs: string[],
   childOutcomes: Array<{ jobId: number; status: string }>,
   sourceId = 'default',
-): Promise<void> {
+): Promise<{ written: boolean; notProjected?: true; error?: string }> {
   const completed = childOutcomes.filter(c => c.status === 'completed').length;
   const failed = childOutcomes.length - completed;
 
@@ -2700,30 +2961,8 @@ async function writeSummaryPage(
   // pre-validated against SUMMARY_SLUG_RE in the caller.
   // Importing put_page via operations.ts would re-run namespace logic
   // unnecessarily; we go straight to the engine.
-  const { parseMarkdown } = await import('../markdown.ts');
-  const parsed = parseMarkdown(fullMarkdown);
-  // #1586: summary lands in the cycle's resolved source too — otherwise the
-  // children live in the named source while the index drifts to 'default'.
-  await engine.putPage(summarySlug, {
-    type: parsed.type,
-    title: parsed.title,
-    compiled_truth: parsed.compiled_truth,
-    timeline: parsed.timeline,
-    frontmatter: parsed.frontmatter,
-  }, { sourceId });
+  return writeDreamSummary(engine, sourceId, summarySlug, fullMarkdown);
 
-  try {
-    await persistCanonicalProjectionFromRow(engine, sourceId, summarySlug);
-    const wt = await writePageThrough(engine, summarySlug, { sourceId });
-    if (!wt.written && wt.skipped !== 'disabled_by_config' && wt.skipped !== 'no_repo_configured') {
-      process.stderr.write(
-        `[dream] summary file-write failed: ${wt.error ?? wt.skipped ?? 'unknown'}\n`,
-      );
-    }
-  } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e);
-    process.stderr.write(`[dream] summary file-write failed: ${msg}\n`);
-  }
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────
@@ -2781,7 +3020,10 @@ export const __testing = {
   buildSynthesisPrompt,
   buildDreamSummarySlug,
   stampDreamProvenance,
+  stampOneDreamProvenance,
+  writeDreamSummary,
   reverseWriteRefs,
   runSubagentsInline,
   loadSynthConfig,
+  renderDreamPreviewMarkdown,
 };
