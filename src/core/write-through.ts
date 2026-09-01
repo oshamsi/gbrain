@@ -460,21 +460,49 @@ export async function verifyOrRepairPageFile(
           parsed.type = page.type;
         }
         parsed.tags.sort();
-        // Write-through stamps ingested_via/source_kind onto the file only.
-        // They are not part of the store semantic hash, so strip them before
-        // comparing — otherwise every healthy restamped file looks divergent.
-        const fm = { ...parsed.frontmatter };
-        delete fm.ingested_via;
-        delete fm.source_kind;
-        const diskHash = contentHash({
+        const diskAsIs = contentHash({
           title: parsed.title,
           type: parsed.type,
           compiled_truth: parsed.compiled_truth,
           timeline: parsed.timeline,
-          frontmatter: fm,
+          frontmatter: parsed.frontmatter,
           tags: parsed.tags,
         });
-        needsRepair = diskHash !== storeHash;
+        const storeRehash = page
+          ? contentHash({
+              title: page.title,
+              type: page.type,
+              compiled_truth: page.compiled_truth,
+              timeline: page.timeline,
+              frontmatter: (page.frontmatter ?? {}) as Record<string, unknown>,
+              tags: parsed.tags,
+            })
+          : null;
+        if (diskAsIs === storeHash || (storeRehash !== null && diskAsIs === storeRehash)) {
+          needsRepair = false;
+        } else {
+          // Compatibility path for older files that carry write-through
+          // provenance stamps not present on the stored frontmatter.
+          // Strip a key only when the store row itself lacks it — live
+          // tracker pages keep ingested_via/source_kind in BOTH planes.
+          const storeFm = (page?.frontmatter ?? {}) as Record<string, unknown>;
+          const fm = { ...parsed.frontmatter };
+          if (!Object.prototype.hasOwnProperty.call(storeFm, 'ingested_via')) {
+            delete fm.ingested_via;
+          }
+          if (!Object.prototype.hasOwnProperty.call(storeFm, 'source_kind')) {
+            delete fm.source_kind;
+          }
+          const compat = contentHash({
+            title: parsed.title,
+            type: parsed.type,
+            compiled_truth: parsed.compiled_truth,
+            timeline: parsed.timeline,
+            frontmatter: fm,
+            tags: parsed.tags,
+          });
+          needsRepair = compat !== storeHash && (storeRehash === null || compat !== storeRehash);
+        }
       }
     } catch {
       needsRepair = true;

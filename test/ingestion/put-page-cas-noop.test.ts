@@ -236,4 +236,52 @@ describe('put_page identical CAS is a store/file no-op', () => {
     expect(healthy.write_through?.skipped).toBe('unchanged');
     expect(fs.statSync(filePath).mtimeMs).toBe(mtimeAfterRepair);
   });
+
+  test('stored ingested_via and source_kind keep a second no-op from restamping the file', async () => {
+    const ctx = makeCtx();
+    const body = `---
+title: CAS no-op probe
+ingested_via: mcp:put_page
+source_kind: mcp:put_page
+---
+
+# probe
+
+- [x] checkbox-1
+`;
+    const created = await putPage.handler(ctx, {
+      slug: 'scratch/cas-provenance-keys',
+      content: body,
+    }) as { write_through?: { path?: string } };
+    const filePath = created.write_through!.path!;
+    const page1 = await engine.getPage('scratch/cas-provenance-keys');
+    expect(page1?.frontmatter).toMatchObject({
+      ingested_via: 'mcp:put_page',
+      source_kind: 'mcp:put_page',
+    });
+    const hash1 = page1!.content_hash!;
+
+    await Bun.sleep(50);
+    const firstNoop = await putPage.handler(ctx, {
+      slug: 'scratch/cas-provenance-keys',
+      content: body,
+      expected_content_hash: hash1,
+    }) as { no_op?: boolean; file_repaired?: boolean; file_status?: string };
+    expect(firstNoop.no_op).toBe(true);
+    expect(firstNoop.file_repaired).toBe(false);
+    expect(firstNoop.file_status).toBe('healthy');
+    const mtimeAfterFirst = fs.statSync(filePath).mtimeMs;
+
+    await Bun.sleep(50);
+    const secondNoop = await putPage.handler(ctx, {
+      slug: 'scratch/cas-provenance-keys',
+      content: body,
+      expected_content_hash: hash1,
+    }) as { no_op?: boolean; file_repaired?: boolean; file_status?: string };
+    expect(secondNoop.no_op).toBe(true);
+    expect(secondNoop.file_repaired).toBe(false);
+    expect(secondNoop.file_status).toBe('healthy');
+    expect(fs.statSync(filePath).mtimeMs).toBe(mtimeAfterFirst);
+    expect((await engine.getPage('scratch/cas-provenance-keys'))?.content_hash).toBe(hash1);
+  });
 });

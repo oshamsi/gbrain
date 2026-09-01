@@ -70,6 +70,9 @@ export const PAGE_CAS_UPDATE_SQL = `
  * moved, vanished, or was tombstoned — callers must fall through to the
  * normal CAS write, which then conflicts.
  */
+// TODO: SET slug = slug is a real UPDATE and advances the statement-level
+// page-generation/cache clock even though it does not bump updated_at.
+// Prefer a compare-only SELECT ... FOR UPDATE if that cache churn matters.
 export const PAGE_CAS_COMPARE_SQL = `
   UPDATE pages
      SET slug = slug
